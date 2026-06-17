@@ -81,9 +81,9 @@ pub enum Shape {
 pub const PIXEL_CELL: f32 = 16.0;
 pub const PIXEL_BRUSH: f32 = 16.0;
 pub const PIXEL_SAMPLE: f32 = 8.0;
-pub const BLUR_CELL: f32 = 4.0;
+pub const BLUR_CELL: f32 = 3.0;
 pub const BLUR_BRUSH: f32 = 16.0;
-pub const BLUR_SAMPLE: f32 = 10.0;
+pub const BLUR_SAMPLE: f32 = 18.0;
 
 fn box_color(rgba: &[u8], fw: u32, fh: u32, cx: f32, cy: f32, half: f32) -> egui::Color32 {
     let x0 = (cx - half).max(0.0) as u32;

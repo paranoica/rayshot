@@ -827,10 +827,19 @@ impl OverlayApp {
                 }
             }
 
+            let brush_ring = match tool {
+                Tool::Marker => Some(8.0),
+                Tool::Pixelate => Some(crate::scene::PIXEL_BRUSH),
+                Tool::Blur => Some(crate::scene::BLUR_BRUSH),
+                _ => None,
+            };
+            let brush_active = resp.hovered() || resp.dragged();
             match tool {
                 Tool::Select => {}
                 Tool::Text => ui.ctx().set_cursor_icon(egui::CursorIcon::Text),
-                Tool::Blur | Tool::Pixelate => ui.ctx().set_cursor_icon(egui::CursorIcon::Cell),
+                _ if brush_ring.is_some() && brush_active => {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+                }
                 _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair),
             }
 
@@ -944,6 +953,22 @@ impl OverlayApp {
             }
             if let Some(d) = &draft {
                 crate::scene::paint(painter, d, &to_screen, scale);
+            }
+            if let (Some(r), Some(p)) = (brush_ring, raw_cursor) {
+                if brush_active {
+                    let rs = r * scale;
+                    painter.circle_stroke(
+                        p,
+                        rs,
+                        egui::Stroke::new(2.5, egui::Color32::from_black_alpha(130)),
+                    );
+                    painter.circle_stroke(
+                        p,
+                        rs,
+                        egui::Stroke::new(1.2, egui::Color32::from_white_alpha(235)),
+                    );
+                    painter.circle_filled(p, 1.4, egui::Color32::from_white_alpha(235));
+                }
             }
             if let (Some(buf), Some((pos, col, tsize))) = (&text_buf, text_info) {
                 if !region.contains(pos) {
