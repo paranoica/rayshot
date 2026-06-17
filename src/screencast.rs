@@ -23,18 +23,25 @@ struct Portal {
     streams: Vec<StreamInfo>,
 }
 
-#[derive(Clone)]
+struct Slot {
+    raw: Vec<u8>,
+    w: u32,
+    h: u32,
+    stride: usize,
+    format: spa::param::video::VideoFormat,
+    pos: (i32, i32),
+    present: bool,
+}
+
 struct Captured {
     pixels: Vec<u8>,
     w: u32,
     h: u32,
     pos: (i32, i32),
-    done: bool,
 }
 
 pub struct ScreencastSession {
-    latest: Arc<Mutex<Vec<Captured>>>,
-    want: Arc<std::sync::atomic::AtomicBool>,
+    latest: Arc<Mutex<Vec<Slot>>>,
 }
 
 impl ScreencastSession {
@@ -42,57 +49,56 @@ impl ScreencastSession {
         let portal = rt
             .block_on(open_screencast())
             .context("screencast portal handshake failed")?;
-        let latest: Vec<Captured> = portal
+        let latest: Vec<Slot> = portal
             .streams
             .iter()
-            .map(|s| Captured {
-                pixels: Vec::new(),
+            .map(|s| Slot {
+                raw: Vec::new(),
                 w: 0,
                 h: 0,
+                stride: 0,
+                format: spa::param::video::VideoFormat::BGRx,
                 pos: s.pos,
-                done: false,
+                present: false,
             })
             .collect();
         let latest = Arc::new(Mutex::new(latest));
-        let want = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shared = latest.clone();
-        let want_thread = want.clone();
         let fd = portal.fd;
         let infos = portal.streams;
         std::thread::Builder::new()
             .name("rayshot-pw".into())
             .spawn(move || {
-                if let Err(e) = run_pw_loop(fd, infos, shared, want_thread) {
+                if let Err(e) = run_pw_loop(fd, infos, shared) {
                     eprintln!("[rayshot] screencast pipewire loop failed: {e:?}");
                 }
             })
             .context("spawn pipewire thread")?;
-        Ok(Self { latest, want })
+        Ok(Self { latest })
     }
 
     fn grab_inner(&self, timeout: Duration) -> Result<Frame> {
-        use std::sync::atomic::Ordering;
-        {
-            let mut slots = self.latest.lock().unwrap();
-            for c in slots.iter_mut() {
-                c.done = false;
-            }
-        }
-        self.want.store(true, Ordering::SeqCst);
         let start = Instant::now();
         loop {
-            if self.latest.lock().unwrap().iter().all(|c| c.done) {
+            if self.latest.lock().unwrap().iter().all(|s| s.present) {
                 break;
             }
             if start.elapsed() > timeout {
-                self.want.store(false, Ordering::SeqCst);
                 return Err(anyhow!("timed out waiting for screencast frames"));
             }
             std::thread::sleep(Duration::from_millis(2));
         }
-        self.want.store(false, Ordering::SeqCst);
         let slots = self.latest.lock().unwrap();
-        composite(&slots)
+        let captured: Vec<Captured> = slots
+            .iter()
+            .map(|s| Captured {
+                pixels: to_rgba(&s.raw, s.w, s.h, s.stride, s.format),
+                w: s.w,
+                h: s.h,
+                pos: s.pos,
+            })
+            .collect();
+        composite(&captured)
     }
 
     pub fn wait_ready(&self, timeout: Duration) -> bool {
@@ -185,12 +191,7 @@ struct FmtData {
     format: spa::param::video::VideoInfoRaw,
 }
 
-fn run_pw_loop(
-    fd: OwnedFd,
-    infos: Vec<StreamInfo>,
-    latest: Arc<Mutex<Vec<Captured>>>,
-    want: Arc<std::sync::atomic::AtomicBool>,
-) -> Result<()> {
+fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Slot>>>) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pipewire main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pipewire context")?;
@@ -238,14 +239,10 @@ fn run_pw_loop(
             })
             .process({
                 let latest = latest.clone();
-                let want = want.clone();
                 move |stream, ud| {
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         return;
                     };
-                    if !want.load(std::sync::atomic::Ordering::SeqCst) {
-                        return;
-                    }
                     let datas = buffer.datas_mut();
                     if datas.is_empty() {
                         return;
@@ -256,23 +253,23 @@ fn run_pw_loop(
                         return;
                     }
                     let stride = datas[0].chunk().stride().max(0) as usize;
-                    let row_bytes = stride.max(w as usize * 4);
+                    let row = stride.max(w as usize * 4);
                     let Some(src) = datas[0].data() else {
                         return;
                     };
                     if src.is_empty() {
                         return;
                     }
-                    let rgba = to_rgba(src, w, h, row_bytes, ud.format.format());
+                    let len = (row * h as usize).min(src.len());
                     let mut slots = latest.lock().unwrap();
-                    let pos = slots[idx].pos;
-                    slots[idx] = Captured {
-                        pixels: rgba,
-                        w,
-                        h,
-                        pos,
-                        done: true,
-                    };
+                    let s = &mut slots[idx];
+                    s.raw.clear();
+                    s.raw.extend_from_slice(&src[..len]);
+                    s.w = w;
+                    s.h = h;
+                    s.stride = row;
+                    s.format = ud.format.format();
+                    s.present = true;
                 }
             })
             .register()
@@ -361,7 +358,11 @@ fn to_rgba(
     let swap = matches!(format, F::BGRx | F::BGRA);
     let has_alpha = matches!(format, F::RGBA | F::BGRA);
     for y in 0..h {
-        let row = &src[y * row_bytes..];
+        let start = y * row_bytes;
+        if start >= src.len() {
+            break;
+        }
+        let row = &src[start..];
         let o = y * w * 4;
         for x in 0..w {
             let i = x * 4;
@@ -383,8 +384,8 @@ fn to_rgba(
 }
 
 fn composite(slots: &[Captured]) -> Result<Frame> {
-    if slots.iter().any(|c| !c.done) {
-        return Err(anyhow!("not all screencast streams produced a frame"));
+    if slots.iter().any(|c| c.w == 0 || c.h == 0) {
+        return Err(anyhow!("screencast stream produced an empty frame"));
     }
     let min_x = slots.iter().map(|c| c.pos.0).min().unwrap_or(0);
     let min_y = slots.iter().map(|c| c.pos.1).min().unwrap_or(0);
