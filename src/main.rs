@@ -4,6 +4,7 @@ mod export;
 mod hotkey;
 mod overlay;
 mod scene;
+mod screencast;
 
 use anyhow::{Context, Result};
 
@@ -41,20 +42,42 @@ fn main() -> Result<()> {
         Some("monitors") => return overlay::list_monitors(),
         _ => {}
     }
+    let shot_pw = std::env::args().nth(1).as_deref() == Some("shot-pw");
     let shot = std::env::args().nth(1).as_deref() == Some("shot");
 
-    if !shot && !acquire_single_instance() {
+    let interactive = !shot && !shot_pw;
+
+    if interactive && !acquire_single_instance() {
         return Ok(());
     }
 
     export::cleanup_old(&export::scratch_dir(), export::SCRATCH_MAX_AGE);
 
-    let _anim = (!shot).then(anim::AnimationGuard::disable);
+    let _anim = interactive.then(anim::AnimationGuard::disable);
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
+
+    if shot_pw {
+        let t0 = std::time::Instant::now();
+        let frame = screencast::capture_once(rt.handle()).context("screencast capture failed")?;
+        eprintln!(
+            "[rayshot] screencast capture: {:?} ({}x{})",
+            t0.elapsed(),
+            frame.width,
+            frame.height
+        );
+        let path = std::env::args()
+            .nth(2)
+            .unwrap_or_else(|| "/tmp/rayshot-pw.png".to_string());
+        let img = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
+            .context("frame buffer size mismatch")?;
+        img.save(&path).context("failed to save capture")?;
+        println!("saved screencast capture to {path}");
+        return Ok(());
+    }
 
     if shot {
         let frame = rt
