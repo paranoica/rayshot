@@ -29,6 +29,7 @@ pub async fn capture_frame() -> Result<Frame> {
         .context("failed to decode the screenshot file")?
         .to_rgba8();
     let t_decode = t1.elapsed();
+    let _ = std::fs::remove_file(&path);
     let (width, height) = img.dimensions();
 
     eprintln!(

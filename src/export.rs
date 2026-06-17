@@ -64,6 +64,41 @@ pub fn cleanup_old(dir: &Path, max_age: Duration) {
     }
 }
 
+fn timestamped_filename() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&secs, &mut tm);
+    }
+    format!(
+        "rayshot-{:02}-{:02}-{:04}-{:02}-{:02}-{:02}.png",
+        tm.tm_mday,
+        tm.tm_mon + 1,
+        tm.tm_year + 1900,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    )
+}
+
+fn unique_path(dir: &Path, name: &str) -> PathBuf {
+    let base = dir.join(name);
+    if !base.exists() {
+        return base;
+    }
+    let stem = name.strip_suffix(".png").unwrap_or(name);
+    for n in 2..1000 {
+        let p = dir.join(format!("{stem}-{n}.png"));
+        if !p.exists() {
+            return p;
+        }
+    }
+    base
+}
+
 pub fn to_png_bytes(img: &RgbaImage) -> Result<Vec<u8>> {
     let mut buf = std::io::Cursor::new(Vec::new());
     img.write_to(&mut buf, image::ImageFormat::Png)
@@ -74,11 +109,7 @@ pub fn to_png_bytes(img: &RgbaImage) -> Result<Vec<u8>> {
 pub fn save_to_scratch(png: &[u8]) -> Result<PathBuf> {
     let dir = scratch_dir();
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let path = dir.join(format!("rayshot-{secs}.png"));
+    let path = unique_path(&dir, &timestamped_filename());
     std::fs::write(&path, png).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
@@ -93,11 +124,7 @@ pub fn save_to_pictures(png: &[u8]) -> Result<PathBuf> {
     } else {
         PathBuf::from("/tmp")
     };
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let path = dir.join(format!("rayshot-{secs}.png"));
+    let path = unique_path(&dir, &timestamped_filename());
     std::fs::write(&path, png).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
