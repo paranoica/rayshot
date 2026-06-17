@@ -177,6 +177,7 @@ struct OverlayApp {
     daemon: bool,
     active: bool,
     screencast: Option<crate::screencast::ScreencastSession>,
+    anim_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl OverlayApp {
@@ -207,6 +208,7 @@ impl OverlayApp {
             daemon: false,
             active: false,
             screencast: None,
+            anim_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -327,6 +329,8 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 if self.active {
                     return;
                 }
+                self.anim_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 crate::anim::set_animations(false);
                 let frame = match self.screencast.as_ref().map(|s| s.grab()) {
                     Some(Ok(f)) => f,
@@ -896,7 +900,8 @@ impl OverlayApp {
                                     to_screen(sel.min),
                                     to_screen(sel.max),
                                 );
-                                if let Some(h) = hit_handle(s, p, 12.0) {
+                                let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
+                                if let Some(h) = hit_handle(s, p, hr) {
                                     sel_mode = Some(SelMode::Resize(h));
                                     sel_ref = sel;
                                 } else if sel.contains(fp) {
@@ -955,12 +960,13 @@ impl OverlayApp {
                     }
                     let icon = if let Some(sel) = selection {
                         let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+                        let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
                         match sel_mode {
                             Some(SelMode::Resize(h)) => handle_cursor(h),
                             Some(SelMode::Move) => egui::CursorIcon::Grabbing,
                             _ => match resp.hover_pos() {
-                                Some(p) if hit_handle(s, p, 12.0).is_some() => {
-                                    handle_cursor(hit_handle(s, p, 12.0).unwrap())
+                                Some(p) if hit_handle(s, p, hr).is_some() => {
+                                    handle_cursor(hit_handle(s, p, hr).unwrap())
                                 }
                                 Some(p) if s.contains(p) => egui::CursorIcon::Move,
                                 _ => egui::CursorIcon::Crosshair,
@@ -1940,7 +1946,14 @@ impl OverlayApp {
         self.selection = None;
         self.tool = crate::scene::Tool::Select;
         self.active = false;
-        crate::anim::set_animations(true);
+        let counter = self.anim_gen.clone();
+        let target = counter.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            if counter.load(std::sync::atomic::Ordering::SeqCst) == target {
+                crate::anim::set_animations(true);
+            }
+        });
     }
 
     fn finish_and_exit(&mut self, event_loop: &ActiveEventLoop) {
