@@ -1,6 +1,6 @@
 # rayshot
 
-A fast, lightweight screenshot and annotation tool for Linux — select a region,
+A fast, lightweight screenshot and annotation tool for Linux - select a region,
 mark it up, copy or save. Built in Rust. Tuned for GNOME on Wayland, with an
 optional resident daemon that makes capture feel instant.
 
@@ -25,8 +25,8 @@ handling) is desktop-specific.
 |-----------------------------|------------------------------------------------------------------------|
 | **GNOME (Wayland)**         | Full support: portal + instant daemon + automatic hotkey + autostart.  |
 | **KDE / other Wayland**     | Works in portal mode (same capture + clipboard code). Bind the hotkey manually. |
-| **wlroots (Sway/Hyprland)** | Not officially supported (the portal Screenshot backend is usually absent; `grim`-based capture is the natural path — PRs welcome). |
-| **X11**                     | Not supported (different capture model).                               |
+| **wlroots (Sway/Hyprland)** | Not officially supported (the portal Screenshot backend is usually absent; `grim`-based capture is the natural path). |
+| **X11**                     | Not supported.                               |
 
 `install-hotkey` detects non-GNOME desktops and prints what to bind manually
 instead of silently doing nothing.
@@ -160,4 +160,4 @@ converts no frames, so it sits at ~46 MB and ~0.1 % CPU.
 
 ## License
 
-Not yet licensed — add one before publishing.
+MIT — see [LICENSE](LICENSE).

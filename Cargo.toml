@@ -2,6 +2,8 @@
 name = "rayshot"
 version = "0.1.0"
 edition = "2024"
+description = "Fast screenshot and annotation tool for Linux (GNOME/Wayland)"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.102"
