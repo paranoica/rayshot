@@ -30,10 +30,23 @@ impl AnimationGuard {
         if let Some(dir) = marker_path().parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(marker_path(), changed.join("\n"));
+        let mut content = make_token();
+        for line in &changed {
+            content.push('\n');
+            content.push_str(line);
+        }
+        let _ = std::fs::write(marker_path(), content);
         install_signal_restore();
         Self { restore: true }
     }
+}
+
+fn make_token() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("tok-{}-{}", std::process::id(), nanos)
 }
 
 impl Drop for AnimationGuard {
@@ -82,13 +95,21 @@ pub fn restore_detached() {
     let Ok(content) = std::fs::read_to_string(marker_path()) else {
         return;
     };
-    let mut script = String::from("sleep 0.25");
-    for line in content.lines() {
+    let mut lines = content.lines();
+    let Some(token) = lines.next() else {
+        return;
+    };
+    let mut sets = String::new();
+    for line in lines {
         if let Some((schema, key)) = line.split_once(' ') {
-            script.push_str(&format!("; gsettings set {schema} {key} true"));
+            sets.push_str(&format!("gsettings set {schema} {key} true; "));
         }
     }
-    script.push_str(&format!("; rm -f '{}'", marker_path().display()));
+    let marker = marker_path();
+    let marker = marker.display();
+    let script = format!(
+        "sleep 0.25; if [ \"x$(head -n1 '{marker}' 2>/dev/null)\" = \"x{token}\" ]; then {sets}rm -f '{marker}'; fi"
+    );
     let _ = Command::new("sh")
         .arg("-c")
         .arg(script)
