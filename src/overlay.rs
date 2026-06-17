@@ -120,6 +120,9 @@ impl OverlayApp {
     }
 }
 
+/// Minimum selection width/height in frame pixels (never zero on either axis).
+const MIN_SELECTION: f32 = 5.0;
+
 fn hit_handle(s: egui::Rect, p: egui::Pos2, radius: f32) -> Option<usize> {
     let pts = [
         s.left_top(),
@@ -251,6 +254,21 @@ impl ApplicationHandler for OverlayApp {
                 color: yellow,
                 size: 28.0,
             });
+            let brect =
+                egui::Rect::from_min_max(egui::pos2(950.0, 250.0), egui::pos2(1300.0, 380.0));
+            let (cells, cols, rows) = crate::scene::compute_mosaic(
+                &self.frame.rgba,
+                self.frame.width,
+                self.frame.height,
+                brect,
+                14.0,
+            );
+            self.scene.push(Shape::Blur {
+                rect: brect,
+                cells,
+                cols,
+                rows,
+            });
         }
         if let Some(spec) = std::env::var_os("RAYSHOT_TEST_CROP") {
             self.selection = parse_crop(&spec.to_string_lossy());
@@ -342,6 +360,8 @@ impl ApplicationHandler for OverlayApp {
                                 Some(Tool::Marker)
                             } else if is(KeyCode::KeyT) {
                                 Some(Tool::Text)
+                            } else if is(KeyCode::KeyB) {
+                                Some(Tool::Blur)
                             } else {
                                 None
                             };
@@ -537,6 +557,7 @@ impl OverlayApp {
         }
         let frame_w = self.frame.width as f32;
         let frame_h = self.frame.height as f32;
+        let frame = self.frame.clone(); // for the pixelate (Blur) mosaic
         let win = &mut self.windows[idx];
 
         win.frames += 1;
@@ -653,7 +674,12 @@ impl OverlayApp {
                                         selection = Some(m);
                                     }
                                     Some(SelMode::Resize(h)) => {
-                                        selection = Some(resize_rect(sel_ref, h, fp));
+                                        // Don't let a handle collapse the selection.
+                                        let r = resize_rect(sel_ref, h, fp);
+                                        if r.width() >= MIN_SELECTION && r.height() >= MIN_SELECTION
+                                        {
+                                            selection = Some(r);
+                                        }
                                     }
                                     None => {}
                                 }
@@ -661,6 +687,15 @@ impl OverlayApp {
                         }
                     }
                     if resp.drag_stopped() {
+                        // Drop a degenerate selection (e.g. a click with no drag) so
+                        // it can never be zero-width or zero-height.
+                        if sel_mode == Some(SelMode::New) {
+                            if let Some(s) = selection {
+                                if s.width() < MIN_SELECTION || s.height() < MIN_SELECTION {
+                                    selection = None;
+                                }
+                            }
+                        }
                         sel_mode = None;
                         moving_shape = None;
                     }
@@ -749,6 +784,24 @@ impl OverlayApp {
                                 Tool::Pen | Tool::Marker => {
                                     if let Some(Shape::Pen { points, .. }) = &mut draft {
                                         points.push(fp);
+                                    }
+                                }
+                                Tool::Blur => {
+                                    if let Some(st) = draft_start {
+                                        let rect = egui::Rect::from_two_pos(st, fp);
+                                        let (cells, cols, rows) = crate::scene::compute_mosaic(
+                                            &frame.rgba,
+                                            frame.width,
+                                            frame.height,
+                                            rect,
+                                            14.0,
+                                        );
+                                        draft = Some(Shape::Blur {
+                                            rect,
+                                            cells,
+                                            cols,
+                                            rows,
+                                        });
                                     }
                                 }
                                 _ => {}
@@ -1051,6 +1104,7 @@ impl OverlayApp {
                                         Tool::Rect,
                                         Tool::Marker,
                                         Tool::Text,
+                                        Tool::Blur,
                                         Tool::Select,
                                     ] {
                                         if tool_button(ui, t.icon(), tool == t)

@@ -7,6 +7,7 @@ pub enum Tool {
     Rect,
     Marker,
     Text,
+    Blur,
 }
 
 impl Tool {
@@ -20,6 +21,7 @@ impl Tool {
             Tool::Rect => p::RECTANGLE,
             Tool::Marker => p::HIGHLIGHTER,
             Tool::Text => p::TEXT_T,
+            Tool::Blur => p::SQUARES_FOUR,
         }
     }
 
@@ -32,6 +34,7 @@ impl Tool {
             Tool::Rect => "Rectangle (R)",
             Tool::Marker => "Marker (M)",
             Tool::Text => "Text (T)",
+            Tool::Blur => "Pixelate (B)",
         }
     }
 }
@@ -66,6 +69,62 @@ pub enum Shape {
         color: egui::Color32,
         size: f32,
     },
+    /// Pixelated (mosaic) region: the average colour of each cell, baked from the
+    /// frame, laid out `cols`×`rows` across `rect`.
+    Blur {
+        rect: egui::Rect,
+        cells: Vec<egui::Color32>,
+        cols: usize,
+        rows: usize,
+    },
+}
+
+/// Bake a mosaic of `rect` (frame pixels) from the captured RGBA8 buffer: the
+/// average colour of each ~`cell`-sized block, row-major.
+pub fn compute_mosaic(
+    rgba: &[u8],
+    fw: u32,
+    fh: u32,
+    rect: egui::Rect,
+    cell: f32,
+) -> (Vec<egui::Color32>, usize, usize) {
+    let x0 = rect.min.x.floor().clamp(0.0, fw as f32) as u32;
+    let y0 = rect.min.y.floor().clamp(0.0, fh as f32) as u32;
+    let x1 = rect.max.x.ceil().clamp(0.0, fw as f32) as u32;
+    let y1 = rect.max.y.ceil().clamp(0.0, fh as f32) as u32;
+    if x1 <= x0 || y1 <= y0 {
+        return (Vec::new(), 0, 0);
+    }
+    let cell = cell.max(2.0);
+    let cols = (((x1 - x0) as f32) / cell).ceil() as usize;
+    let rows = (((y1 - y0) as f32) / cell).ceil() as usize;
+    let mut cells = Vec::with_capacity(cols * rows);
+    for ry in 0..rows {
+        for cx in 0..cols {
+            let cx0 = x0 + (cx as f32 * cell) as u32;
+            let cy0 = y0 + (ry as f32 * cell) as u32;
+            let cx1 = (cx0 + cell as u32).min(x1);
+            let cy1 = (cy0 + cell as u32).min(y1);
+            let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+            for py in cy0..cy1 {
+                let base = (py * fw + cx0) as usize * 4;
+                for px in 0..(cx1 - cx0) as usize {
+                    let i = base + px * 4;
+                    r += rgba[i] as u64;
+                    g += rgba[i + 1] as u64;
+                    b += rgba[i + 2] as u64;
+                    n += 1;
+                }
+            }
+            let n = n.max(1);
+            cells.push(egui::Color32::from_rgb(
+                (r / n) as u8,
+                (g / n) as u8,
+                (b / n) as u8,
+            ));
+        }
+    }
+    (cells, cols, rows)
 }
 
 #[derive(Default)]
@@ -148,6 +207,7 @@ pub fn shape_hit(shapes: &[Shape], p: egui::Pos2) -> Option<usize> {
             Shape::Text {
                 pos, text, size, ..
             } => text_box(*pos, text, *size).contains(p),
+            Shape::Blur { rect, .. } => rect.contains(p),
         };
         if hit {
             return Some(i);
@@ -204,6 +264,17 @@ pub fn translated(shape: &Shape, d: egui::Vec2) -> Shape {
             text: text.clone(),
             color: *color,
             size: *size,
+        },
+        Shape::Blur {
+            rect,
+            cells,
+            cols,
+            rows,
+        } => Shape::Blur {
+            rect: rect.translate(d),
+            cells: cells.clone(),
+            cols: *cols,
+            rows: *rows,
         },
     }
 }
@@ -291,6 +362,28 @@ pub fn paint(
                 egui::FontId::proportional(size * scale),
                 *color,
             );
+        }
+        Shape::Blur {
+            rect,
+            cells,
+            cols,
+            rows,
+        } => {
+            if *cols == 0 || *rows == 0 {
+                return;
+            }
+            let cw = rect.width() / *cols as f32;
+            let ch = rect.height() / *rows as f32;
+            for ry in 0..*rows {
+                for cx in 0..*cols {
+                    let min = egui::pos2(rect.min.x + cx as f32 * cw, rect.min.y + ry as f32 * ch);
+                    let cell = egui::Rect::from_min_max(
+                        to_screen(min),
+                        to_screen(egui::pos2(min.x + cw, min.y + ch)),
+                    );
+                    painter.rect_filled(cell, 0, cells[ry * cols + cx]);
+                }
+            }
         }
     }
 }
