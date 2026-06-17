@@ -8,7 +8,6 @@ mod scene;
 use anyhow::{Context, Result};
 
 fn main() -> Result<()> {
-    // Hotkey setup subcommands (no capture/overlay needed).
     match std::env::args().nth(1).as_deref() {
         Some("install-hotkey") => {
             let binding = std::env::args()

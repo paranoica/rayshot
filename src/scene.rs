@@ -69,62 +69,65 @@ pub enum Shape {
         color: egui::Color32,
         size: f32,
     },
-    /// Pixelated (mosaic) region: the average colour of each cell, baked from the
-    /// frame, laid out `cols`×`rows` across `rect`.
     Blur {
-        rect: egui::Rect,
-        cells: Vec<egui::Color32>,
-        cols: usize,
-        rows: usize,
+        cell: f32,
+        cells: Vec<(u32, u32, egui::Color32)>,
     },
 }
 
-/// Bake a mosaic of `rect` (frame pixels) from the captured RGBA8 buffer: the
-/// average colour of each ~`cell`-sized block, row-major.
-pub fn compute_mosaic(
+pub const BLUR_CELL: f32 = 16.0;
+pub const BLUR_BRUSH: f32 = 16.0;
+
+fn cell_color(rgba: &[u8], fw: u32, fh: u32, gx: u32, gy: u32, cell: f32) -> egui::Color32 {
+    let x0 = (gx as f32 * cell) as u32;
+    let y0 = (gy as f32 * cell) as u32;
+    let x1 = (x0 + cell as u32).min(fw);
+    let y1 = (y0 + cell as u32).min(fh);
+    if x1 <= x0 || y1 <= y0 {
+        return egui::Color32::BLACK;
+    }
+    let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
+    for py in y0..y1 {
+        let base = (py * fw + x0) as usize * 4;
+        for px in 0..(x1 - x0) as usize {
+            let i = base + px * 4;
+            r += rgba[i] as u64;
+            g += rgba[i + 1] as u64;
+            b += rgba[i + 2] as u64;
+            n += 1;
+        }
+    }
+    let n = n.max(1);
+    egui::Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
+}
+
+pub fn add_brush_cells(
+    cells: &mut Vec<(u32, u32, egui::Color32)>,
     rgba: &[u8],
     fw: u32,
     fh: u32,
-    rect: egui::Rect,
+    fp: egui::Pos2,
     cell: f32,
-) -> (Vec<egui::Color32>, usize, usize) {
-    let x0 = rect.min.x.floor().clamp(0.0, fw as f32) as u32;
-    let y0 = rect.min.y.floor().clamp(0.0, fh as f32) as u32;
-    let x1 = rect.max.x.ceil().clamp(0.0, fw as f32) as u32;
-    let y1 = rect.max.y.ceil().clamp(0.0, fh as f32) as u32;
-    if x1 <= x0 || y1 <= y0 {
-        return (Vec::new(), 0, 0);
-    }
-    let cell = cell.max(2.0);
-    let cols = (((x1 - x0) as f32) / cell).ceil() as usize;
-    let rows = (((y1 - y0) as f32) / cell).ceil() as usize;
-    let mut cells = Vec::with_capacity(cols * rows);
-    for ry in 0..rows {
-        for cx in 0..cols {
-            let cx0 = x0 + (cx as f32 * cell) as u32;
-            let cy0 = y0 + (ry as f32 * cell) as u32;
-            let cx1 = (cx0 + cell as u32).min(x1);
-            let cy1 = (cy0 + cell as u32).min(y1);
-            let (mut r, mut g, mut b, mut n) = (0u64, 0u64, 0u64, 0u64);
-            for py in cy0..cy1 {
-                let base = (py * fw + cx0) as usize * 4;
-                for px in 0..(cx1 - cx0) as usize {
-                    let i = base + px * 4;
-                    r += rgba[i] as u64;
-                    g += rgba[i + 1] as u64;
-                    b += rgba[i + 2] as u64;
-                    n += 1;
-                }
+    brush: f32,
+) {
+    let max_gx = (fw as f32 / cell).ceil() as u32;
+    let max_gy = (fh as f32 / cell).ceil() as u32;
+    let gx0 = ((fp.x - brush).max(0.0) / cell) as u32;
+    let gy0 = ((fp.y - brush).max(0.0) / cell) as u32;
+    let gx1 = (((fp.x + brush) / cell) as u32).min(max_gx.saturating_sub(1));
+    let gy1 = (((fp.y + brush) / cell) as u32).min(max_gy.saturating_sub(1));
+    for gy in gy0..=gy1 {
+        for gx in gx0..=gx1 {
+            let cxc = (gx as f32 + 0.5) * cell;
+            let cyc = (gy as f32 + 0.5) * cell;
+            if (egui::pos2(cxc, cyc) - fp).length() > brush + cell * 0.5 {
+                continue;
             }
-            let n = n.max(1);
-            cells.push(egui::Color32::from_rgb(
-                (r / n) as u8,
-                (g / n) as u8,
-                (b / n) as u8,
-            ));
+            if !cells.iter().any(|&(x, y, _)| x == gx && y == gy) {
+                cells.push((gx, gy, cell_color(rgba, fw, fh, gx, gy, cell)));
+            }
         }
     }
-    (cells, cols, rows)
 }
 
 #[derive(Default)]
@@ -207,7 +210,7 @@ pub fn shape_hit(shapes: &[Shape], p: egui::Pos2) -> Option<usize> {
             Shape::Text {
                 pos, text, size, ..
             } => text_box(*pos, text, *size).contains(p),
-            Shape::Blur { rect, .. } => rect.contains(p),
+            Shape::Blur { .. } => false,
         };
         if hit {
             return Some(i);
@@ -265,16 +268,9 @@ pub fn translated(shape: &Shape, d: egui::Vec2) -> Shape {
             color: *color,
             size: *size,
         },
-        Shape::Blur {
-            rect,
-            cells,
-            cols,
-            rows,
-        } => Shape::Blur {
-            rect: rect.translate(d),
+        Shape::Blur { cell, cells } => Shape::Blur {
+            cell: *cell,
             cells: cells.clone(),
-            cols: *cols,
-            rows: *rows,
         },
     }
 }
@@ -363,26 +359,14 @@ pub fn paint(
                 *color,
             );
         }
-        Shape::Blur {
-            rect,
-            cells,
-            cols,
-            rows,
-        } => {
-            if *cols == 0 || *rows == 0 {
-                return;
-            }
-            let cw = rect.width() / *cols as f32;
-            let ch = rect.height() / *rows as f32;
-            for ry in 0..*rows {
-                for cx in 0..*cols {
-                    let min = egui::pos2(rect.min.x + cx as f32 * cw, rect.min.y + ry as f32 * ch);
-                    let cell = egui::Rect::from_min_max(
-                        to_screen(min),
-                        to_screen(egui::pos2(min.x + cw, min.y + ch)),
-                    );
-                    painter.rect_filled(cell, 0, cells[ry * cols + cx]);
-                }
+        Shape::Blur { cell, cells } => {
+            for &(gx, gy, color) in cells {
+                let min = egui::pos2(gx as f32 * cell, gy as f32 * cell);
+                let r = egui::Rect::from_min_max(
+                    to_screen(min),
+                    to_screen(egui::pos2(min.x + cell, min.y + cell)),
+                );
+                painter.rect_filled(r, 0, color);
             }
         }
     }
