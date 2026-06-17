@@ -34,6 +34,7 @@ struct Captured {
 
 pub struct ScreencastSession {
     latest: Arc<Mutex<Vec<Captured>>>,
+    want: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ScreencastSession {
@@ -53,36 +54,53 @@ impl ScreencastSession {
             })
             .collect();
         let latest = Arc::new(Mutex::new(latest));
+        let want = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shared = latest.clone();
+        let want_thread = want.clone();
         let fd = portal.fd;
         let infos = portal.streams;
         std::thread::Builder::new()
             .name("rayshot-pw".into())
             .spawn(move || {
-                if let Err(e) = run_pw_loop(fd, infos, shared) {
+                if let Err(e) = run_pw_loop(fd, infos, shared, want_thread) {
                     eprintln!("[rayshot] screencast pipewire loop failed: {e:?}");
                 }
             })
             .context("spawn pipewire thread")?;
-        Ok(Self { latest })
+        Ok(Self { latest, want })
     }
 
-    pub fn wait_ready(&self, timeout: Duration) -> bool {
+    fn grab_inner(&self, timeout: Duration) -> Result<Frame> {
+        use std::sync::atomic::Ordering;
+        {
+            let mut slots = self.latest.lock().unwrap();
+            for c in slots.iter_mut() {
+                c.done = false;
+            }
+        }
+        self.want.store(true, Ordering::SeqCst);
         let start = Instant::now();
         loop {
             if self.latest.lock().unwrap().iter().all(|c| c.done) {
-                return true;
+                break;
             }
             if start.elapsed() > timeout {
-                return false;
+                self.want.store(false, Ordering::SeqCst);
+                return Err(anyhow!("timed out waiting for screencast frames"));
             }
-            std::thread::sleep(Duration::from_millis(5));
+            std::thread::sleep(Duration::from_millis(2));
         }
+        self.want.store(false, Ordering::SeqCst);
+        let slots = self.latest.lock().unwrap();
+        composite(&slots)
+    }
+
+    pub fn wait_ready(&self, timeout: Duration) -> bool {
+        self.grab_inner(timeout).is_ok()
     }
 
     pub fn grab(&self) -> Result<Frame> {
-        let slots = self.latest.lock().unwrap();
-        composite(&slots)
+        self.grab_inner(Duration::from_millis(700))
     }
 }
 
@@ -167,7 +185,12 @@ struct FmtData {
     format: spa::param::video::VideoInfoRaw,
 }
 
-fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Captured>>>) -> Result<()> {
+fn run_pw_loop(
+    fd: OwnedFd,
+    infos: Vec<StreamInfo>,
+    latest: Arc<Mutex<Vec<Captured>>>,
+    want: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pipewire main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pipewire context")?;
@@ -215,10 +238,14 @@ fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Captur
             })
             .process({
                 let latest = latest.clone();
+                let want = want.clone();
                 move |stream, ud| {
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         return;
                     };
+                    if !want.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
                     let datas = buffer.datas_mut();
                     if datas.is_empty() {
                         return;
