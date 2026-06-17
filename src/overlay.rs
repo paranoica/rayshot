@@ -820,6 +820,12 @@ impl OverlayApp {
                                     );
                                     draft = Some(Shape::Pixelate { cell, cells });
                                 }
+                                Tool::Blur => {
+                                    draft = Some(Shape::Blur {
+                                        points: vec![fp],
+                                        radius: crate::scene::BLUR_BRUSH,
+                                    });
+                                }
                                 _ => {}
                             }
                         }
@@ -878,10 +884,8 @@ impl OverlayApp {
                                     }
                                 }
                                 Tool::Blur => {
-                                    if let Some(st) = draft_start {
-                                        draft = Some(Shape::Blur {
-                                            rect: egui::Rect::from_two_pos(st, fp),
-                                        });
+                                    if let Some(Shape::Blur { points, .. }) = &mut draft {
+                                        points.push(fp);
                                     }
                                 }
                                 _ => {}
@@ -899,6 +903,7 @@ impl OverlayApp {
                 Tool::Pen | Tool::Line => Some((stroke_width * 0.5).max(5.0)),
                 Tool::Marker => Some(8.0),
                 Tool::Pixelate => Some(crate::scene::PIXEL_BRUSH),
+                Tool::Blur => Some(crate::scene::BLUR_BRUSH),
                 _ => None,
             };
             let brush_active = resp.hovered() || resp.dragged();

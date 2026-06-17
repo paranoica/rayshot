@@ -77,7 +77,8 @@ pub enum Shape {
         cells: Vec<(u32, u32, egui::Color32)>,
     },
     Blur {
-        rect: egui::Rect,
+        points: Vec<egui::Pos2>,
+        radius: f32,
     },
 }
 
@@ -355,7 +356,10 @@ pub fn translated(shape: &Shape, d: egui::Vec2) -> Shape {
             cell: *cell,
             cells: cells.clone(),
         },
-        Shape::Blur { rect } => Shape::Blur { rect: *rect },
+        Shape::Blur { points, radius } => Shape::Blur {
+            points: points.iter().map(|p| *p + d).collect(),
+            radius: *radius,
+        },
     }
 }
 
@@ -456,13 +460,58 @@ pub fn paint(
                 painter.rect_filled(r, 0, color);
             }
         }
-        Shape::Blur { rect } => {
-            let r = egui::Rect::from_two_pos(to_screen(rect.min), to_screen(rect.max));
-            let uv = egui::Rect::from_min_max(
-                egui::pos2(rect.min.x / frame_w, rect.min.y / frame_h),
-                egui::pos2(rect.max.x / frame_w, rect.max.y / frame_h),
-            );
-            painter.image(blur_tex, r, uv, egui::Color32::WHITE);
+        Shape::Blur { points, radius } => {
+            if points.is_empty() {
+                return;
+            }
+            let r = *radius;
+            let white = egui::Color32::WHITE;
+            let uvof = |fp: egui::Pos2| egui::pos2(fp.x / frame_w, fp.y / frame_h);
+            let vert = |fp: egui::Pos2| egui::epaint::Vertex {
+                pos: to_screen(fp),
+                uv: uvof(fp),
+                color: white,
+            };
+            let mut mesh = egui::Mesh::with_texture(blur_tex);
+            let segs = 20u32;
+            for &c in points {
+                let base = mesh.vertices.len() as u32;
+                mesh.vertices.push(vert(c));
+                for i in 0..segs {
+                    let a = std::f32::consts::TAU * i as f32 / segs as f32;
+                    mesh.vertices
+                        .push(vert(egui::pos2(c.x + r * a.cos(), c.y + r * a.sin())));
+                }
+                for i in 0..segs {
+                    mesh.indices.extend_from_slice(&[
+                        base,
+                        base + 1 + i,
+                        base + 1 + (i + 1) % segs,
+                    ]);
+                }
+            }
+            for w in points.windows(2) {
+                let (a, b) = (w[0], w[1]);
+                let dir = b - a;
+                let len = dir.length();
+                if len < 0.01 {
+                    continue;
+                }
+                let n = egui::vec2(-dir.y, dir.x) / len * r;
+                let base = mesh.vertices.len() as u32;
+                for &fp in &[a + n, b + n, b - n, a - n] {
+                    mesh.vertices.push(vert(fp));
+                }
+                mesh.indices.extend_from_slice(&[
+                    base,
+                    base + 1,
+                    base + 2,
+                    base,
+                    base + 2,
+                    base + 3,
+                ]);
+            }
+            painter.add(egui::Shape::mesh(mesh));
         }
     }
 }
