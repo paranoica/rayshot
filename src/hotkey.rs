@@ -71,7 +71,8 @@ fn write_autostart(exe: &str) {
 }
 
 fn start_daemon(exe: &str) {
-    let _ = Command::new(exe)
+    let _ = Command::new("setsid")
+        .arg(exe)
         .arg("daemon")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
