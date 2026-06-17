@@ -68,6 +68,7 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
     if !session.wait_ready(std::time::Duration::from_secs(15)) {
         anyhow::bail!("screencast stream did not start in time");
     }
+    crate::anim::install_daemon_restore();
     eprintln!("[rayshot] daemon: screencast stream live");
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
@@ -307,16 +308,22 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 if self.active {
                     return;
                 }
+                crate::anim::set_animations(false);
                 let frame = match self.screencast.as_ref().map(|s| s.grab()) {
                     Some(Ok(f)) => f,
                     Some(Err(e)) => {
                         eprintln!("[rayshot] daemon grab failed: {e:?}");
+                        crate::anim::set_animations(true);
                         return;
                     }
-                    None => return,
+                    None => {
+                        crate::anim::set_animations(true);
+                        return;
+                    }
                 };
                 if let Err(e) = self.init_gpu(event_loop) {
                     eprintln!("[rayshot] daemon gpu init failed: {e:?}");
+                    crate::anim::set_animations(true);
                     return;
                 }
                 self.attach_frame(event_loop, frame);
@@ -1895,6 +1902,7 @@ impl OverlayApp {
         self.selection = None;
         self.tool = crate::scene::Tool::Select;
         self.active = false;
+        crate::anim::set_animations(true);
     }
 
     fn finish_and_exit(&mut self, event_loop: &ActiveEventLoop) {
