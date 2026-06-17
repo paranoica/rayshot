@@ -40,8 +40,20 @@ fn main() -> Result<()> {
         }
         Some("uninstall-hotkey") => return hotkey::uninstall(),
         Some("monitors") => return overlay::list_monitors(),
+        Some("daemon") => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            return overlay::run_daemon(rt.handle().clone());
+        }
         _ => {}
     }
+
+    if std::env::args().nth(1).as_deref() == Some("trigger") && overlay::trigger()? {
+        return Ok(());
+    }
+
     let shot_pw = std::env::args().nth(1).as_deref() == Some("shot-pw");
     let shot = std::env::args().nth(1).as_deref() == Some("shot");
 

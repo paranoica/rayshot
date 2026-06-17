@@ -39,6 +39,7 @@ pub fn list_monitors() -> Result<()> {
 
 enum UserEvent {
     Captured(Result<Frame, String>),
+    Trigger,
 }
 
 pub fn run(rt: Handle) -> Result<()> {
@@ -55,6 +56,60 @@ pub fn run(rt: Handle) -> Result<()> {
     let mut app = OverlayApp::new(rt);
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
+}
+
+pub fn daemon_socket_path() -> std::path::PathBuf {
+    crate::export::scratch_dir().join("daemon.sock")
+}
+
+pub fn run_daemon(rt: Handle) -> Result<()> {
+    let session = crate::screencast::ScreencastSession::start(&rt)
+        .context("failed to start screencast session")?;
+    if !session.wait_ready(std::time::Duration::from_secs(15)) {
+        anyhow::bail!("screencast stream did not start in time");
+    }
+    eprintln!("[rayshot] daemon: screencast stream live");
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("failed to create winit event loop")?;
+    let proxy = event_loop.create_proxy();
+
+    let sock_path = daemon_socket_path();
+    let _ = std::fs::remove_file(&sock_path);
+    if let Some(dir) = sock_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&sock_path)
+        .context("failed to bind daemon socket")?;
+    std::thread::Builder::new()
+        .name("rayshot-trigger".into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_ok() {
+                    let _ = proxy.send_event(UserEvent::Trigger);
+                }
+            }
+        })
+        .context("spawn trigger listener")?;
+    eprintln!("[rayshot] daemon: listening on {}", sock_path.display());
+
+    let mut app = OverlayApp::new(rt);
+    app.daemon = true;
+    app.screencast = Some(session);
+    event_loop.run_app(&mut app).context("event loop error")?;
+    Ok(())
+}
+
+pub fn trigger() -> Result<bool> {
+    use std::io::Write;
+    match std::os::unix::net::UnixStream::connect(daemon_socket_path()) {
+        Ok(mut s) => {
+            let _ = s.write_all(b"go");
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +156,9 @@ struct OverlayApp {
     move_shape: Option<(usize, crate::scene::Shape)>,
     text_sel: Option<(usize, usize, usize)>,
     blurred: Option<Arc<Vec<u8>>>,
+    daemon: bool,
+    active: bool,
+    screencast: Option<crate::screencast::ScreencastSession>,
 }
 
 impl OverlayApp {
@@ -128,6 +186,9 @@ impl OverlayApp {
             move_shape: None,
             text_sel: None,
             blurred: None,
+            daemon: false,
+            active: false,
+            screencast: None,
         }
     }
 }
@@ -216,6 +277,9 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             return;
         }
         self.initialized = true;
+        if self.daemon {
+            return;
+        }
         if let Err(e) = self.init_gpu(event_loop) {
             eprintln!("[rayshot] failed to initialize overlay: {e:?}");
             event_loop.exit();
@@ -239,6 +303,25 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 eprintln!("[rayshot] desktop capture failed: {e}");
                 event_loop.exit();
             }
+            UserEvent::Trigger => {
+                if self.active {
+                    return;
+                }
+                let frame = match self.screencast.as_ref().map(|s| s.grab()) {
+                    Some(Ok(f)) => f,
+                    Some(Err(e)) => {
+                        eprintln!("[rayshot] daemon grab failed: {e:?}");
+                        return;
+                    }
+                    None => return,
+                };
+                if let Err(e) = self.init_gpu(event_loop) {
+                    eprintln!("[rayshot] daemon gpu init failed: {e:?}");
+                    return;
+                }
+                self.attach_frame(event_loop, frame);
+                self.active = true;
+            }
         }
     }
 
@@ -258,7 +341,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
         match event {
             WindowEvent::CloseRequested => {
                 eprintln!("[rayshot] exit: CloseRequested");
-                self.hide_and_exit(event_loop);
+                self.close(event_loop);
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -286,7 +369,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                         use crate::scene::Tool;
                         if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
                             eprintln!("[rayshot] exit: Escape (cancelled)");
-                            self.hide_and_exit(event_loop);
+                            self.close(event_loop);
                         } else if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
                             self.finish_and_exit(event_loop);
                         } else if ctrl && is(KeyCode::KeyC) {
@@ -347,7 +430,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                     Some(Action::Save) => self.save_and_exit(event_loop),
                     Some(Action::Close) => {
                         eprintln!("[rayshot] exit: toolbar close");
-                        self.hide_and_exit(event_loop);
+                        self.close(event_loop);
                     }
                     None => {}
                 }
@@ -624,7 +707,7 @@ impl OverlayApp {
             unsafe { libc::_exit(0) };
         }
         if std::env::var_os("RAYSHOT_TEST_QUIT").is_some() {
-            self.hide_and_exit(event_loop);
+            self.close(event_loop);
         }
     }
 
@@ -1782,28 +1865,50 @@ impl OverlayApp {
         }
     }
 
-    fn hide_and_exit(&self, _event_loop: &ActiveEventLoop) -> ! {
+    fn close(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(sel) = self.selection {
             if sel.width() > 1.0 && sel.height() > 1.0 {
                 crate::export::save_last_selection(sel.min.x, sel.min.y, sel.width(), sel.height());
             }
         }
-        crate::anim::restore_detached();
-        unsafe { libc::_exit(0) }
+        if self.daemon {
+            self.teardown_session();
+        } else {
+            crate::anim::restore_detached();
+            unsafe { libc::_exit(0) }
+        }
     }
 
-    fn finish_and_exit(&self, event_loop: &ActiveEventLoop) {
+    fn teardown_session(&mut self) {
+        self.windows.clear();
+        self.shared = None;
+        self.scene = crate::scene::Scene::default();
+        self.draft = None;
+        self.draft_start = None;
+        self.text_edit = None;
+        self.text_sel = None;
+        self.move_shape = None;
+        self.sel_mode = None;
+        self.blurred = None;
+        self.frame = None;
+        self.pending = None;
+        self.selection = None;
+        self.tool = crate::scene::Tool::Select;
+        self.active = false;
+    }
+
+    fn finish_and_exit(&mut self, event_loop: &ActiveEventLoop) {
         match self.finish() {
             Ok(Some(path)) => {
                 eprintln!("[rayshot] copied to clipboard + saved {}", path.display());
-                self.hide_and_exit(event_loop);
+                self.close(event_loop);
             }
             Ok(None) => eprintln!("[rayshot] nothing to copy (no selection)"),
             Err(e) => eprintln!("[rayshot] finish failed: {e:?}"),
         }
     }
 
-    fn save_and_exit(&self, event_loop: &ActiveEventLoop) {
+    fn save_and_exit(&mut self, event_loop: &ActiveEventLoop) {
         let img = match self.render_selection_to_image() {
             Ok(Some(img)) => img,
             Ok(None) => {
@@ -1820,7 +1925,7 @@ impl OverlayApp {
         {
             Ok(path) => {
                 eprintln!("[rayshot] saved {}", path.display());
-                self.hide_and_exit(event_loop);
+                self.close(event_loop);
             }
             Err(e) => eprintln!("[rayshot] save failed: {e:#}"),
         }
