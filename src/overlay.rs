@@ -64,6 +64,21 @@ pub fn daemon_socket_path() -> std::path::PathBuf {
 }
 
 pub fn run_daemon(rt: Handle) -> Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let dir = crate::export::scratch_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("daemon.lock"))
+        .context("open daemon lock")?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        eprintln!("[rayshot] daemon already running");
+        return Ok(());
+    }
+    std::mem::forget(lock);
+
     let session = crate::screencast::ScreencastSession::start(&rt)
         .context("failed to start screencast session")?;
     if !session.wait_ready(std::time::Duration::from_secs(15)) {

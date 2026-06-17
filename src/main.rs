@@ -33,10 +33,14 @@ fn acquire_single_instance() -> bool {
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("install-hotkey") => {
-            let binding = std::env::args()
-                .nth(2)
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let daemon = args.iter().any(|a| a == "--daemon");
+            let binding = args
+                .iter()
+                .find(|a| !a.starts_with("--"))
+                .cloned()
                 .unwrap_or_else(|| "Print".to_string());
-            return hotkey::install(&binding);
+            return hotkey::install(&binding, daemon);
         }
         Some("uninstall-hotkey") => return hotkey::uninstall(),
         Some("monitors") => return overlay::list_monitors(),
