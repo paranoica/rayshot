@@ -261,12 +261,13 @@ impl ApplicationHandler for OverlayApp {
                     self.frame.width,
                     self.frame.height,
                     egui::pos2(950.0 + i as f32 * 12.0, 300.0),
-                    crate::scene::BLUR_CELL,
-                    crate::scene::BLUR_BRUSH,
+                    crate::scene::PIXEL_CELL,
+                    crate::scene::PIXEL_BRUSH,
+                    crate::scene::PIXEL_SAMPLE,
                 );
             }
             self.scene.push(Shape::Blur {
-                cell: crate::scene::BLUR_CELL,
+                cell: crate::scene::PIXEL_CELL,
                 cells: bcells,
             });
         }
@@ -360,6 +361,8 @@ impl ApplicationHandler for OverlayApp {
                                 Some(Tool::Marker)
                             } else if is(KeyCode::KeyT) {
                                 Some(Tool::Text)
+                            } else if is(KeyCode::KeyX) {
+                                Some(Tool::Pixelate)
                             } else if is(KeyCode::KeyB) {
                                 Some(Tool::Blur)
                             } else {
@@ -741,7 +744,8 @@ impl OverlayApp {
                                         width: 16.0,
                                     });
                                 }
-                                Tool::Blur => {
+                                Tool::Blur | Tool::Pixelate => {
+                                    let (cell, brush, sample) = brush_params(tool);
                                     let mut cells = Vec::new();
                                     crate::scene::add_brush_cells(
                                         &mut cells,
@@ -749,13 +753,11 @@ impl OverlayApp {
                                         frame.width,
                                         frame.height,
                                         fp,
-                                        crate::scene::BLUR_CELL,
-                                        crate::scene::BLUR_BRUSH,
+                                        cell,
+                                        brush,
+                                        sample,
                                     );
-                                    draft = Some(Shape::Blur {
-                                        cell: crate::scene::BLUR_CELL,
-                                        cells,
-                                    });
+                                    draft = Some(Shape::Blur { cell, cells });
                                 }
                                 _ => {}
                             }
@@ -799,8 +801,9 @@ impl OverlayApp {
                                         points.push(fp);
                                     }
                                 }
-                                Tool::Blur => {
+                                Tool::Blur | Tool::Pixelate => {
                                     if let Some(Shape::Blur { cell, cells }) = &mut draft {
+                                        let (_, brush, sample) = brush_params(tool);
                                         crate::scene::add_brush_cells(
                                             cells,
                                             &frame.rgba,
@@ -808,7 +811,8 @@ impl OverlayApp {
                                             frame.height,
                                             fp,
                                             *cell,
-                                            crate::scene::BLUR_BRUSH,
+                                            brush,
+                                            sample,
                                         );
                                     }
                                 }
@@ -823,11 +827,10 @@ impl OverlayApp {
                 }
             }
 
-            // Tool-specific cursor over the canvas (Select sets its own above).
             match tool {
                 Tool::Select => {}
                 Tool::Text => ui.ctx().set_cursor_icon(egui::CursorIcon::Text),
-                Tool::Blur => ui.ctx().set_cursor_icon(egui::CursorIcon::Cell),
+                Tool::Blur | Tool::Pixelate => ui.ctx().set_cursor_icon(egui::CursorIcon::Cell),
                 _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair),
             }
 
@@ -1108,10 +1111,6 @@ impl OverlayApp {
                 if region.contains(sel.max) {
                     let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
 
-                    // Place the tool/action stack beside the selection so it never
-                    // overflows the screen edges or overlaps itself. Use the actual
-                    // sizes measured on the previous frame (self-correcting), with a
-                    // generous estimate as the first-frame fallback.
                     let tools_id = egui::Id::new("rayshot-tools");
                     let actions_id = egui::Id::new("rayshot-actions");
                     let tools_sz = egui::AreaState::load(ui.ctx(), tools_id)
@@ -1125,8 +1124,6 @@ impl OverlayApp {
                     let total_h = tools_sz.y + gap + actions_sz.y;
                     let pad = 8.0;
 
-                    // Horizontal: prefer the right of the selection, fall back to the
-                    // left, then clamp inside if the selection is very wide.
                     let mut x = s.right() + 10.0;
                     if x + width > avail.right() - pad {
                         x = s.left() - 10.0 - width;
@@ -1135,8 +1132,6 @@ impl OverlayApp {
                         x = (avail.right() - pad - width).max(avail.left() + pad);
                     }
 
-                    // Vertical: start at the selection top, shift up if the stack would
-                    // run past the bottom, never above the top.
                     let mut top = s.top();
                     if top + total_h > avail.bottom() - pad {
                         top = avail.bottom() - pad - total_h;
@@ -1159,15 +1154,14 @@ impl OverlayApp {
                                         Tool::Rect,
                                         Tool::Marker,
                                         Tool::Text,
+                                        Tool::Pixelate,
                                         Tool::Blur,
                                         Tool::Select,
                                     ] {
-                                        let btn = if matches!(t, Tool::Blur) {
-                                            blur_tool_button(ui, tool == t)
-                                        } else {
-                                            tool_button(ui, t.icon(), tool == t)
-                                        };
-                                        if btn.on_hover_text(t.tooltip()).clicked() {
+                                        if tool_button(ui, t.icon(), tool == t)
+                                            .on_hover_text(t.tooltip())
+                                            .clicked()
+                                        {
                                             tool = t;
                                         }
                                     }
@@ -1654,37 +1648,12 @@ fn tool_button(ui: &mut egui::Ui, glyph: &str, selected: bool) -> egui::Response
     )
 }
 
-/// The pixelate (Blur) tool button — a vector 3×3 mosaic, drawn by hand so it's
-/// unmistakable regardless of icon-font coverage.
-fn blur_tool_button(ui: &mut egui::Ui, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::click());
-    let bg = if selected {
-        egui::Color32::from_rgb(54, 110, 200)
-    } else if resp.hovered() {
-        ui.visuals().widgets.hovered.bg_fill
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    ui.painter().rect_filled(rect, 4.0, bg);
-    let area = rect.shrink(8.0);
-    let n = 3usize;
-    let gap = 1.5;
-    let cs = (area.width() - gap * (n as f32 - 1.0)) / n as f32;
-    for r in 0..n {
-        for c in 0..n {
-            let min = egui::pos2(
-                area.left() + c as f32 * (cs + gap),
-                area.top() + r as f32 * (cs + gap),
-            );
-            let shade = if (r + c) % 2 == 0 { 235 } else { 150 };
-            ui.painter().rect_filled(
-                egui::Rect::from_min_size(min, egui::vec2(cs, cs)),
-                0.0,
-                egui::Color32::from_gray(shade),
-            );
-        }
+fn brush_params(tool: crate::scene::Tool) -> (f32, f32, f32) {
+    use crate::scene;
+    match tool {
+        scene::Tool::Pixelate => (scene::PIXEL_CELL, scene::PIXEL_BRUSH, scene::PIXEL_SAMPLE),
+        _ => (scene::BLUR_CELL, scene::BLUR_BRUSH, scene::BLUR_SAMPLE),
     }
-    resp
 }
 
 fn parse_crop(spec: &str) -> Option<egui::Rect> {

@@ -7,6 +7,7 @@ pub enum Tool {
     Rect,
     Marker,
     Text,
+    Pixelate,
     Blur,
 }
 
@@ -21,7 +22,8 @@ impl Tool {
             Tool::Rect => p::RECTANGLE,
             Tool::Marker => p::HIGHLIGHTER,
             Tool::Text => p::TEXT_T,
-            Tool::Blur => p::SQUARES_FOUR,
+            Tool::Pixelate => p::SQUARES_FOUR,
+            Tool::Blur => p::DROP,
         }
     }
 
@@ -34,7 +36,8 @@ impl Tool {
             Tool::Rect => "Rectangle (R)",
             Tool::Marker => "Marker (M)",
             Tool::Text => "Text (T)",
-            Tool::Blur => "Pixelate (B)",
+            Tool::Pixelate => "Pixelate (X)",
+            Tool::Blur => "Blur (B)",
         }
     }
 }
@@ -75,14 +78,18 @@ pub enum Shape {
     },
 }
 
-pub const BLUR_CELL: f32 = 16.0;
+pub const PIXEL_CELL: f32 = 16.0;
+pub const PIXEL_BRUSH: f32 = 16.0;
+pub const PIXEL_SAMPLE: f32 = 8.0;
+pub const BLUR_CELL: f32 = 4.0;
 pub const BLUR_BRUSH: f32 = 16.0;
+pub const BLUR_SAMPLE: f32 = 10.0;
 
-fn cell_color(rgba: &[u8], fw: u32, fh: u32, gx: u32, gy: u32, cell: f32) -> egui::Color32 {
-    let x0 = (gx as f32 * cell) as u32;
-    let y0 = (gy as f32 * cell) as u32;
-    let x1 = (x0 + cell as u32).min(fw);
-    let y1 = (y0 + cell as u32).min(fh);
+fn box_color(rgba: &[u8], fw: u32, fh: u32, cx: f32, cy: f32, half: f32) -> egui::Color32 {
+    let x0 = (cx - half).max(0.0) as u32;
+    let y0 = (cy - half).max(0.0) as u32;
+    let x1 = ((cx + half) as u32).min(fw);
+    let y1 = ((cy + half) as u32).min(fh);
     if x1 <= x0 || y1 <= y0 {
         return egui::Color32::BLACK;
     }
@@ -109,6 +116,7 @@ pub fn add_brush_cells(
     fp: egui::Pos2,
     cell: f32,
     brush: f32,
+    sample: f32,
 ) {
     let max_gx = (fw as f32 / cell).ceil() as u32;
     let max_gy = (fh as f32 / cell).ceil() as u32;
@@ -116,6 +124,8 @@ pub fn add_brush_cells(
     let gy0 = ((fp.y - brush).max(0.0) / cell) as u32;
     let gx1 = (((fp.x + brush) / cell) as u32).min(max_gx.saturating_sub(1));
     let gy1 = (((fp.y + brush) / cell) as u32).min(max_gy.saturating_sub(1));
+    let mut seen: std::collections::HashSet<(u32, u32)> =
+        cells.iter().map(|&(x, y, _)| (x, y)).collect();
     for gy in gy0..=gy1 {
         for gx in gx0..=gx1 {
             let cxc = (gx as f32 + 0.5) * cell;
@@ -123,8 +133,8 @@ pub fn add_brush_cells(
             if (egui::pos2(cxc, cyc) - fp).length() > brush + cell * 0.5 {
                 continue;
             }
-            if !cells.iter().any(|&(x, y, _)| x == gx && y == gy) {
-                cells.push((gx, gy, cell_color(rgba, fw, fh, gx, gy, cell)));
+            if seen.insert((gx, gy)) {
+                cells.push((gx, gy, box_color(rgba, fw, fh, cxc, cyc, sample)));
             }
         }
     }
