@@ -86,6 +86,7 @@ struct OverlayApp {
     text_edit: Option<TextDraft>,
     move_shape: Option<(usize, crate::scene::Shape)>,
     text_sel: Option<(usize, usize, usize)>,
+    blurred: Option<Arc<Vec<u8>>>,
 }
 
 impl OverlayApp {
@@ -116,6 +117,7 @@ impl OverlayApp {
             text_edit: None,
             move_shape: None,
             text_sel: None,
+            blurred: None,
         }
     }
 }
@@ -561,6 +563,11 @@ impl OverlayApp {
         let frame_w = self.frame.width as f32;
         let frame_h = self.frame.height as f32;
         let frame = self.frame.clone();
+        if matches!(self.tool, crate::scene::Tool::Blur) && self.blurred.is_none() {
+            let b = crate::scene::blur_frame(&self.frame.rgba, self.frame.width, self.frame.height);
+            self.blurred = Some(Arc::new(b));
+        }
+        let blurred = self.blurred.clone();
         let win = &mut self.windows[idx];
 
         win.frames += 1;
@@ -746,10 +753,18 @@ impl OverlayApp {
                                 }
                                 Tool::Blur | Tool::Pixelate => {
                                     let (cell, brush, sample) = brush_params(tool);
+                                    let src: &[u8] = if matches!(tool, Tool::Blur) {
+                                        blurred
+                                            .as_ref()
+                                            .map(|b| b.as_slice())
+                                            .unwrap_or(&frame.rgba)
+                                    } else {
+                                        &frame.rgba
+                                    };
                                     let mut cells = Vec::new();
                                     crate::scene::add_brush_cells(
                                         &mut cells,
-                                        &frame.rgba,
+                                        src,
                                         frame.width,
                                         frame.height,
                                         fp,
@@ -804,9 +819,17 @@ impl OverlayApp {
                                 Tool::Blur | Tool::Pixelate => {
                                     if let Some(Shape::Blur { cell, cells }) = &mut draft {
                                         let (_, brush, sample) = brush_params(tool);
+                                        let src: &[u8] = if matches!(tool, Tool::Blur) {
+                                            blurred
+                                                .as_ref()
+                                                .map(|b| b.as_slice())
+                                                .unwrap_or(&frame.rgba)
+                                        } else {
+                                            &frame.rgba
+                                        };
                                         crate::scene::add_brush_cells(
                                             cells,
-                                            &frame.rgba,
+                                            src,
                                             frame.width,
                                             frame.height,
                                             fp,
@@ -828,6 +851,7 @@ impl OverlayApp {
             }
 
             let brush_ring = match tool {
+                Tool::Pen | Tool::Line => Some((stroke_width * 0.5).max(5.0)),
                 Tool::Marker => Some(8.0),
                 Tool::Pixelate => Some(crate::scene::PIXEL_BRUSH),
                 Tool::Blur => Some(crate::scene::BLUR_BRUSH),
@@ -953,6 +977,9 @@ impl OverlayApp {
             }
             if let Some(d) = &draft {
                 crate::scene::paint(painter, d, &to_screen, scale);
+            }
+            if let Some(c) = &committed {
+                crate::scene::paint(painter, c, &to_screen, scale);
             }
             if let (Some(r), Some(p)) = (brush_ring, raw_cursor) {
                 if brush_active {

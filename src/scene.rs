@@ -83,7 +83,76 @@ pub const PIXEL_BRUSH: f32 = 16.0;
 pub const PIXEL_SAMPLE: f32 = 8.0;
 pub const BLUR_CELL: f32 = 3.0;
 pub const BLUR_BRUSH: f32 = 16.0;
-pub const BLUR_SAMPLE: f32 = 18.0;
+pub const BLUR_SAMPLE: f32 = 2.0;
+pub const BLUR_RADIUS: usize = 8;
+pub const BLUR_PASSES: usize = 3;
+
+pub fn blur_frame(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let w = w as usize;
+    let h = h as usize;
+    let mut src = rgba.to_vec();
+    let mut tmp = vec![0u8; src.len()];
+    for _ in 0..BLUR_PASSES {
+        box_blur_h(&src, &mut tmp, w, h, BLUR_RADIUS);
+        box_blur_v(&tmp, &mut src, w, h, BLUR_RADIUS);
+    }
+    src
+}
+
+fn box_blur_h(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    for y in 0..h {
+        let base = y * w * 4;
+        for c in 0..4 {
+            let mut sum: u32 = 0;
+            for x in 0..=r.min(w - 1) {
+                sum += src[base + x * 4 + c] as u32;
+            }
+            let mut lo: isize = -(r as isize);
+            let mut hi: isize = r as isize;
+            for x in 0..w {
+                let count = (hi.min(w as isize - 1) - lo.max(0) + 1) as u32;
+                dst[base + x * 4 + c] = (sum / count) as u8;
+                let add = hi + 1;
+                if add < w as isize {
+                    sum += src[base + add as usize * 4 + c] as u32;
+                }
+                if lo >= 0 {
+                    sum -= src[base + lo as usize * 4 + c] as u32;
+                }
+                lo += 1;
+                hi += 1;
+            }
+        }
+    }
+}
+
+fn box_blur_v(src: &[u8], dst: &mut [u8], w: usize, h: usize, r: usize) {
+    let stride = w * 4;
+    for x in 0..w {
+        let col = x * 4;
+        for c in 0..4 {
+            let mut sum: u32 = 0;
+            for y in 0..=r.min(h - 1) {
+                sum += src[col + y * stride + c] as u32;
+            }
+            let mut lo: isize = -(r as isize);
+            let mut hi: isize = r as isize;
+            for y in 0..h {
+                let count = (hi.min(h as isize - 1) - lo.max(0) + 1) as u32;
+                dst[col + y * stride + c] = (sum / count) as u8;
+                let add = hi + 1;
+                if add < h as isize {
+                    sum += src[col + add as usize * stride + c] as u32;
+                }
+                if lo >= 0 {
+                    sum -= src[col + lo as usize * stride + c] as u32;
+                }
+                lo += 1;
+                hi += 1;
+            }
+        }
+    }
+}
 
 fn box_color(rgba: &[u8], fw: u32, fh: u32, cx: f32, cy: f32, half: f32) -> egui::Color32 {
     let x0 = (cx - half).max(0.0) as u32;

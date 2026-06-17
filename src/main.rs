@@ -7,6 +7,28 @@ mod scene;
 
 use anyhow::{Context, Result};
 
+fn acquire_single_instance() -> bool {
+    use std::os::unix::io::AsRawFd;
+    let dir = export::scratch_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("instance.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+    {
+        Ok(f) => f,
+        Err(_) => return true,
+    };
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return false;
+    }
+    std::mem::forget(file);
+    true
+}
+
 fn main() -> Result<()> {
     match std::env::args().nth(1).as_deref() {
         Some("install-hotkey") => {
@@ -20,6 +42,10 @@ fn main() -> Result<()> {
         _ => {}
     }
     let shot = std::env::args().nth(1).as_deref() == Some("shot");
+
+    if !shot && !acquire_single_instance() {
+        return Ok(());
+    }
 
     export::cleanup_old(&export::scratch_dir(), export::SCRATCH_MAX_AGE);
 
