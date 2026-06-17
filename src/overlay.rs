@@ -823,6 +823,14 @@ impl OverlayApp {
                 }
             }
 
+            // Tool-specific cursor over the canvas (Select sets its own above).
+            match tool {
+                Tool::Select => {}
+                Tool::Text => ui.ctx().set_cursor_icon(egui::CursorIcon::Text),
+                Tool::Blur => ui.ctx().set_cursor_icon(egui::CursorIcon::Cell),
+                _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair),
+            }
+
             let painter = ui.painter();
             let dim_alpha = if std::env::var_os("RAYSHOT_NODIM").is_some() {
                 0
@@ -1115,10 +1123,12 @@ impl OverlayApp {
                                         Tool::Blur,
                                         Tool::Select,
                                     ] {
-                                        if tool_button(ui, t.icon(), tool == t)
-                                            .on_hover_text(t.tooltip())
-                                            .clicked()
-                                        {
+                                        let btn = if matches!(t, Tool::Blur) {
+                                            blur_tool_button(ui, tool == t)
+                                        } else {
+                                            tool_button(ui, t.icon(), tool == t)
+                                        };
+                                        if btn.on_hover_text(t.tooltip()).clicked() {
                                             tool = t;
                                         }
                                     }
@@ -1602,6 +1612,39 @@ fn tool_button(ui: &mut egui::Ui, glyph: &str, selected: bool) -> egui::Response
         egui::vec2(30.0, 28.0),
         egui::Button::selectable(selected, text),
     )
+}
+
+/// The pixelate (Blur) tool button — a vector 3×3 mosaic, drawn by hand so it's
+/// unmistakable regardless of icon-font coverage.
+fn blur_tool_button(ui: &mut egui::Ui, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::click());
+    let bg = if selected {
+        egui::Color32::from_rgb(54, 110, 200)
+    } else if resp.hovered() {
+        ui.visuals().widgets.hovered.bg_fill
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 4.0, bg);
+    let area = rect.shrink(8.0);
+    let n = 3usize;
+    let gap = 1.5;
+    let cs = (area.width() - gap * (n as f32 - 1.0)) / n as f32;
+    for r in 0..n {
+        for c in 0..n {
+            let min = egui::pos2(
+                area.left() + c as f32 * (cs + gap),
+                area.top() + r as f32 * (cs + gap),
+            );
+            let shade = if (r + c) % 2 == 0 { 235 } else { 150 };
+            ui.painter().rect_filled(
+                egui::Rect::from_min_size(min, egui::vec2(cs, cs)),
+                0.0,
+                egui::Color32::from_gray(shade),
+            );
+        }
+    }
+    resp
 }
 
 fn parse_crop(spec: &str) -> Option<egui::Rect> {
