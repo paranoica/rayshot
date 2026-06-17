@@ -72,9 +72,12 @@ pub enum Shape {
         color: egui::Color32,
         size: f32,
     },
-    Blur {
+    Pixelate {
         cell: f32,
         cells: Vec<(u32, u32, egui::Color32)>,
+    },
+    Blur {
+        rect: egui::Rect,
     },
 }
 
@@ -289,6 +292,7 @@ pub fn shape_hit(shapes: &[Shape], p: egui::Pos2) -> Option<usize> {
             Shape::Text {
                 pos, text, size, ..
             } => text_box(*pos, text, *size).contains(p),
+            Shape::Pixelate { .. } => false,
             Shape::Blur { .. } => false,
         };
         if hit {
@@ -347,10 +351,11 @@ pub fn translated(shape: &Shape, d: egui::Vec2) -> Shape {
             color: *color,
             size: *size,
         },
-        Shape::Blur { cell, cells } => Shape::Blur {
+        Shape::Pixelate { cell, cells } => Shape::Pixelate {
             cell: *cell,
             cells: cells.clone(),
         },
+        Shape::Blur { rect } => Shape::Blur { rect: *rect },
     }
 }
 
@@ -359,6 +364,9 @@ pub fn paint(
     shape: &Shape,
     to_screen: &impl Fn(egui::Pos2) -> egui::Pos2,
     scale: f32,
+    blur_tex: egui::TextureId,
+    frame_w: f32,
+    frame_h: f32,
 ) {
     match shape {
         Shape::Rect { rect, color, width } => {
@@ -438,7 +446,7 @@ pub fn paint(
                 *color,
             );
         }
-        Shape::Blur { cell, cells } => {
+        Shape::Pixelate { cell, cells } => {
             for &(gx, gy, color) in cells {
                 let min = egui::pos2(gx as f32 * cell, gy as f32 * cell);
                 let r = egui::Rect::from_min_max(
@@ -447,6 +455,14 @@ pub fn paint(
                 );
                 painter.rect_filled(r, 0, color);
             }
+        }
+        Shape::Blur { rect } => {
+            let r = egui::Rect::from_two_pos(to_screen(rect.min), to_screen(rect.max));
+            let uv = egui::Rect::from_min_max(
+                egui::pos2(rect.min.x / frame_w, rect.min.y / frame_h),
+                egui::pos2(rect.max.x / frame_w, rect.max.y / frame_h),
+            );
+            painter.image(blur_tex, r, uv, egui::Color32::WHITE);
         }
     }
 }

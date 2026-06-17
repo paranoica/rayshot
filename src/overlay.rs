@@ -182,6 +182,8 @@ struct Shared {
     queue: wgpu::Queue,
     _frame_texture: wgpu::Texture,
     _frame_view: wgpu::TextureView,
+    _blur_texture: Option<wgpu::Texture>,
+    blur_view: Option<wgpu::TextureView>,
 }
 
 struct WindowState {
@@ -192,6 +194,7 @@ struct WindowState {
     egui_state: egui_winit::State,
     renderer: Renderer,
     frame_texture_id: egui::TextureId,
+    blur_texture_id: Option<egui::TextureId>,
     region: egui::Rect,
     frames: u64,
     cursor: Option<egui::Pos2>,
@@ -268,7 +271,7 @@ impl ApplicationHandler for OverlayApp {
                     crate::scene::PIXEL_SAMPLE,
                 );
             }
-            self.scene.push(Shape::Blur {
+            self.scene.push(Shape::Pixelate {
                 cell: crate::scene::PIXEL_CELL,
                 cells: bcells,
             });
@@ -538,6 +541,7 @@ impl OverlayApp {
                 egui_state,
                 renderer,
                 frame_texture_id,
+                blur_texture_id: None,
                 region,
                 frames: 0,
                 cursor: None,
@@ -550,6 +554,8 @@ impl OverlayApp {
             queue,
             _frame_texture: frame_texture,
             _frame_view: frame_view,
+            _blur_texture: None,
+            blur_view: None,
         });
         self.windows = windows;
         eprintln!("[rayshot] gpu/window init: {:?}", init_started.elapsed());
@@ -567,8 +573,55 @@ impl OverlayApp {
             let b = crate::scene::blur_frame(&self.frame.rgba, self.frame.width, self.frame.height);
             self.blurred = Some(Arc::new(b));
         }
-        let blurred = self.blurred.clone();
+        if let (Some(b), Some(shared)) = (self.blurred.as_ref(), self.shared.as_mut()) {
+            if shared.blur_view.is_none() {
+                let extent = wgpu::Extent3d {
+                    width: self.frame.width,
+                    height: self.frame.height,
+                    depth_or_array_layers: 1,
+                };
+                let tex = shared.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("blur frame"),
+                    size: extent,
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                shared.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    b.as_slice(),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(4 * self.frame.width),
+                        rows_per_image: Some(self.frame.height),
+                    },
+                    extent,
+                );
+                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+                shared._blur_texture = Some(tex);
+                shared.blur_view = Some(view);
+            }
+        }
         let win = &mut self.windows[idx];
+        if win.blur_texture_id.is_none() {
+            if let Some(shared) = self.shared.as_ref() {
+                if let Some(view) = shared.blur_view.as_ref() {
+                    win.blur_texture_id = Some(win.renderer.register_native_texture(
+                        &shared.device,
+                        view,
+                        wgpu::FilterMode::Linear,
+                    ));
+                }
+            }
+        }
 
         win.frames += 1;
         if win.frames <= 2 {
@@ -577,6 +630,7 @@ impl OverlayApp {
 
         let region = win.region;
         let texture_id = win.frame_texture_id;
+        let blur_tex = win.blur_texture_id.unwrap_or(texture_id);
         let raw_cursor = win.cursor;
         let ctx = win.egui_ctx.clone();
         let raw_input = win.egui_state.take_egui_input(&win.window);
@@ -751,20 +805,12 @@ impl OverlayApp {
                                         width: 16.0,
                                     });
                                 }
-                                Tool::Blur | Tool::Pixelate => {
+                                Tool::Pixelate => {
                                     let (cell, brush, sample) = brush_params(tool);
-                                    let src: &[u8] = if matches!(tool, Tool::Blur) {
-                                        blurred
-                                            .as_ref()
-                                            .map(|b| b.as_slice())
-                                            .unwrap_or(&frame.rgba)
-                                    } else {
-                                        &frame.rgba
-                                    };
                                     let mut cells = Vec::new();
                                     crate::scene::add_brush_cells(
                                         &mut cells,
-                                        src,
+                                        &frame.rgba,
                                         frame.width,
                                         frame.height,
                                         fp,
@@ -772,7 +818,7 @@ impl OverlayApp {
                                         brush,
                                         sample,
                                     );
-                                    draft = Some(Shape::Blur { cell, cells });
+                                    draft = Some(Shape::Pixelate { cell, cells });
                                 }
                                 _ => {}
                             }
@@ -816,20 +862,12 @@ impl OverlayApp {
                                         points.push(fp);
                                     }
                                 }
-                                Tool::Blur | Tool::Pixelate => {
-                                    if let Some(Shape::Blur { cell, cells }) = &mut draft {
+                                Tool::Pixelate => {
+                                    if let Some(Shape::Pixelate { cell, cells }) = &mut draft {
                                         let (_, brush, sample) = brush_params(tool);
-                                        let src: &[u8] = if matches!(tool, Tool::Blur) {
-                                            blurred
-                                                .as_ref()
-                                                .map(|b| b.as_slice())
-                                                .unwrap_or(&frame.rgba)
-                                        } else {
-                                            &frame.rgba
-                                        };
                                         crate::scene::add_brush_cells(
                                             cells,
-                                            src,
+                                            &frame.rgba,
                                             frame.width,
                                             frame.height,
                                             fp,
@@ -837,6 +875,13 @@ impl OverlayApp {
                                             brush,
                                             sample,
                                         );
+                                    }
+                                }
+                                Tool::Blur => {
+                                    if let Some(st) = draft_start {
+                                        draft = Some(Shape::Blur {
+                                            rect: egui::Rect::from_two_pos(st, fp),
+                                        });
                                     }
                                 }
                                 _ => {}
@@ -854,7 +899,6 @@ impl OverlayApp {
                 Tool::Pen | Tool::Line => Some((stroke_width * 0.5).max(5.0)),
                 Tool::Marker => Some(8.0),
                 Tool::Pixelate => Some(crate::scene::PIXEL_BRUSH),
-                Tool::Blur => Some(crate::scene::BLUR_BRUSH),
                 _ => None,
             };
             let brush_active = resp.hovered() || resp.dragged();
@@ -973,13 +1017,15 @@ impl OverlayApp {
             }
 
             for shape in shapes {
-                crate::scene::paint(painter, shape, &to_screen, scale);
+                crate::scene::paint(
+                    painter, shape, &to_screen, scale, blur_tex, frame_w, frame_h,
+                );
             }
             if let Some(d) = &draft {
-                crate::scene::paint(painter, d, &to_screen, scale);
+                crate::scene::paint(painter, d, &to_screen, scale, blur_tex, frame_w, frame_h);
             }
             if let Some(c) = &committed {
-                crate::scene::paint(painter, c, &to_screen, scale);
+                crate::scene::paint(painter, c, &to_screen, scale, blur_tex, frame_w, frame_h);
             }
             if let (Some(r), Some(p)) = (brush_ring, raw_cursor) {
                 if brush_active {
@@ -1470,6 +1516,10 @@ impl OverlayApp {
         let mut renderer = Renderer::new(device, format, RendererOptions::default());
         let frame_tex_id =
             renderer.register_native_texture(device, &shared._frame_view, wgpu::FilterMode::Linear);
+        let blur_tex_id = match shared.blur_view.as_ref() {
+            Some(v) => renderer.register_native_texture(device, v, wgpu::FilterMode::Linear),
+            None => frame_tex_id,
+        };
 
         let frame_w = self.frame.width as f32;
         let frame_h = self.frame.height as f32;
@@ -1494,7 +1544,15 @@ impl OverlayApp {
                 .image(frame_tex_id, rect, uv, egui::Color32::WHITE);
             let to_screen = |p: egui::Pos2| egui::pos2(p.x - sel_min.x, p.y - sel_min.y);
             for s in shapes {
-                crate::scene::paint(ui.painter(), s, &to_screen, 1.0);
+                crate::scene::paint(
+                    ui.painter(),
+                    s,
+                    &to_screen,
+                    1.0,
+                    blur_tex_id,
+                    frame_w,
+                    frame_h,
+                );
             }
         });
 
