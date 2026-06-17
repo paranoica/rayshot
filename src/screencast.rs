@@ -239,10 +239,19 @@ fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Slot>>
             })
             .process({
                 let latest = latest.clone();
+                let last_copy = std::cell::Cell::new(
+                    Instant::now()
+                        .checked_sub(Duration::from_secs(1))
+                        .unwrap_or_else(Instant::now),
+                );
                 move |stream, ud| {
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         return;
                     };
+                    let now = Instant::now();
+                    if now.duration_since(last_copy.get()) < Duration::from_millis(66) {
+                        return;
+                    }
                     let datas = buffer.datas_mut();
                     if datas.is_empty() {
                         return;
@@ -270,6 +279,7 @@ fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Slot>>
                     s.stride = row;
                     s.format = ud.format.format();
                     s.present = true;
+                    last_copy.set(now);
                 }
             })
             .register()
