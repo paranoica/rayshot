@@ -1402,9 +1402,13 @@ impl OverlayApp {
             | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 win.surface.configure(&shared.device, &win.config);
+                win.window.request_redraw();
                 return Ok(());
             }
-            _ => return Ok(()),
+            _ => {
+                win.window.request_redraw();
+                return Ok(());
+            }
         };
         let view = surface_texture
             .texture
