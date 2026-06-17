@@ -40,6 +40,7 @@ pub fn list_monitors() -> Result<()> {
 enum UserEvent {
     Captured(Result<Frame, String>),
     Trigger,
+    Close,
 }
 
 pub fn run(rt: Handle) -> Result<()> {
@@ -86,9 +87,17 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
     std::thread::Builder::new()
         .name("rayshot-trigger".into())
         .spawn(move || {
+            use std::io::Read;
             for stream in listener.incoming() {
-                if stream.is_ok() {
-                    let _ = proxy.send_event(UserEvent::Trigger);
+                if let Ok(mut s) = stream {
+                    let mut buf = [0u8; 8];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let ev = if n > 0 && buf[0] == b'c' {
+                        UserEvent::Close
+                    } else {
+                        UserEvent::Trigger
+                    };
+                    let _ = proxy.send_event(ev);
                 }
             }
         })
@@ -103,10 +112,18 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
 }
 
 pub fn trigger() -> Result<bool> {
+    send_daemon(b"go")
+}
+
+pub fn close_remote() -> Result<bool> {
+    send_daemon(b"close")
+}
+
+fn send_daemon(msg: &[u8]) -> Result<bool> {
     use std::io::Write;
     match std::os::unix::net::UnixStream::connect(daemon_socket_path()) {
         Ok(mut s) => {
-            let _ = s.write_all(b"go");
+            let _ = s.write_all(msg);
             Ok(true)
         }
         Err(_) => Ok(false),
@@ -250,6 +267,8 @@ fn resize_rect(base: egui::Rect, handle: usize, fp: egui::Pos2) -> egui::Rect {
 }
 
 struct Shared {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
     _frame_texture: Option<wgpu::Texture>,
@@ -328,6 +347,11 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 }
                 self.attach_frame(event_loop, frame);
                 self.active = true;
+            }
+            UserEvent::Close => {
+                if self.active {
+                    self.close(event_loop);
+                }
             }
         }
     }
@@ -483,41 +507,58 @@ impl OverlayApp {
         }
         eprintln!("[rayshot] creating {} overlay window(s)", targets.len());
 
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let surfaces: Vec<wgpu::Surface<'static>> = match self.shared.as_ref() {
+            Some(shared) => targets
+                .iter()
+                .map(|(w, _)| shared.instance.create_surface(w.clone()))
+                .collect::<std::result::Result<_, _>>()
+                .context("failed to create surface")?,
+            None => {
+                let instance = wgpu::Instance::new(
+                    wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
+                );
+                let surfaces: Vec<wgpu::Surface<'static>> = targets
+                    .iter()
+                    .map(|(w, _)| instance.create_surface(w.clone()))
+                    .collect::<std::result::Result<_, _>>()
+                    .context("failed to create surface")?;
+                let adapter = self
+                    .rt
+                    .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&surfaces[0]),
+                        force_fallback_adapter: false,
+                    }))
+                    .context("no suitable GPU adapter found")?;
+                let (device, queue) = self
+                    .rt
+                    .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                        label: Some("rayshot device"),
+                        ..Default::default()
+                    }))
+                    .context("failed to request GPU device")?;
+                self.shared = Some(Shared {
+                    instance,
+                    adapter,
+                    device,
+                    queue,
+                    _frame_texture: None,
+                    frame_view: None,
+                    _blur_texture: None,
+                    blur_view: None,
+                });
+                surfaces
+            }
+        };
 
-        let mut surfaces: Vec<wgpu::Surface<'static>> = Vec::with_capacity(targets.len());
-        for (window, _) in &targets {
-            surfaces.push(
-                instance
-                    .create_surface(window.clone())
-                    .context("failed to create surface")?,
-            );
-        }
-
-        let adapter = self
-            .rt
-            .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surfaces[0]),
-                force_fallback_adapter: false,
-            }))
-            .context("no suitable GPU adapter found")?;
-        let (device, queue) = self
-            .rt
-            .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("rayshot device"),
-                ..Default::default()
-            }))
-            .context("failed to request GPU device")?;
-
+        let shared = self.shared.as_ref().expect("shared initialized");
         let mut windows = Vec::with_capacity(targets.len());
         for ((window, region), surface) in targets.into_iter().zip(surfaces.into_iter()) {
             let size = window.inner_size();
             let config = surface
-                .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+                .get_default_config(&shared.adapter, size.width.max(1), size.height.max(1))
                 .context("surface not supported by adapter")?;
-            surface.configure(&device, &config);
+            surface.configure(&shared.device, &config);
 
             let egui_ctx = egui::Context::default();
             let mut fonts = egui::FontDefinitions::default();
@@ -529,9 +570,10 @@ impl OverlayApp {
                 &window,
                 Some(window.scale_factor() as f32),
                 None,
-                Some(device.limits().max_texture_dimension_2d as usize),
+                Some(shared.device.limits().max_texture_dimension_2d as usize),
             );
-            let renderer = Renderer::new(&device, config.format, RendererOptions::default());
+            let renderer =
+                Renderer::new(&shared.device, config.format, RendererOptions::default());
 
             windows.push(WindowState {
                 window,
@@ -548,15 +590,6 @@ impl OverlayApp {
             });
         }
         eprintln!("[rayshot] surface format: {:?}", windows[0].config.format);
-
-        self.shared = Some(Shared {
-            device,
-            queue,
-            _frame_texture: None,
-            frame_view: None,
-            _blur_texture: None,
-            blur_view: None,
-        });
         self.windows = windows;
         eprintln!("[rayshot] gpu/window init: {:?}", init_started.elapsed());
         Ok(())
@@ -1888,7 +1921,12 @@ impl OverlayApp {
 
     fn teardown_session(&mut self) {
         self.windows.clear();
-        self.shared = None;
+        if let Some(shared) = self.shared.as_mut() {
+            shared._frame_texture = None;
+            shared.frame_view = None;
+            shared._blur_texture = None;
+            shared.blur_view = None;
+        }
         self.scene = crate::scene::Scene::default();
         self.draft = None;
         self.draft_start = None;

@@ -50,6 +50,11 @@ fn main() -> Result<()> {
         _ => {}
     }
 
+    if std::env::args().nth(1).as_deref() == Some("close") {
+        overlay::close_remote()?;
+        return Ok(());
+    }
+
     if std::env::args().nth(1).as_deref() == Some("trigger") && overlay::trigger()? {
         return Ok(());
     }
