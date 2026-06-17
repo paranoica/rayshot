@@ -1,7 +1,9 @@
 use std::cell::RefCell;
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use pipewire as pw;
@@ -21,11 +23,82 @@ struct Portal {
     streams: Vec<StreamInfo>,
 }
 
+#[derive(Clone)]
+struct Captured {
+    pixels: Vec<u8>,
+    w: u32,
+    h: u32,
+    pos: (i32, i32),
+    done: bool,
+}
+
+pub struct ScreencastSession {
+    latest: Arc<Mutex<Vec<Captured>>>,
+}
+
+impl ScreencastSession {
+    pub fn start(rt: &Handle) -> Result<Self> {
+        let portal = rt
+            .block_on(open_screencast())
+            .context("screencast portal handshake failed")?;
+        let latest: Vec<Captured> = portal
+            .streams
+            .iter()
+            .map(|s| Captured {
+                pixels: Vec::new(),
+                w: 0,
+                h: 0,
+                pos: s.pos,
+                done: false,
+            })
+            .collect();
+        let latest = Arc::new(Mutex::new(latest));
+        let shared = latest.clone();
+        let fd = portal.fd;
+        let infos = portal.streams;
+        std::thread::Builder::new()
+            .name("rayshot-pw".into())
+            .spawn(move || {
+                if let Err(e) = run_pw_loop(fd, infos, shared) {
+                    eprintln!("[rayshot] screencast pipewire loop failed: {e:?}");
+                }
+            })
+            .context("spawn pipewire thread")?;
+        Ok(Self { latest })
+    }
+
+    pub fn wait_ready(&self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        loop {
+            if self.latest.lock().unwrap().iter().all(|c| c.done) {
+                return true;
+            }
+            if start.elapsed() > timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    pub fn grab(&self) -> Result<Frame> {
+        let slots = self.latest.lock().unwrap();
+        composite(&slots)
+    }
+}
+
 pub fn capture_once(rt: &Handle) -> Result<Frame> {
-    let portal = rt
-        .block_on(open_screencast())
-        .context("screencast portal handshake failed")?;
-    pw_capture(portal)
+    let session = ScreencastSession::start(rt)?;
+    if !session.wait_ready(Duration::from_secs(5)) {
+        return Err(anyhow!("timed out waiting for screencast frames"));
+    }
+    session.grab()
+}
+
+fn token_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    home.join(".config/rayshot/screencast.token")
 }
 
 async fn open_screencast() -> Result<Portal> {
@@ -38,6 +111,11 @@ async fn open_screencast() -> Result<Portal> {
     let proxy = Screencast::new().await?;
     let session = proxy.create_session(Default::default()).await?;
 
+    let saved_token = std::fs::read_to_string(token_path())
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     proxy
         .select_sources(
             &session,
@@ -45,7 +123,8 @@ async fn open_screencast() -> Result<Portal> {
                 .set_multiple(true)
                 .set_cursor_mode(CursorMode::Hidden)
                 .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Monitor))
-                .set_persist_mode(PersistMode::Application),
+                .set_persist_mode(PersistMode::Application)
+                .set_restore_token(saved_token.as_deref()),
         )
         .await?
         .response()?;
@@ -54,6 +133,13 @@ async fn open_screencast() -> Result<Portal> {
         .start(&session, None, StartCastOptions::default())
         .await?
         .response()?;
+
+    if let Some(token) = streams.restore_token() {
+        if let Some(dir) = token_path().parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(token_path(), token);
+    }
 
     let infos: Vec<StreamInfo> = streams
         .streams()
@@ -77,45 +163,22 @@ async fn open_screencast() -> Result<Portal> {
     Ok(Portal { fd, streams: infos })
 }
 
-struct Captured {
-    pixels: Vec<u8>,
-    w: u32,
-    h: u32,
-    pos: (i32, i32),
-    done: bool,
-}
-
 struct FmtData {
     format: spa::param::video::VideoInfoRaw,
 }
 
-fn pw_capture(portal: Portal) -> Result<Frame> {
+fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Captured>>>) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pipewire main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pipewire context")?;
     let core = context
-        .connect_fd_rc(portal.fd, None)
+        .connect_fd_rc(fd, None)
         .context("pipewire connect_fd")?;
-
-    let collector = Rc::new(RefCell::new(
-        portal
-            .streams
-            .iter()
-            .map(|s| Captured {
-                pixels: Vec::new(),
-                w: 0,
-                h: 0,
-                pos: s.pos,
-                done: false,
-            })
-            .collect::<Vec<_>>(),
-    ));
-    let total = portal.streams.len();
 
     let mut streams = Vec::new();
     let mut listeners = Vec::new();
 
-    for (idx, info) in portal.streams.iter().enumerate() {
+    for (idx, info) in infos.iter().enumerate() {
         let stream = pw::stream::StreamRc::new(
             core.clone(),
             "rayshot-capture",
@@ -151,44 +214,38 @@ fn pw_capture(portal: Portal) -> Result<Frame> {
                 let _ = ud.format.parse(param);
             })
             .process({
-                let collector = collector.clone();
-                let mainloop = mainloop.clone();
+                let latest = latest.clone();
                 move |stream, ud| {
                     let Some(mut buffer) = stream.dequeue_buffer() else {
                         return;
                     };
-                    {
-                        let mut slots = collector.borrow_mut();
-                        if slots[idx].done {
-                            return;
-                        }
-                        let datas = buffer.datas_mut();
-                        if datas.is_empty() {
-                            return;
-                        }
-                        let w = ud.format.size().width;
-                        let h = ud.format.size().height;
-                        let stride = datas[0].chunk().stride().max(0) as usize;
-                        let Some(src) = datas[0].data() else {
-                            return;
-                        };
-                        if w == 0 || h == 0 || src.is_empty() {
-                            return;
-                        }
-                        let row_bytes = stride.max(w as usize * 4);
-                        let rgba = to_rgba(src, w, h, row_bytes, ud.format.format());
-                        slots[idx] = Captured {
-                            pixels: rgba,
-                            w,
-                            h,
-                            pos: slots[idx].pos,
-                            done: true,
-                        };
+                    let datas = buffer.datas_mut();
+                    if datas.is_empty() {
+                        return;
                     }
-                    let done = collector.borrow().iter().filter(|c| c.done).count();
-                    if done >= total {
-                        mainloop.quit();
+                    let w = ud.format.size().width;
+                    let h = ud.format.size().height;
+                    if w == 0 || h == 0 {
+                        return;
                     }
+                    let stride = datas[0].chunk().stride().max(0) as usize;
+                    let row_bytes = stride.max(w as usize * 4);
+                    let Some(src) = datas[0].data() else {
+                        return;
+                    };
+                    if src.is_empty() {
+                        return;
+                    }
+                    let rgba = to_rgba(src, w, h, row_bytes, ud.format.format());
+                    let mut slots = latest.lock().unwrap();
+                    let pos = slots[idx].pos;
+                    slots[idx] = Captured {
+                        pixels: rgba,
+                        w,
+                        h,
+                        pos,
+                        done: true,
+                    };
                 }
             })
             .register()
@@ -259,27 +316,9 @@ fn pw_capture(portal: Portal) -> Result<Frame> {
         listeners.push(listener);
     }
 
-    let timed_out = Rc::new(RefCell::new(false));
-    let timer = mainloop.loop_().add_timer({
-        let mainloop = mainloop.clone();
-        let timed_out = timed_out.clone();
-        move |_| {
-            *timed_out.borrow_mut() = true;
-            mainloop.quit();
-        }
-    });
-    timer
-        .update_timer(Some(Duration::from_secs(3)), None)
-        .into_result()
-        .ok();
-
+    let _keep = Rc::new(RefCell::new((streams, listeners)));
     mainloop.run();
-
-    if *timed_out.borrow() {
-        return Err(anyhow!("timed out waiting for screencast frames"));
-    }
-
-    composite(collector)
+    Ok(())
 }
 
 fn to_rgba(
@@ -316,8 +355,7 @@ fn to_rgba(
     out
 }
 
-fn composite(collector: Rc<RefCell<Vec<Captured>>>) -> Result<Frame> {
-    let slots = collector.borrow();
+fn composite(slots: &[Captured]) -> Result<Frame> {
     if slots.iter().any(|c| !c.done) {
         return Err(anyhow!("not all screencast streams produced a frame"));
     }
