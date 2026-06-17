@@ -56,12 +56,11 @@ fn main() -> Result<()> {
         .build()
         .context("failed to build tokio runtime")?;
 
-    let frame = rt
-        .block_on(capture::capture_frame())
-        .context("desktop capture failed")?;
-    println!("captured frame: {}x{}", frame.width, frame.height);
-
     if shot {
+        let frame = rt
+            .block_on(capture::capture_frame())
+            .context("desktop capture failed")?;
+        println!("captured frame: {}x{}", frame.width, frame.height);
         let path = std::env::args()
             .nth(2)
             .unwrap_or_else(|| "/tmp/rayshot-capture.png".to_string());
@@ -72,6 +71,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    overlay::run(frame, rt.handle().clone()).context("overlay failed")?;
+    overlay::run(rt.handle().clone()).context("overlay failed")?;
     Ok(())
 }

@@ -37,9 +37,22 @@ pub fn list_monitors() -> Result<()> {
     Ok(())
 }
 
-pub fn run(frame: Frame, rt: Handle) -> Result<()> {
-    let event_loop = EventLoop::new().context("failed to create winit event loop")?;
-    let mut app = OverlayApp::new(frame, rt);
+enum UserEvent {
+    Captured(Result<Frame, String>),
+}
+
+pub fn run(rt: Handle) -> Result<()> {
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("failed to create winit event loop")?;
+    let proxy = event_loop.create_proxy();
+    rt.spawn(async move {
+        let result = crate::capture::capture_frame()
+            .await
+            .map_err(|e| format!("{e:?}"));
+        let _ = proxy.send_event(UserEvent::Captured(result));
+    });
+    let mut app = OverlayApp::new(rt);
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
 }
@@ -66,7 +79,8 @@ struct TextDraft {
 }
 
 struct OverlayApp {
-    frame: Arc<Frame>,
+    frame: Option<Arc<Frame>>,
+    pending_frame: Option<Frame>,
     rt: Handle,
     shared: Option<Shared>,
     windows: Vec<WindowState>,
@@ -90,19 +104,15 @@ struct OverlayApp {
 }
 
 impl OverlayApp {
-    fn new(frame: Frame, rt: Handle) -> Self {
-        let (fw, fh) = (frame.width as f32, frame.height as f32);
-        let selection = crate::export::load_last_selection().and_then(|(x, y, w, h)| {
-            let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
-            (r.min.x >= 0.0 && r.min.y >= 0.0 && r.max.x <= fw && r.max.y <= fh).then_some(r)
-        });
+    fn new(rt: Handle) -> Self {
         Self {
-            frame: Arc::new(frame),
+            frame: None,
+            pending_frame: None,
             rt,
             shared: None,
             windows: Vec::new(),
             initialized: false,
-            selection,
+            selection: None,
             drag_start: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             scene: crate::scene::Scene::default(),
@@ -180,8 +190,8 @@ fn resize_rect(base: egui::Rect, handle: usize, fp: egui::Pos2) -> egui::Rect {
 struct Shared {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    _frame_texture: wgpu::Texture,
-    _frame_view: wgpu::TextureView,
+    _frame_texture: Option<wgpu::Texture>,
+    frame_view: Option<wgpu::TextureView>,
     _blur_texture: Option<wgpu::Texture>,
     blur_view: Option<wgpu::TextureView>,
 }
@@ -193,106 +203,42 @@ struct WindowState {
     egui_ctx: egui::Context,
     egui_state: egui_winit::State,
     renderer: Renderer,
-    frame_texture_id: egui::TextureId,
+    frame_texture_id: Option<egui::TextureId>,
     blur_texture_id: Option<egui::TextureId>,
     region: egui::Rect,
     frames: u64,
     cursor: Option<egui::Pos2>,
 }
 
-impl ApplicationHandler for OverlayApp {
+impl ApplicationHandler<UserEvent> for OverlayApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.initialized {
             return;
         }
         self.initialized = true;
-        if let Err(e) = self.init(event_loop) {
+        if let Err(e) = self.init_gpu(event_loop) {
             eprintln!("[rayshot] failed to initialize overlay: {e:?}");
             event_loop.exit();
             return;
         }
-
-        if let Some(spec) = std::env::var_os("RAYSHOT_SHOW_SEL") {
-            self.selection = parse_crop(&spec.to_string_lossy());
+        if let Some(frame) = self.pending_frame.take() {
+            self.attach_frame(event_loop, frame);
         }
-        if let Some(spec) = std::env::var_os("RAYSHOT_TEST_TEXT") {
-            let s = spec.to_string_lossy();
-            let mut it = s.splitn(3, ',');
-            if let (Some(x), Some(y), Some(t)) = (it.next(), it.next(), it.next()) {
-                if let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) {
-                    self.tool = crate::scene::Tool::Text;
-                    self.text_edit = Some(TextDraft {
-                        pos: egui::pos2(x, y),
-                        buf: t.to_string(),
-                        color: self.color,
-                        size: 24.0,
-                    });
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Captured(Ok(frame)) => {
+                if self.initialized && self.shared.is_some() {
+                    self.attach_frame(event_loop, frame);
+                } else {
+                    self.pending_frame = Some(frame);
                 }
             }
-        }
-        if std::env::var_os("RAYSHOT_DEMO").is_some() {
-            use crate::scene::Shape;
-            let red = egui::Color32::from_rgb(255, 60, 60);
-            let yellow = egui::Color32::from_rgb(255, 200, 40);
-            let green = egui::Color32::from_rgb(60, 200, 90);
-            self.scene.push(Shape::Rect {
-                rect: egui::Rect::from_min_max(egui::pos2(400.0, 300.0), egui::pos2(800.0, 600.0)),
-                color: red,
-                width: 3.0,
-            });
-            self.scene.push(Shape::Arrow {
-                from: egui::pos2(900.0, 400.0),
-                to: egui::pos2(1250.0, 700.0),
-                color: yellow,
-                width: 4.0,
-            });
-            self.scene.push(Shape::Line {
-                from: egui::pos2(300.0, 720.0),
-                to: egui::pos2(760.0, 760.0),
-                color: green,
-                width: 3.0,
-            });
-            self.scene.push(Shape::Text {
-                pos: egui::pos2(420.0, 240.0),
-                text: "rayshot text!".to_string(),
-                color: yellow,
-                size: 28.0,
-            });
-            let mut bcells = Vec::new();
-            for i in 0..30 {
-                crate::scene::add_brush_cells(
-                    &mut bcells,
-                    &self.frame.rgba,
-                    self.frame.width,
-                    self.frame.height,
-                    egui::pos2(950.0 + i as f32 * 12.0, 300.0),
-                    crate::scene::PIXEL_CELL,
-                    crate::scene::PIXEL_BRUSH,
-                    crate::scene::PIXEL_SAMPLE,
-                );
+            UserEvent::Captured(Err(e)) => {
+                eprintln!("[rayshot] desktop capture failed: {e}");
+                event_loop.exit();
             }
-            self.scene.push(Shape::Pixelate {
-                cell: crate::scene::PIXEL_CELL,
-                cells: bcells,
-            });
-        }
-        if let Some(spec) = std::env::var_os("RAYSHOT_TEST_CROP") {
-            self.selection = parse_crop(&spec.to_string_lossy());
-            match self.finish() {
-                Ok(Some(path)) => eprintln!("[rayshot] test saved + copied {}", path.display()),
-                Ok(None) => eprintln!("[rayshot] test: empty selection"),
-                Err(e) => eprintln!("[rayshot] test finish failed: {e:?}"),
-            }
-            crate::anim::force_restore();
-            unsafe { libc::_exit(0) };
-        }
-
-        if std::env::var_os("RAYSHOT_TEST_QUIT").is_some() {
-            self.hide_and_exit(event_loop);
-        }
-
-        for win in &self.windows {
-            win.window.request_redraw();
         }
     }
 
@@ -412,23 +358,20 @@ impl ApplicationHandler for OverlayApp {
 }
 
 impl OverlayApp {
-    fn init(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+    fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
         let init_started = std::time::Instant::now();
         let windowed = std::env::var_os("RAYSHOT_WINDOWED").is_some();
-        let frame_w = self.frame.width as f32;
-        let frame_h = self.frame.height as f32;
 
         let mut targets: Vec<(Arc<Window>, egui::Rect)> = Vec::new();
 
         if windowed {
             let attrs = Window::default_attributes()
                 .with_title("rayshot")
+                .with_visible(false)
                 .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
                 .with_inner_size(winit::dpi::LogicalSize::new(1600.0, 900.0));
             let window = Arc::new(event_loop.create_window(attrs).context("create window")?);
-            let region =
-                egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(frame_w, frame_h));
-            targets.push((window, region));
+            targets.push((window, egui::Rect::ZERO));
         } else {
             for monitor in event_loop.available_monitors() {
                 let pos = monitor.position();
@@ -439,6 +382,7 @@ impl OverlayApp {
                 );
                 let attrs = Window::default_attributes()
                     .with_title("rayshot")
+                    .with_visible(false)
                     .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
                 let window = Arc::new(event_loop.create_window(attrs).context("create window")?);
                 targets.push((window, region));
@@ -477,38 +421,6 @@ impl OverlayApp {
             }))
             .context("failed to request GPU device")?;
 
-        let extent = wgpu::Extent3d {
-            width: self.frame.width,
-            height: self.frame.height,
-            depth_or_array_layers: 1,
-        };
-        let frame_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("capture frame"),
-            size: extent,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &frame_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &self.frame.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * self.frame.width),
-                rows_per_image: Some(self.frame.height),
-            },
-            extent,
-        );
-        let frame_view = frame_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
         let mut windows = Vec::with_capacity(targets.len());
         for ((window, region), surface) in targets.into_iter().zip(surfaces.into_iter()) {
             let size = window.inner_size();
@@ -529,9 +441,7 @@ impl OverlayApp {
                 None,
                 Some(device.limits().max_texture_dimension_2d as usize),
             );
-            let mut renderer = Renderer::new(&device, config.format, RendererOptions::default());
-            let frame_texture_id =
-                renderer.register_native_texture(&device, &frame_view, wgpu::FilterMode::Linear);
+            let renderer = Renderer::new(&device, config.format, RendererOptions::default());
 
             windows.push(WindowState {
                 window,
@@ -540,7 +450,7 @@ impl OverlayApp {
                 egui_ctx,
                 egui_state,
                 renderer,
-                frame_texture_id,
+                frame_texture_id: None,
                 blur_texture_id: None,
                 region,
                 frames: 0,
@@ -552,8 +462,8 @@ impl OverlayApp {
         self.shared = Some(Shared {
             device,
             queue,
-            _frame_texture: frame_texture,
-            _frame_view: frame_view,
+            _frame_texture: None,
+            frame_view: None,
             _blur_texture: None,
             blur_view: None,
         });
@@ -562,22 +472,180 @@ impl OverlayApp {
         Ok(())
     }
 
+    fn attach_frame(&mut self, event_loop: &ActiveEventLoop, frame: Frame) {
+        let attach_started = std::time::Instant::now();
+        let frame = Arc::new(frame);
+        let (fw, fh) = (frame.width as f32, frame.height as f32);
+        self.frame = Some(frame.clone());
+
+        if self.selection.is_none() {
+            self.selection = crate::export::load_last_selection().and_then(|(x, y, w, h)| {
+                let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                (r.min.x >= 0.0 && r.min.y >= 0.0 && r.max.x <= fw && r.max.y <= fh).then_some(r)
+            });
+        }
+
+        if std::env::var_os("RAYSHOT_WINDOWED").is_some() {
+            let region = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
+            for win in &mut self.windows {
+                win.region = region;
+            }
+        }
+
+        if let Some(shared) = self.shared.as_mut() {
+            let extent = wgpu::Extent3d {
+                width: frame.width,
+                height: frame.height,
+                depth_or_array_layers: 1,
+            };
+            let tex = shared.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("capture frame"),
+                size: extent,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            shared.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &frame.rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(4 * frame.width),
+                    rows_per_image: Some(frame.height),
+                },
+                extent,
+            );
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            shared._frame_texture = Some(tex);
+            shared.frame_view = Some(view);
+        }
+        if let Some(shared) = self.shared.as_ref() {
+            if let Some(view) = shared.frame_view.as_ref() {
+                for win in &mut self.windows {
+                    win.frame_texture_id = Some(win.renderer.register_native_texture(
+                        &shared.device,
+                        view,
+                        wgpu::FilterMode::Linear,
+                    ));
+                }
+            }
+        }
+
+        self.seed_test_env(event_loop, &frame);
+
+        for win in &self.windows {
+            win.window.set_visible(true);
+            win.window.request_redraw();
+        }
+        eprintln!("[rayshot] attach frame: {:?}", attach_started.elapsed());
+    }
+
+    fn seed_test_env(&mut self, event_loop: &ActiveEventLoop, frame: &Frame) {
+        if let Some(spec) = std::env::var_os("RAYSHOT_SHOW_SEL") {
+            self.selection = parse_crop(&spec.to_string_lossy());
+        }
+        if let Some(spec) = std::env::var_os("RAYSHOT_TEST_TEXT") {
+            let s = spec.to_string_lossy();
+            let mut it = s.splitn(3, ',');
+            if let (Some(x), Some(y), Some(t)) = (it.next(), it.next(), it.next()) {
+                if let (Ok(x), Ok(y)) = (x.trim().parse::<f32>(), y.trim().parse::<f32>()) {
+                    self.tool = crate::scene::Tool::Text;
+                    self.text_edit = Some(TextDraft {
+                        pos: egui::pos2(x, y),
+                        buf: t.to_string(),
+                        color: self.color,
+                        size: 24.0,
+                    });
+                }
+            }
+        }
+        if std::env::var_os("RAYSHOT_DEMO").is_some() {
+            use crate::scene::Shape;
+            let red = egui::Color32::from_rgb(255, 60, 60);
+            let yellow = egui::Color32::from_rgb(255, 200, 40);
+            let green = egui::Color32::from_rgb(60, 200, 90);
+            self.scene.push(Shape::Rect {
+                rect: egui::Rect::from_min_max(egui::pos2(400.0, 300.0), egui::pos2(800.0, 600.0)),
+                color: red,
+                width: 3.0,
+            });
+            self.scene.push(Shape::Arrow {
+                from: egui::pos2(900.0, 400.0),
+                to: egui::pos2(1250.0, 700.0),
+                color: yellow,
+                width: 4.0,
+            });
+            self.scene.push(Shape::Line {
+                from: egui::pos2(300.0, 720.0),
+                to: egui::pos2(760.0, 760.0),
+                color: green,
+                width: 3.0,
+            });
+            self.scene.push(Shape::Text {
+                pos: egui::pos2(420.0, 240.0),
+                text: "rayshot text!".to_string(),
+                color: yellow,
+                size: 28.0,
+            });
+            let mut bcells = Vec::new();
+            for i in 0..30 {
+                crate::scene::add_brush_cells(
+                    &mut bcells,
+                    &frame.rgba,
+                    frame.width,
+                    frame.height,
+                    egui::pos2(950.0 + i as f32 * 12.0, 300.0),
+                    crate::scene::PIXEL_CELL,
+                    crate::scene::PIXEL_BRUSH,
+                    crate::scene::PIXEL_SAMPLE,
+                );
+            }
+            self.scene.push(Shape::Pixelate {
+                cell: crate::scene::PIXEL_CELL,
+                cells: bcells,
+            });
+        }
+        if let Some(spec) = std::env::var_os("RAYSHOT_TEST_CROP") {
+            self.selection = parse_crop(&spec.to_string_lossy());
+            match self.finish() {
+                Ok(Some(path)) => eprintln!("[rayshot] test saved + copied {}", path.display()),
+                Ok(None) => eprintln!("[rayshot] test: empty selection"),
+                Err(e) => eprintln!("[rayshot] test finish failed: {e:?}"),
+            }
+            crate::anim::force_restore();
+            unsafe { libc::_exit(0) };
+        }
+        if std::env::var_os("RAYSHOT_TEST_QUIT").is_some() {
+            self.hide_and_exit(event_loop);
+        }
+    }
+
     fn render_window(&mut self, idx: usize) -> Result<()> {
         if self.shared.is_none() {
             return Ok(());
         }
-        let frame_w = self.frame.width as f32;
-        let frame_h = self.frame.height as f32;
-        let frame = self.frame.clone();
+        let Some(frame) = self.frame.clone() else {
+            return Ok(());
+        };
+        let frame_w = frame.width as f32;
+        let frame_h = frame.height as f32;
         if matches!(self.tool, crate::scene::Tool::Blur) && self.blurred.is_none() {
-            let b = crate::scene::blur_frame(&self.frame.rgba, self.frame.width, self.frame.height);
+            let b = crate::scene::blur_frame(&frame.rgba, frame.width, frame.height);
             self.blurred = Some(Arc::new(b));
         }
         if let (Some(b), Some(shared)) = (self.blurred.as_ref(), self.shared.as_mut()) {
             if shared.blur_view.is_none() {
                 let extent = wgpu::Extent3d {
-                    width: self.frame.width,
-                    height: self.frame.height,
+                    width: frame.width,
+                    height: frame.height,
                     depth_or_array_layers: 1,
                 };
                 let tex = shared.device.create_texture(&wgpu::TextureDescriptor {
@@ -600,8 +668,8 @@ impl OverlayApp {
                     b.as_slice(),
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(4 * self.frame.width),
-                        rows_per_image: Some(self.frame.height),
+                        bytes_per_row: Some(4 * frame.width),
+                        rows_per_image: Some(frame.height),
                     },
                     extent,
                 );
@@ -629,7 +697,9 @@ impl OverlayApp {
         }
 
         let region = win.region;
-        let texture_id = win.frame_texture_id;
+        let Some(texture_id) = win.frame_texture_id else {
+            return Ok(());
+        };
         let blur_tex = win.blur_texture_id.unwrap_or(texture_id);
         let raw_cursor = win.cursor;
         let ctx = win.egui_ctx.clone();
@@ -1470,31 +1540,29 @@ impl OverlayApp {
 
     fn cropped_image(&self) -> Option<image::RgbaImage> {
         let sel = self.selection?;
-        let x = sel.min.x.floor().clamp(0.0, self.frame.width as f32) as u32;
-        let y = sel.min.y.floor().clamp(0.0, self.frame.height as f32) as u32;
-        let x2 = sel.max.x.ceil().clamp(0.0, self.frame.width as f32) as u32;
-        let y2 = sel.max.y.ceil().clamp(0.0, self.frame.height as f32) as u32;
+        let frame = self.frame.as_ref()?;
+        let x = sel.min.x.floor().clamp(0.0, frame.width as f32) as u32;
+        let y = sel.min.y.floor().clamp(0.0, frame.height as f32) as u32;
+        let x2 = sel.max.x.ceil().clamp(0.0, frame.width as f32) as u32;
+        let y2 = sel.max.y.ceil().clamp(0.0, frame.height as f32) as u32;
         if x2 <= x || y2 <= y {
             return None;
         }
-        let full = image::RgbaImage::from_raw(
-            self.frame.width,
-            self.frame.height,
-            self.frame.rgba.clone(),
-        )?;
+        let full = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())?;
         Some(image::imageops::crop_imm(&full, x, y, x2 - x, y2 - y).to_image())
     }
 
     fn render_selection_to_image(&self) -> Result<Option<image::RgbaImage>> {
         let shared = self.shared.as_ref().context("gpu not initialized")?;
+        let frame = self.frame.as_ref().context("frame not captured")?;
         let Some(sel) = self.selection else {
             return Ok(None);
         };
 
-        let fx = sel.min.x.floor().clamp(0.0, self.frame.width as f32);
-        let fy = sel.min.y.floor().clamp(0.0, self.frame.height as f32);
-        let fx2 = sel.max.x.ceil().clamp(0.0, self.frame.width as f32);
-        let fy2 = sel.max.y.ceil().clamp(0.0, self.frame.height as f32);
+        let fx = sel.min.x.floor().clamp(0.0, frame.width as f32);
+        let fy = sel.min.y.floor().clamp(0.0, frame.height as f32);
+        let fx2 = sel.max.x.ceil().clamp(0.0, frame.width as f32);
+        let fy2 = sel.max.y.ceil().clamp(0.0, frame.height as f32);
         let (w, h) = ((fx2 - fx) as u32, (fy2 - fy) as u32);
         if w == 0 || h == 0 {
             return Ok(None);
@@ -1521,17 +1589,21 @@ impl OverlayApp {
         });
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
 
+        let frame_view = shared
+            .frame_view
+            .as_ref()
+            .context("frame texture not ready")?;
         let ctx = egui::Context::default();
         let mut renderer = Renderer::new(device, format, RendererOptions::default());
         let frame_tex_id =
-            renderer.register_native_texture(device, &shared._frame_view, wgpu::FilterMode::Linear);
+            renderer.register_native_texture(device, frame_view, wgpu::FilterMode::Linear);
         let blur_tex_id = match shared.blur_view.as_ref() {
             Some(v) => renderer.register_native_texture(device, v, wgpu::FilterMode::Linear),
             None => frame_tex_id,
         };
 
-        let frame_w = self.frame.width as f32;
-        let frame_h = self.frame.height as f32;
+        let frame_w = frame.width as f32;
+        let frame_h = frame.height as f32;
         let sel_min = egui::pos2(fx, fy);
         let shapes = self.scene.shapes();
 
