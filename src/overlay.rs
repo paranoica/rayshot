@@ -1107,8 +1107,47 @@ impl OverlayApp {
             if let Some((sel, _vis)) = visible {
                 if region.contains(sel.max) {
                     let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
-                    let tools_area = egui::Area::new(egui::Id::new("rayshot-tools"))
-                        .fixed_pos(s.right_top() + egui::vec2(10.0, 0.0))
+
+                    // Place the tool/action stack beside the selection so it never
+                    // overflows the screen edges or overlaps itself. Use the actual
+                    // sizes measured on the previous frame (self-correcting), with a
+                    // generous estimate as the first-frame fallback.
+                    let tools_id = egui::Id::new("rayshot-tools");
+                    let actions_id = egui::Id::new("rayshot-actions");
+                    let tools_sz = egui::AreaState::load(ui.ctx(), tools_id)
+                        .and_then(|st| st.size)
+                        .unwrap_or(egui::vec2(46.0, 300.0));
+                    let actions_sz = egui::AreaState::load(ui.ctx(), actions_id)
+                        .and_then(|st| st.size)
+                        .unwrap_or(egui::vec2(46.0, 110.0));
+                    let gap = 6.0;
+                    let width = tools_sz.x.max(actions_sz.x);
+                    let total_h = tools_sz.y + gap + actions_sz.y;
+                    let pad = 8.0;
+
+                    // Horizontal: prefer the right of the selection, fall back to the
+                    // left, then clamp inside if the selection is very wide.
+                    let mut x = s.right() + 10.0;
+                    if x + width > avail.right() - pad {
+                        x = s.left() - 10.0 - width;
+                    }
+                    if x < avail.left() + pad {
+                        x = (avail.right() - pad - width).max(avail.left() + pad);
+                    }
+
+                    // Vertical: start at the selection top, shift up if the stack would
+                    // run past the bottom, never above the top.
+                    let mut top = s.top();
+                    if top + total_h > avail.bottom() - pad {
+                        top = avail.bottom() - pad - total_h;
+                    }
+                    if top < avail.top() + pad {
+                        top = avail.top() + pad;
+                    }
+
+                    let tools_area = egui::Area::new(tools_id)
+                        .fixed_pos(egui::pos2(x, top))
+                        .constrain(false)
                         .show(ui.ctx(), |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 3.0;
@@ -1142,9 +1181,10 @@ impl OverlayApp {
                             });
                         });
 
-                    let actions_pos = tools_area.response.rect.left_bottom() + egui::vec2(0.0, 6.0);
-                    egui::Area::new(egui::Id::new("rayshot-actions"))
+                    let actions_pos = tools_area.response.rect.left_bottom() + egui::vec2(0.0, gap);
+                    egui::Area::new(actions_id)
                         .fixed_pos(actions_pos)
+                        .constrain(false)
                         .show(ui.ctx(), |ui| {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 3.0;
