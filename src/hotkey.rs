@@ -80,11 +80,38 @@ fn start_daemon(exe: &str) {
         .spawn();
 }
 
+fn current_desktop() -> String {
+    std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()
+}
+
+fn is_gnome() -> bool {
+    current_desktop().to_ascii_uppercase().contains("GNOME")
+}
+
 pub fn install(binding: &str, daemon: bool) -> Result<()> {
     let exe = std::env::current_exe()
         .context("cannot find rayshot's own path")?
         .to_string_lossy()
         .to_string();
+
+    if !is_gnome() {
+        let desktop = current_desktop();
+        let desktop = if desktop.is_empty() {
+            "unknown".to_string()
+        } else {
+            desktop
+        };
+        println!("rayshot: automatic hotkey setup is GNOME-only (detected: {desktop}).");
+        println!("Bind a shortcut to this command in your desktop's keyboard settings:");
+        println!("    {exe}");
+        println!("(rayshot will capture via the screenshot portal; needs a portal backend + wl-clipboard.)");
+        if daemon {
+            println!(
+                "Instant daemon mode is tuned for GNOME; on other desktops use the command above."
+            );
+        }
+        return Ok(());
+    }
 
     if binding.eq_ignore_ascii_case("Print") {
         if let Some(cur) = gget(SHELL_KB, "show-screenshot-ui") {
@@ -134,6 +161,12 @@ pub fn install(binding: &str, daemon: bool) -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
+    let _ = std::fs::remove_file(autostart_path());
+    if !is_gnome() {
+        println!("rayshot: nothing to remove automatically (GNOME-only).");
+        println!("Remove the shortcut you bound manually in your desktop's settings.");
+        return Ok(());
+    }
     let list = gget(MEDIA_KEYS, "custom-keybindings").unwrap_or_default();
     let paths: Vec<String> = parse_paths(&list)
         .into_iter()
