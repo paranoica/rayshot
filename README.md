@@ -13,7 +13,8 @@ optional resident daemon that makes capture feel instant.
 - Copy to clipboard and/or save to `~/Pictures`.
 - **Instant daemon mode** on GNOME: a resident process keeps a screen-capture
   stream and the GPU warm, so the overlay appears with no portal round-trip and
-  no flash. Idle cost is ~46 MB RAM and ~0.1 % CPU.
+  no flash. Idle cost is about 90 MB RAM and a few % CPU only while the screen
+  is changing (near-zero on a static screen).
 
 ## Desktop support
 
@@ -148,8 +149,10 @@ instant only because it is the compositor and already holds the pixels.
 
 The daemon closes that gap: it keeps a PipeWire screen-capture stream and a
 pre-initialised GPU warm, so a trigger grabs the latest frame and shows the
-overlay near-instantly, without the portal round-trip or the flash. When idle it
-converts no frames, so it sits at ~46 MB and ~0.1 % CPU.
+overlay near-instantly, without the portal round-trip or the flash. It copies
+only a few frames per second and converts none until you trigger, so it sits at
+about 90 MB RAM (much of it screen-capture buffers shared with the compositor)
+and a few % CPU while the screen changes, near-zero when static.
 
 ## Environment variables
 
