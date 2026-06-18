@@ -291,7 +291,7 @@ fn resize_rect(base: egui::Rect, handle: usize, fp: egui::Pos2) -> egui::Rect {
 }
 
 struct Shared {
-    _instance: wgpu::Instance,
+    instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -311,6 +311,7 @@ struct WindowState {
     frame_texture_id: Option<egui::TextureId>,
     blur_texture_id: Option<egui::TextureId>,
     region: egui::Rect,
+    configured: bool,
     frames: u64,
     cursor: Option<egui::Pos2>,
 }
@@ -321,11 +322,16 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             return;
         }
         self.initialized = true;
+        if let Err(e) = self.ensure_device() {
+            eprintln!("[rayshot] failed to init gpu device: {e:?}");
+            event_loop.exit();
+            return;
+        }
         if self.daemon {
             return;
         }
-        if let Err(e) = self.init_gpu(event_loop) {
-            eprintln!("[rayshot] failed to initialize overlay: {e:?}");
+        if let Err(e) = self.create_windows(event_loop) {
+            eprintln!("[rayshot] failed to create windows: {e:?}");
             event_loop.exit();
             return;
         }
@@ -366,8 +372,13 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                         return;
                     }
                 };
-                if let Err(e) = self.init_gpu(event_loop) {
+                if let Err(e) = self.ensure_device() {
                     eprintln!("[rayshot] daemon gpu init failed: {e:?}");
+                    crate::anim::set_animations(true);
+                    return;
+                }
+                if let Err(e) = self.create_windows(event_loop) {
+                    eprintln!("[rayshot] daemon window creation failed: {e:?}");
                     crate::anim::set_animations(true);
                     return;
                 }
@@ -474,6 +485,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                         win.config.width = size.width;
                         win.config.height = size.height;
                         win.surface.configure(&shared.device, &win.config);
+                        win.configured = true;
                         win.window.request_redraw();
                     }
                 }
@@ -498,12 +510,47 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
 }
 
 impl OverlayApp {
-    fn init_gpu(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
-        let init_started = std::time::Instant::now();
+    fn ensure_device(&mut self) -> Result<()> {
+        if self.shared.is_some() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = self
+            .rt
+            .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            }))
+            .context("no suitable GPU adapter found")?;
+        let (device, queue) = self
+            .rt
+            .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("rayshot device"),
+                ..Default::default()
+            }))
+            .context("failed to request GPU device")?;
+        self.shared = Some(Shared {
+            instance,
+            adapter,
+            device,
+            queue,
+            _frame_texture: None,
+            frame_view: None,
+            _blur_texture: None,
+            blur_view: None,
+        });
+        eprintln!("[rayshot] gpu device init: {:?}", started.elapsed());
+        Ok(())
+    }
+
+    fn create_windows(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        let started = std::time::Instant::now();
         let windowed = std::env::var_os("RAYSHOT_WINDOWED").is_some();
 
         let mut targets: Vec<(Arc<Window>, egui::Rect)> = Vec::new();
-
         if windowed {
             let attrs = Window::default_attributes()
                 .with_title("rayshot")
@@ -531,49 +578,18 @@ impl OverlayApp {
         if targets.is_empty() {
             anyhow::bail!("no monitors/windows to display on");
         }
-        eprintln!("[rayshot] creating {} overlay window(s)", targets.len());
 
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let surfaces: Vec<wgpu::Surface<'static>> = targets
-            .iter()
-            .map(|(w, _)| instance.create_surface(w.clone()))
-            .collect::<std::result::Result<_, _>>()
-            .context("failed to create surface")?;
-        let adapter = self
-            .rt
-            .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surfaces[0]),
-                force_fallback_adapter: false,
-            }))
-            .context("no suitable GPU adapter found")?;
-        let (device, queue) = self
-            .rt
-            .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("rayshot device"),
-                ..Default::default()
-            }))
-            .context("failed to request GPU device")?;
-        self.shared = Some(Shared {
-            _instance: instance,
-            adapter,
-            device,
-            queue,
-            _frame_texture: None,
-            frame_view: None,
-            _blur_texture: None,
-            blur_view: None,
-        });
-
-        let shared = self.shared.as_ref().expect("shared initialized");
+        let shared = self.shared.as_ref().context("device not initialized")?;
         let mut windows = Vec::with_capacity(targets.len());
-        for ((window, region), surface) in targets.into_iter().zip(surfaces.into_iter()) {
+        for (window, region) in targets {
+            let surface = shared
+                .instance
+                .create_surface(window.clone())
+                .context("failed to create surface")?;
             let size = window.inner_size();
             let config = surface
                 .get_default_config(&shared.adapter, size.width.max(1), size.height.max(1))
                 .context("surface not supported by adapter")?;
-            surface.configure(&shared.device, &config);
 
             let egui_ctx = egui::Context::default();
             let mut fonts = egui::FontDefinitions::default();
@@ -600,13 +616,13 @@ impl OverlayApp {
                 frame_texture_id: None,
                 blur_texture_id: None,
                 region,
+                configured: false,
                 frames: 0,
                 cursor: None,
             });
         }
-        eprintln!("[rayshot] surface format: {:?}", windows[0].config.format);
         self.windows = windows;
-        eprintln!("[rayshot] gpu/window init: {:?}", init_started.elapsed());
+        eprintln!("[rayshot] windows created: {:?}", started.elapsed());
         Ok(())
     }
 
@@ -768,6 +784,9 @@ impl OverlayApp {
 
     fn render_window(&mut self, idx: usize) -> Result<()> {
         if self.shared.is_none() {
+            return Ok(());
+        }
+        if !self.windows[idx].configured {
             return Ok(());
         }
         let Some(frame) = self.frame.clone() else {
@@ -1938,7 +1957,12 @@ impl OverlayApp {
 
     fn teardown_session(&mut self) {
         self.windows.clear();
-        self.shared = None;
+        if let Some(shared) = self.shared.as_mut() {
+            shared._frame_texture = None;
+            shared.frame_view = None;
+            shared._blur_texture = None;
+            shared.blur_view = None;
+        }
         self.scene = crate::scene::Scene::default();
         self.draft = None;
         self.draft_start = None;
