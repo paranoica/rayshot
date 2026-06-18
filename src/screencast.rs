@@ -335,7 +335,27 @@ fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Slot>>
         .map_err(|e| anyhow!("serialize pod: {e:?}"))?
         .0
         .into_inner();
-        let mut params = [Pod::from_bytes(&values).ok_or_else(|| anyhow!("pod from_bytes"))?];
+
+        let buffers = pw::spa::pod::Value::Object(pw::spa::pod::Object {
+            type_: pw::spa::sys::SPA_TYPE_OBJECT_ParamBuffers,
+            id: pw::spa::sys::SPA_PARAM_Buffers,
+            properties: vec![pw::spa::pod::Property::new(
+                pw::spa::sys::SPA_PARAM_BUFFERS_buffers,
+                pw::spa::pod::Value::Int(4),
+            )],
+        });
+        let bvalues: Vec<u8> = pw::spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &buffers,
+        )
+        .map_err(|e| anyhow!("serialize buffers pod: {e:?}"))?
+        .0
+        .into_inner();
+
+        let mut params = [
+            Pod::from_bytes(&values).ok_or_else(|| anyhow!("pod from_bytes"))?,
+            Pod::from_bytes(&bvalues).ok_or_else(|| anyhow!("buffers pod from_bytes"))?,
+        ];
 
         stream
             .connect(
