@@ -51,6 +51,19 @@ fn main() -> Result<()> {
                 .context("failed to build tokio runtime")?;
             return overlay::run_daemon(rt.handle().clone());
         }
+        Some("overlay") => {
+            let path = std::env::args()
+                .nth(2)
+                .context("overlay needs a frame file path")?;
+            let frame = capture::read_frame_raw(std::path::Path::new(&path))
+                .context("failed to read frame file")?;
+            let _anim = anim::AnimationGuard::disable();
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            return overlay::run_with_frame(frame, rt.handle().clone());
+        }
         _ => {}
     }
 

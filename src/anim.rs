@@ -80,23 +80,6 @@ fn set_bool(schema: &str, key: &str, val: bool) {
         .status();
 }
 
-pub fn set_animations(on: bool) {
-    set_bool("org.gnome.desktop.interface", "enable-animations", on);
-}
-
-pub fn install_daemon_restore() {
-    use signal_hook::consts::{SIGINT, SIGTERM};
-    use signal_hook::iterator::Signals;
-    if let Ok(mut signals) = Signals::new([SIGINT, SIGTERM]) {
-        std::thread::spawn(move || {
-            if signals.forever().next().is_some() {
-                set_animations(true);
-                unsafe { libc::_exit(130) };
-            }
-        });
-    }
-}
-
 pub fn force_restore() {
     if let Ok(content) = std::fs::read_to_string(marker_path()) {
         for line in content.lines() {

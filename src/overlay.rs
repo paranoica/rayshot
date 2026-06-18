@@ -39,8 +39,6 @@ pub fn list_monitors() -> Result<()> {
 
 enum UserEvent {
     Captured(Result<Frame, String>),
-    Trigger,
-    Close,
 }
 
 pub fn run(rt: Handle) -> Result<()> {
@@ -63,7 +61,18 @@ pub fn daemon_socket_path() -> std::path::PathBuf {
     crate::export::scratch_dir().join("daemon.sock")
 }
 
+pub fn run_with_frame(frame: Frame, rt: Handle) -> Result<()> {
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("failed to create winit event loop")?;
+    let mut app = OverlayApp::new(rt);
+    app.pending_frame = Some(frame);
+    event_loop.run_app(&mut app).context("event loop error")?;
+    Ok(())
+}
+
 pub fn run_daemon(rt: Handle) -> Result<()> {
+    use std::io::Read;
     use std::os::unix::io::AsRawFd;
     let dir = crate::export::scratch_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -79,57 +88,62 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
     }
     std::mem::forget(lock);
 
-    crate::anim::set_animations(true);
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        crate::anim::set_animations(true);
-        default_hook(info);
-    }));
-
+    let exe = std::env::current_exe().context("cannot find rayshot's own path")?;
     let session = crate::screencast::ScreencastSession::start(&rt)
         .context("failed to start screencast session")?;
     if !session.wait_ready(std::time::Duration::from_secs(15)) {
         anyhow::bail!("screencast stream did not start in time");
     }
-    crate::anim::install_daemon_restore();
     eprintln!("[rayshot] daemon: screencast stream live");
-
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .context("failed to create winit event loop")?;
-    let proxy = event_loop.create_proxy();
 
     let sock_path = daemon_socket_path();
     let _ = std::fs::remove_file(&sock_path);
-    if let Some(dir) = sock_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let listener = std::os::unix::net::UnixListener::bind(&sock_path)
         .context("failed to bind daemon socket")?;
-    std::thread::Builder::new()
-        .name("rayshot-trigger".into())
-        .spawn(move || {
-            use std::io::Read;
-            for stream in listener.incoming() {
-                if let Ok(mut s) = stream {
-                    let mut buf = [0u8; 8];
-                    let n = s.read(&mut buf).unwrap_or(0);
-                    let ev = if n > 0 && buf[0] == b'c' {
-                        UserEvent::Close
-                    } else {
-                        UserEvent::Trigger
-                    };
-                    let _ = proxy.send_event(ev);
-                }
-            }
-        })
-        .context("spawn trigger listener")?;
     eprintln!("[rayshot] daemon: listening on {}", sock_path.display());
 
-    let mut app = OverlayApp::new(rt);
-    app.daemon = true;
-    app.screencast = Some(session);
-    event_loop.run_app(&mut app).context("event loop error")?;
+    let mut child: Option<std::process::Child> = None;
+    let mut counter: u64 = 0;
+    for stream in listener.incoming() {
+        let Ok(mut s) = stream else {
+            continue;
+        };
+        let mut buf = [0u8; 8];
+        let n = s.read(&mut buf).unwrap_or(0);
+        if let Some(c) = child.as_mut() {
+            let _ = c.try_wait();
+        }
+        if n > 0 && buf[0] == b'c' {
+            if let Some(c) = child.as_ref() {
+                unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGTERM) };
+            }
+            continue;
+        }
+        let frame = match session.grab() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("[rayshot] daemon grab failed: {e:?}");
+                continue;
+            }
+        };
+        counter += 1;
+        let frame_path = dir.join(format!("frame-{counter}.raw"));
+        if let Err(e) = crate::capture::write_frame_raw(&frame, &frame_path) {
+            eprintln!("[rayshot] daemon write frame failed: {e:?}");
+            continue;
+        }
+        match std::process::Command::new(&exe)
+            .arg("overlay")
+            .arg(&frame_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(ch) => child = Some(ch),
+            Err(e) => eprintln!("[rayshot] daemon spawn overlay failed: {e:?}"),
+        }
+    }
     Ok(())
 }
 
@@ -196,10 +210,6 @@ struct OverlayApp {
     move_shape: Option<(usize, crate::scene::Shape)>,
     text_sel: Option<(usize, usize, usize)>,
     blurred: Option<Arc<Vec<u8>>>,
-    daemon: bool,
-    active: bool,
-    screencast: Option<crate::screencast::ScreencastSession>,
-    anim_gen: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl OverlayApp {
@@ -227,10 +237,6 @@ impl OverlayApp {
             move_shape: None,
             text_sel: None,
             blurred: None,
-            daemon: false,
-            active: false,
-            screencast: None,
-            anim_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 }
@@ -327,9 +333,6 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             event_loop.exit();
             return;
         }
-        if self.daemon {
-            return;
-        }
         if let Err(e) = self.create_windows(event_loop) {
             eprintln!("[rayshot] failed to create windows: {e:?}");
             event_loop.exit();
@@ -352,43 +355,6 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             UserEvent::Captured(Err(e)) => {
                 eprintln!("[rayshot] desktop capture failed: {e}");
                 event_loop.exit();
-            }
-            UserEvent::Trigger => {
-                if self.active {
-                    return;
-                }
-                self.anim_gen
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                crate::anim::set_animations(false);
-                let frame = match self.screencast.as_ref().map(|s| s.grab()) {
-                    Some(Ok(f)) => f,
-                    Some(Err(e)) => {
-                        eprintln!("[rayshot] daemon grab failed: {e:?}");
-                        crate::anim::set_animations(true);
-                        return;
-                    }
-                    None => {
-                        crate::anim::set_animations(true);
-                        return;
-                    }
-                };
-                if let Err(e) = self.ensure_device() {
-                    eprintln!("[rayshot] daemon gpu init failed: {e:?}");
-                    crate::anim::set_animations(true);
-                    return;
-                }
-                if let Err(e) = self.create_windows(event_loop) {
-                    eprintln!("[rayshot] daemon window creation failed: {e:?}");
-                    crate::anim::set_animations(true);
-                    return;
-                }
-                self.attach_frame(event_loop, frame);
-                self.active = true;
-            }
-            UserEvent::Close => {
-                if self.active {
-                    self.close(event_loop);
-                }
             }
         }
     }
@@ -1947,43 +1913,8 @@ impl OverlayApp {
                 crate::export::save_last_selection(sel.min.x, sel.min.y, sel.width(), sel.height());
             }
         }
-        if self.daemon {
-            self.teardown_session();
-        } else {
-            crate::anim::restore_detached();
-            unsafe { libc::_exit(0) }
-        }
-    }
-
-    fn teardown_session(&mut self) {
-        self.windows.clear();
-        if let Some(shared) = self.shared.as_mut() {
-            shared._frame_texture = None;
-            shared.frame_view = None;
-            shared._blur_texture = None;
-            shared.blur_view = None;
-        }
-        self.scene = crate::scene::Scene::default();
-        self.draft = None;
-        self.draft_start = None;
-        self.text_edit = None;
-        self.text_sel = None;
-        self.move_shape = None;
-        self.sel_mode = None;
-        self.blurred = None;
-        self.frame = None;
-        self.pending = None;
-        self.selection = None;
-        self.tool = crate::scene::Tool::Select;
-        self.active = false;
-        let counter = self.anim_gen.clone();
-        let target = counter.load(std::sync::atomic::Ordering::SeqCst);
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            if counter.load(std::sync::atomic::Ordering::SeqCst) == target {
-                crate::anim::set_animations(true);
-            }
-        });
+        crate::anim::restore_detached();
+        unsafe { libc::_exit(0) }
     }
 
     fn finish_and_exit(&mut self, event_loop: &ActiveEventLoop) {
