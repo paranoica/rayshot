@@ -79,6 +79,13 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
     }
     std::mem::forget(lock);
 
+    crate::anim::set_animations(true);
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        crate::anim::set_animations(true);
+        default_hook(info);
+    }));
+
     let session = crate::screencast::ScreencastSession::start(&rt)
         .context("failed to start screencast session")?;
     if !session.wait_ready(std::time::Duration::from_secs(15)) {
@@ -284,7 +291,7 @@ fn resize_rect(base: egui::Rect, handle: usize, fp: egui::Pos2) -> egui::Rect {
 }
 
 struct Shared {
-    instance: wgpu::Instance,
+    _instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -526,49 +533,38 @@ impl OverlayApp {
         }
         eprintln!("[rayshot] creating {} overlay window(s)", targets.len());
 
-        let surfaces: Vec<wgpu::Surface<'static>> = match self.shared.as_ref() {
-            Some(shared) => targets
-                .iter()
-                .map(|(w, _)| shared.instance.create_surface(w.clone()))
-                .collect::<std::result::Result<_, _>>()
-                .context("failed to create surface")?,
-            None => {
-                let instance = wgpu::Instance::new(
-                    wgpu::InstanceDescriptor::new_without_display_handle_from_env(),
-                );
-                let surfaces: Vec<wgpu::Surface<'static>> = targets
-                    .iter()
-                    .map(|(w, _)| instance.create_surface(w.clone()))
-                    .collect::<std::result::Result<_, _>>()
-                    .context("failed to create surface")?;
-                let adapter = self
-                    .rt
-                    .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                        power_preference: wgpu::PowerPreference::HighPerformance,
-                        compatible_surface: Some(&surfaces[0]),
-                        force_fallback_adapter: false,
-                    }))
-                    .context("no suitable GPU adapter found")?;
-                let (device, queue) = self
-                    .rt
-                    .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                        label: Some("rayshot device"),
-                        ..Default::default()
-                    }))
-                    .context("failed to request GPU device")?;
-                self.shared = Some(Shared {
-                    instance,
-                    adapter,
-                    device,
-                    queue,
-                    _frame_texture: None,
-                    frame_view: None,
-                    _blur_texture: None,
-                    blur_view: None,
-                });
-                surfaces
-            }
-        };
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let surfaces: Vec<wgpu::Surface<'static>> = targets
+            .iter()
+            .map(|(w, _)| instance.create_surface(w.clone()))
+            .collect::<std::result::Result<_, _>>()
+            .context("failed to create surface")?;
+        let adapter = self
+            .rt
+            .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surfaces[0]),
+                force_fallback_adapter: false,
+            }))
+            .context("no suitable GPU adapter found")?;
+        let (device, queue) = self
+            .rt
+            .block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                label: Some("rayshot device"),
+                ..Default::default()
+            }))
+            .context("failed to request GPU device")?;
+        self.shared = Some(Shared {
+            _instance: instance,
+            adapter,
+            device,
+            queue,
+            _frame_texture: None,
+            frame_view: None,
+            _blur_texture: None,
+            blur_view: None,
+        });
 
         let shared = self.shared.as_ref().expect("shared initialized");
         let mut windows = Vec::with_capacity(targets.len());
@@ -1942,12 +1938,7 @@ impl OverlayApp {
 
     fn teardown_session(&mut self) {
         self.windows.clear();
-        if let Some(shared) = self.shared.as_mut() {
-            shared._frame_texture = None;
-            shared.frame_view = None;
-            shared._blur_texture = None;
-            shared.blur_view = None;
-        }
+        self.shared = None;
         self.scene = crate::scene::Scene::default();
         self.draft = None;
         self.draft_start = None;
