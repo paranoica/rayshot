@@ -13,6 +13,7 @@ optdepends=('xdg-desktop-portal-gnome: GNOME portal backend, daemon and hotkey s
 makedepends=('cargo' 'clang' 'git')
 provides=('rayshot')
 conflicts=('rayshot')
+options=('!lto')
 source=("$_srcname::git+https://github.com/paranoica/rayshot.git")
 sha256sums=('SKIP')
 install=rayshot.install

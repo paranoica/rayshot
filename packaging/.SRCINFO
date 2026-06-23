@@ -17,6 +17,7 @@ pkgbase = rayshot-git
 	optdepends = glib2: gsettings, required for automatic GNOME hotkey setup
 	provides = rayshot
 	conflicts = rayshot
+	options = !lto
 	source = rayshot::git+https://github.com/paranoica/rayshot.git
 	sha256sums = SKIP
 
