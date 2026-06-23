@@ -1406,7 +1406,7 @@ impl OverlayApp {
             }
 
             if let Some((sel, _vis)) = visible {
-                if region.contains(sel.max) {
+                if region.contains(sel.max) && sel_mode.is_none() {
                     let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
 
                     let tools_id = egui::Id::new("rayshot-tools");
