@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use pipewire as pw;
+use pw::stream::StreamState;
 use pw::{properties::properties, spa};
 use spa::pod::Pod;
 use tokio::runtime::Handle;
@@ -42,13 +43,29 @@ struct Captured {
 
 pub struct ScreencastSession {
     latest: Arc<Mutex<Vec<Slot>>>,
+    states: Arc<Mutex<Vec<StreamState>>>,
+    quit_tx: pw::channel::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for ScreencastSession {
+    fn drop(&mut self) {
+        let _ = self.quit_tx.send(());
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl ScreencastSession {
     pub fn start(rt: &Handle) -> Result<Self> {
-        let portal = rt
-            .block_on(open_screencast())
-            .context("screencast portal handshake failed")?;
+        let portal = match rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(8), open_screencast()).await
+        }) {
+            Ok(Ok(p)) => p,
+            Ok(Err(e)) => return Err(e).context("screencast portal handshake failed"),
+            Err(_) => return Err(anyhow!("screencast portal handshake timed out")),
+        };
         let latest: Vec<Slot> = portal
             .streams
             .iter()
@@ -63,18 +80,38 @@ impl ScreencastSession {
             })
             .collect();
         let latest = Arc::new(Mutex::new(latest));
+        let states: Vec<StreamState> = portal
+            .streams
+            .iter()
+            .map(|_| StreamState::Unconnected)
+            .collect();
+        let states = Arc::new(Mutex::new(states));
         let shared = latest.clone();
+        let shared_states = states.clone();
         let fd = portal.fd;
         let infos = portal.streams;
-        std::thread::Builder::new()
+        let (quit_tx, quit_rx) = pw::channel::channel::<()>();
+        let thread = std::thread::Builder::new()
             .name("rayshot-pw".into())
             .spawn(move || {
-                if let Err(e) = run_pw_loop(fd, infos, shared) {
+                if let Err(e) = run_pw_loop(fd, infos, shared, shared_states, quit_rx) {
                     eprintln!("[rayshot] screencast pipewire loop failed: {e:?}");
                 }
             })
             .context("spawn pipewire thread")?;
-        Ok(Self { latest })
+        Ok(Self {
+            latest,
+            states,
+            quit_tx,
+            thread: Some(thread),
+        })
+    }
+
+    pub fn is_healthy(&self) -> bool {
+        self.states
+            .lock()
+            .map(|s| !s.is_empty() && s.iter().all(|st| *st == StreamState::Streaming))
+            .unwrap_or(false)
     }
 
     fn grab_inner(&self, timeout: Duration) -> Result<Frame> {
@@ -191,13 +228,24 @@ struct FmtData {
     format: spa::param::video::VideoInfoRaw,
 }
 
-fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Slot>>>) -> Result<()> {
+fn run_pw_loop(
+    fd: OwnedFd,
+    infos: Vec<StreamInfo>,
+    latest: Arc<Mutex<Vec<Slot>>>,
+    states: Arc<Mutex<Vec<StreamState>>>,
+    quit_rx: pw::channel::Receiver<()>,
+) -> Result<()> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None).context("pipewire main loop")?;
     let context = pw::context::ContextRc::new(&mainloop, None).context("pipewire context")?;
     let core = context
         .connect_fd_rc(fd, None)
         .context("pipewire connect_fd")?;
+
+    let _quit = quit_rx.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
 
     let mut streams = Vec::new();
     let mut listeners = Vec::new();
@@ -236,6 +284,16 @@ fn run_pw_loop(fd: OwnedFd, infos: Vec<StreamInfo>, latest: Arc<Mutex<Vec<Slot>>
                     return;
                 }
                 let _ = ud.format.parse(param);
+            })
+            .state_changed({
+                let states = states.clone();
+                move |_, _, _old, new| {
+                    if let Ok(mut st) = states.lock() {
+                        if idx < st.len() {
+                            st[idx] = new;
+                        }
+                    }
+                }
             })
             .process({
                 let latest = latest.clone();
