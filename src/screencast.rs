@@ -60,7 +60,7 @@ impl Drop for ScreencastSession {
 impl ScreencastSession {
     pub fn start(rt: &Handle) -> Result<Self> {
         let portal = match rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(8), open_screencast()).await
+            tokio::time::timeout(Duration::from_secs(60), open_screencast()).await
         }) {
             Ok(Ok(p)) => p,
             Ok(Err(e)) => return Err(e).context("screencast portal handshake failed"),
