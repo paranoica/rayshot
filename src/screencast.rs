@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,7 @@ struct Captured {
 pub struct ScreencastSession {
     latest: Arc<Mutex<Vec<Slot>>>,
     states: Arc<Mutex<Vec<StreamState>>>,
+    trusted: Arc<AtomicBool>,
     quit_tx: pw::channel::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -59,6 +61,14 @@ impl Drop for ScreencastSession {
 
 impl ScreencastSession {
     pub fn start(rt: &Handle) -> Result<Self> {
+        Self::start_impl(rt, true)
+    }
+
+    pub fn start_recovery(rt: &Handle) -> Result<Self> {
+        Self::start_impl(rt, false)
+    }
+
+    fn start_impl(rt: &Handle, initially_trusted: bool) -> Result<Self> {
         let portal = match rt.block_on(async {
             tokio::time::timeout(Duration::from_secs(60), open_screencast()).await
         }) {
@@ -86,15 +96,18 @@ impl ScreencastSession {
             .map(|_| StreamState::Unconnected)
             .collect();
         let states = Arc::new(Mutex::new(states));
+        let trusted = Arc::new(AtomicBool::new(initially_trusted));
         let shared = latest.clone();
         let shared_states = states.clone();
+        let shared_trusted = trusted.clone();
         let fd = portal.fd;
         let infos = portal.streams;
         let (quit_tx, quit_rx) = pw::channel::channel::<()>();
         let thread = std::thread::Builder::new()
             .name("rayshot-pw".into())
             .spawn(move || {
-                if let Err(e) = run_pw_loop(fd, infos, shared, shared_states, quit_rx) {
+                if let Err(e) = run_pw_loop(fd, infos, shared, shared_states, shared_trusted, quit_rx)
+                {
                     eprintln!("[rayshot] screencast pipewire loop failed: {e:?}");
                 }
             })
@@ -102,6 +115,7 @@ impl ScreencastSession {
         Ok(Self {
             latest,
             states,
+            trusted,
             quit_tx,
             thread: Some(thread),
         })
@@ -112,6 +126,10 @@ impl ScreencastSession {
             .lock()
             .map(|s| !s.is_empty() && s.iter().all(|st| *st == StreamState::Streaming))
             .unwrap_or(false)
+    }
+
+    pub fn is_trusted(&self) -> bool {
+        self.trusted.load(Ordering::Relaxed)
     }
 
     fn grab_inner(&self, timeout: Duration) -> Result<Frame> {
@@ -233,6 +251,7 @@ fn run_pw_loop(
     infos: Vec<StreamInfo>,
     latest: Arc<Mutex<Vec<Slot>>>,
     states: Arc<Mutex<Vec<StreamState>>>,
+    trusted: Arc<AtomicBool>,
     quit_rx: pw::channel::Receiver<()>,
 ) -> Result<()> {
     pw::init();
@@ -297,6 +316,8 @@ fn run_pw_loop(
             })
             .process({
                 let latest = latest.clone();
+                let trusted = trusted.clone();
+                let baseline = std::cell::Cell::new(None::<u64>);
                 let last_copy = std::cell::Cell::new(
                     Instant::now()
                         .checked_sub(Duration::from_secs(1))
@@ -337,6 +358,17 @@ fn run_pw_loop(
                     s.stride = row;
                     s.format = ud.format.format();
                     s.present = true;
+                    if !trusted.load(Ordering::Relaxed) {
+                        let sig = frame_sig(&s.raw);
+                        match baseline.get() {
+                            None => baseline.set(Some(sig)),
+                            Some(b) => {
+                                if sig != b {
+                                    trusted.store(true, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    }
                     last_copy.set(now);
                 }
             })
@@ -431,6 +463,18 @@ fn run_pw_loop(
     let _keep = Rc::new(RefCell::new((streams, listeners)));
     mainloop.run();
     Ok(())
+}
+
+fn frame_sig(data: &[u8]) -> u64 {
+    let mut h: u64 = 1469598103934665603;
+    let step = (data.len() / 16384).max(1);
+    let mut i = 0;
+    while i < data.len() {
+        h ^= data[i] as u64;
+        h = h.wrapping_mul(1099511628211);
+        i += step;
+    }
+    h
 }
 
 fn to_rgba(

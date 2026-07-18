@@ -119,23 +119,9 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
             }
             continue;
         }
-        let disrupted = !session.is_healthy();
-        let frame = if disrupted {
-            eprintln!("[rayshot] daemon: screencast unhealthy, capturing this shot via portal");
-            match rt.block_on(crate::capture::capture_frame()) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[rayshot] daemon: portal capture failed ({e:?}), trying screencast");
-                    match session.grab() {
-                        Ok(f) => f,
-                        Err(e2) => {
-                            eprintln!("[rayshot] daemon: screencast grab also failed: {e2:?}");
-                            continue;
-                        }
-                    }
-                }
-            }
-        } else {
+        let healthy = session.is_healthy();
+        let fresh = healthy && session.is_trusted();
+        let frame = if fresh {
             match session.grab() {
                 Ok(f) => f,
                 Err(e) => {
@@ -149,12 +135,30 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
                     }
                 }
             }
+        } else {
+            eprintln!(
+                "[rayshot] daemon: screencast not fresh (healthy={healthy}, trusted={}), via portal",
+                session.is_trusted()
+            );
+            match rt.block_on(crate::capture::capture_frame()) {
+                Ok(f) => f,
+                Err(e) => {
+                    eprintln!("[rayshot] daemon: portal capture failed ({e:?}), trying screencast");
+                    match session.grab() {
+                        Ok(f) => f,
+                        Err(e2) => {
+                            eprintln!("[rayshot] daemon: screencast grab also failed: {e2:?}");
+                            continue;
+                        }
+                    }
+                }
+            }
         };
         eprintln!(
             "[rayshot] daemon: shot {}x{} via {}",
             frame.width,
             frame.height,
-            if disrupted { "portal" } else { "screencast" }
+            if fresh { "screencast" } else { "portal" }
         );
         counter += 1;
         let frame_path = dir.join(format!("frame-{counter}.raw"));
@@ -173,9 +177,9 @@ pub fn run_daemon(rt: Handle) -> Result<()> {
             Ok(ch) => child = Some(ch),
             Err(e) => eprintln!("[rayshot] daemon spawn overlay failed: {e:?}"),
         }
-        if disrupted {
-            eprintln!("[rayshot] daemon: rebuilding screencast for next shots");
-            match crate::screencast::ScreencastSession::start(&rt) {
+        if !healthy {
+            eprintln!("[rayshot] daemon: rebuilding screencast (untrusted until a fresh frame)");
+            match crate::screencast::ScreencastSession::start_recovery(&rt) {
                 Ok(s) => {
                     let ready = s.wait_ready(std::time::Duration::from_secs(3));
                     session = s;
