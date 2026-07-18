@@ -1,5 +1,9 @@
 # rayshot
 
+[![AUR version](https://img.shields.io/aur/version/rayshot?label=AUR)](https://aur.archlinux.org/packages/rayshot)
+[![CI](https://github.com/paranoica/rayshot/actions/workflows/ci.yml/badge.svg)](https://github.com/paranoica/rayshot/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A fast, lightweight screenshot and annotation tool for Linux - select a region,
 mark it up, copy or save. Built in Rust. Tuned for GNOME on Wayland, with an
 optional resident daemon that makes capture feel instant.
@@ -17,6 +21,21 @@ optional resident daemon that makes capture feel instant.
   stream and the GPU warm, so the overlay appears with no portal round-trip and
   no flash. Idle cost is about 90 MB RAM and a few % CPU only while the screen
   is changing (near-zero on a static screen).
+
+## Why rayshot?
+
+Flameshot is the established Linux screenshot tool and does more — rayshot is
+deliberately smaller, with a single focus: fast region-select and annotation on
+GNOME/Wayland, in a Lightshot-like flow, with capture that feels instant.
+
+|              | rayshot                                | Flameshot                     |
+|--------------|----------------------------------------|-------------------------------|
+| Focus        | GNOME/Wayland, instant capture         | Cross-platform, feature-rich  |
+| Instant mode | Resident daemon, no portal flash       | Portal round-trip per shot    |
+| Written in   | Rust                                   | C++                           |
+| Platforms    | Linux (GNOME/Wayland focus)            | Linux, Windows, macOS         |
+| Annotation   | pen, line, arrow, rect, marker, text, pixelate, blur | more tools + rich config |
+| Maturity     | New                                    | Mature, large community       |
 
 ## Desktop support
 
