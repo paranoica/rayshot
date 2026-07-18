@@ -4,6 +4,8 @@ A fast, lightweight screenshot and annotation tool for Linux - select a region,
 mark it up, copy or save. Built in Rust. Tuned for GNOME on Wayland, with an
 optional resident daemon that makes capture feel instant.
 
+![rayshot demo](assets/demo.gif)
+
 ## Features
 
 - Region select across multiple monitors, with the last selection remembered.
