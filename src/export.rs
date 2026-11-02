@@ -23,16 +23,33 @@ fn last_selection_path() -> PathBuf {
     home.join(".cache/rayshot/last_selection")
 }
 
+fn remember_selection() -> bool {
+    std::env::var_os("RAYSHOT_NO_REMEMBER_SELECTION").is_none()
+}
+
 pub fn save_last_selection(x: f32, y: f32, w: f32, h: f32) {
-    let path = last_selection_path();
+    save_last_selection_to(remember_selection(), &last_selection_path(), x, y, w, h);
+}
+
+fn save_last_selection_to(remember: bool, path: &Path, x: f32, y: f32, w: f32, h: f32) {
+    if !remember {
+        return;
+    }
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&path, format!("{x},{y},{w},{h}"));
+    let _ = std::fs::write(path, format!("{x},{y},{w},{h}"));
 }
 
 pub fn load_last_selection() -> Option<(f32, f32, f32, f32)> {
-    let text = std::fs::read_to_string(last_selection_path()).ok()?;
+    load_last_selection_from(remember_selection(), &last_selection_path())
+}
+
+fn load_last_selection_from(remember: bool, path: &Path) -> Option<(f32, f32, f32, f32)> {
+    if !remember {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
     let v: Vec<f32> = text
         .trim()
         .split(',')
@@ -151,4 +168,72 @@ pub fn copy_png_to_clipboard(png: &[u8]) -> Result<()> {
         anyhow::bail!("wl-copy exited with {status}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    fn temp_file() -> PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("rayshot-sel-test-{}-{n}", std::process::id()))
+    }
+
+    #[test]
+    fn load_returns_saved_selection_when_remembered() {
+        let path = temp_file();
+        save_last_selection_to(true, &path, 10.0, 20.0, 30.0, 40.0);
+        assert_eq!(
+            load_last_selection_from(true, &path),
+            Some((10.0, 20.0, 30.0, 40.0))
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_skips_restore_when_disabled_even_if_file_exists() {
+        let path = temp_file();
+        save_last_selection_to(true, &path, 10.0, 20.0, 30.0, 40.0);
+        assert_eq!(load_last_selection_from(false, &path), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn save_writes_nothing_when_disabled() {
+        let path = temp_file();
+        save_last_selection_to(false, &path, 10.0, 20.0, 30.0, 40.0);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_rejects_zero_or_negative_size() {
+        let path = temp_file();
+        std::fs::write(&path, "10,20,0,40").unwrap();
+        assert_eq!(load_last_selection_from(true, &path), None);
+        std::fs::write(&path, "10,20,30,0").unwrap();
+        assert_eq!(load_last_selection_from(true, &path), None);
+        std::fs::write(&path, "10,20,-5,40").unwrap();
+        assert_eq!(load_last_selection_from(true, &path), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_rejects_malformed() {
+        let path = temp_file();
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(load_last_selection_from(true, &path), None);
+        std::fs::write(&path, "10,20,30").unwrap();
+        assert_eq!(load_last_selection_from(true, &path), None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_missing_file_is_none() {
+        let path = temp_file();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(load_last_selection_from(true, &path), None);
+    }
 }
