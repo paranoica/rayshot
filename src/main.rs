@@ -6,6 +6,7 @@ mod live;
 mod overlay;
 mod scene;
 mod screencast;
+mod warm;
 
 use anyhow::{Context, Result};
 
@@ -44,6 +45,7 @@ fn main() -> Result<()> {
             return hotkey::install(&binding, daemon);
         }
         Some("uninstall-hotkey") => return hotkey::uninstall(),
+        Some("warm") => return warm::run(std::env::args().nth(2).as_deref()),
         Some("monitors") => return overlay::list_monitors(),
         Some("daemon") => {
             let rt = tokio::runtime::Builder::new_multi_thread()
@@ -51,6 +53,13 @@ fn main() -> Result<()> {
                 .build()
                 .context("failed to build tokio runtime")?;
             return overlay::run_daemon(rt.handle().clone());
+        }
+        Some("serve") => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            return overlay::run_serve(rt.handle().clone());
         }
         Some("overlay") if std::env::args().nth(2).as_deref() == Some("--live") => {
             let dim = |i: usize| -> Result<u32> {
@@ -81,6 +90,9 @@ fn main() -> Result<()> {
                 .build()
                 .context("failed to build tokio runtime")?;
             return overlay::run_with_frame(frame, rt.handle().clone());
+        }
+        Some(cmd) if !matches!(cmd, "close" | "trigger" | "shot" | "shot-pw") => {
+            anyhow::bail!("unknown command {cmd:?}");
         }
         _ => {}
     }

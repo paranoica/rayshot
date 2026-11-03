@@ -14,3 +14,5 @@ else
     echo "Wayland: log out and back in, then run: gnome-extensions enable $UUID"
 fi
 echo "Then press Ctrl+Print to capture + open rayshot."
+echo "The overlay stays warm for a faster start. To turn that off:"
+echo "  gsettings --schemadir \"$DST/schemas\" set org.gnome.shell.extensions.rayshot warm-overlay false"

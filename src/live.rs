@@ -2,8 +2,20 @@ use std::path::PathBuf;
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
-    Frame(PathBuf),
+    Show { id: u64, width: u32, height: u32 },
+    Frame { id: u64, path: PathBuf },
+    Cancel { id: u64 },
     Quit,
+}
+
+pub fn should_recycle(baseline_kb: u64, current_kb: u64, limit_kb: u64) -> bool {
+    current_kb.saturating_sub(baseline_kb) > limit_kb
+}
+
+pub fn rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
+    line.split_whitespace().nth(1)?.parse().ok()
 }
 
 pub fn parse_command(line: &str) -> Option<Command> {
@@ -11,42 +23,134 @@ pub fn parse_command(line: &str) -> Option<Command> {
     if line == "quit" {
         return Some(Command::Quit);
     }
-    let path = line.strip_prefix("frame ")?;
-    (!path.trim().is_empty()).then(|| Command::Frame(PathBuf::from(path)))
+    if let Some(rest) = line.strip_prefix("frame ") {
+        let (id, path) = rest.split_once(' ')?;
+        let id = id.parse().ok()?;
+        return (!path.trim().is_empty()).then(|| Command::Frame {
+            id,
+            path: PathBuf::from(path),
+        });
+    }
+    if let Some(id) = line.strip_prefix("cancel ") {
+        return id.parse().ok().map(|id| Command::Cancel { id });
+    }
+    let rest = line.strip_prefix("show ")?;
+    let mut parts = rest.split(' ');
+    let id = parts.next()?.parse().ok()?;
+    let width = parts.next()?.parse().ok().filter(|&w: &u32| w > 0)?;
+    let height = parts.next()?.parse().ok().filter(|&h: &u32| h > 0)?;
+    parts
+        .next()
+        .is_none()
+        .then_some(Command::Show { id, width, height })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn frame(id: u64, path: &str) -> Option<Command> {
+        Some(Command::Frame {
+            id,
+            path: PathBuf::from(path),
+        })
+    }
+
     #[test]
-    fn parses_frame_with_path() {
+    fn parses_frame_with_session_and_path() {
         assert_eq!(
-            parse_command("frame /run/user/1000/rayshot/f.rsf\n"),
-            Some(Command::Frame(PathBuf::from(
-                "/run/user/1000/rayshot/f.rsf"
-            )))
+            parse_command("frame 7 /run/user/1000/rayshot/f.rsf\n"),
+            frame(7, "/run/user/1000/rayshot/f.rsf")
         );
     }
 
     #[test]
-    fn keeps_spaces_inside_path() {
+    fn keeps_spaces_inside_frame_path() {
         assert_eq!(
-            parse_command("frame /tmp/a b/c.rsf"),
-            Some(Command::Frame(PathBuf::from("/tmp/a b/c.rsf")))
+            parse_command("frame 1 /tmp/a b/c.rsf"),
+            frame(1, "/tmp/a b/c.rsf")
         );
     }
 
     #[test]
-    fn strips_crlf() {
-        assert_eq!(parse_command("quit\r\n"), Some(Command::Quit));
-    }
-
-    #[test]
-    fn rejects_frame_without_path() {
+    fn rejects_frame_without_session_or_path() {
+        assert_eq!(parse_command("frame /x.rsf"), None);
+        assert_eq!(parse_command("frame 7"), None);
+        assert_eq!(parse_command("frame 7 "), None);
         assert_eq!(parse_command("frame"), None);
-        assert_eq!(parse_command("frame "), None);
-        assert_eq!(parse_command("frame \n"), None);
+        assert_eq!(parse_command("frame -1 /x"), None);
+        assert_eq!(parse_command("frame x /x"), None);
+    }
+
+    #[test]
+    fn parses_show() {
+        assert_eq!(
+            parse_command("show 3 3840 1080\r\n"),
+            Some(Command::Show {
+                id: 3,
+                width: 3840,
+                height: 1080
+            })
+        );
+        assert_eq!(
+            parse_command(&format!("show {} 1 1", u64::MAX)),
+            Some(Command::Show {
+                id: u64::MAX,
+                width: 1,
+                height: 1
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_bad_show() {
+        assert_eq!(parse_command("show 3 0 1080"), None);
+        assert_eq!(parse_command("show 3 1920 0"), None);
+        assert_eq!(parse_command("show 3 1920"), None);
+        assert_eq!(parse_command("show 3 1920 1080 5"), None);
+        assert_eq!(parse_command("show 3 a b"), None);
+        assert_eq!(parse_command("show 1920 1080"), None);
+        assert_eq!(parse_command("show -1 2 2"), None);
+        assert_eq!(parse_command("show 3 4294967296 1"), None);
+    }
+
+    #[test]
+    fn parses_cancel() {
+        assert_eq!(parse_command("cancel 9\n"), Some(Command::Cancel { id: 9 }));
+    }
+
+    #[test]
+    fn rejects_bad_cancel() {
+        assert_eq!(parse_command("cancel"), None);
+        assert_eq!(parse_command("cancel "), None);
+        assert_eq!(parse_command("cancel x"), None);
+        assert_eq!(parse_command("cancel 9 9"), None);
+        assert_eq!(parse_command("cancel -9"), None);
+    }
+
+    #[test]
+    fn recycles_only_past_the_limit() {
+        assert!(!should_recycle(100_000, 100_000, 131_072));
+        assert!(!should_recycle(100_000, 231_072, 131_072));
+        assert!(should_recycle(100_000, 231_073, 131_072));
+    }
+
+    #[test]
+    fn shrinking_memory_never_recycles() {
+        assert!(!should_recycle(100_000, 50_000, 131_072));
+        assert!(!should_recycle(100_000, 0, 0));
+    }
+
+    #[test]
+    fn recycle_check_survives_extreme_values() {
+        assert!(!should_recycle(u64::MAX, u64::MAX, u64::MAX));
+        assert!(!should_recycle(u64::MAX - 1, u64::MAX, 1));
+        assert!(should_recycle(0, u64::MAX, u64::MAX - 1));
+    }
+
+    #[test]
+    fn parses_quit() {
+        assert_eq!(parse_command("quit\r\n"), Some(Command::Quit));
     }
 
     #[test]
@@ -54,8 +158,8 @@ mod tests {
         assert_eq!(parse_command(""), None);
         assert_eq!(parse_command("\n"), None);
         assert_eq!(parse_command("hello"), None);
-        assert_eq!(parse_command("FRAME /x"), None);
+        assert_eq!(parse_command("FRAME 1 /x"), None);
         assert_eq!(parse_command("quitx"), None);
-        assert_eq!(parse_command("framex /x"), None);
+        assert_eq!(parse_command("showx 1 2 3"), None);
     }
 }

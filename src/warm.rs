@@ -1,0 +1,82 @@
+use anyhow::{Context, Result, bail};
+use std::path::PathBuf;
+use std::process::Command;
+
+const SCHEMA: &str = "org.gnome.shell.extensions.rayshot";
+const KEY: &str = "warm-overlay";
+
+fn schema_dir() -> Result<PathBuf> {
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .context("neither XDG_DATA_HOME nor HOME is set")?;
+    let dir = data.join("gnome-shell/extensions/rayshot@paranoica/schemas");
+    if !dir.join("gschemas.compiled").exists() {
+        bail!(
+            "rayshot GNOME extension is not installed ({})",
+            dir.display()
+        );
+    }
+    Ok(dir)
+}
+
+fn gsettings(dir: &PathBuf, args: &[&str]) -> Result<String> {
+    let out = Command::new("gsettings")
+        .arg("--schemadir")
+        .arg(dir)
+        .args(args)
+        .output()
+        .context("failed to run gsettings")?;
+    if !out.status.success() {
+        bail!(
+            "gsettings failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub fn run(arg: Option<&str>) -> Result<()> {
+    let dir = schema_dir()?;
+    match arg {
+        Some("on") => gsettings(&dir, &["set", SCHEMA, KEY, "true"]).map(drop)?,
+        Some("off") => gsettings(&dir, &["set", SCHEMA, KEY, "false"]).map(drop)?,
+        Some("status") | None => {}
+        Some(other) => bail!("usage: rayshot warm [on|off|status], got {other:?}"),
+    }
+    let state = parse_bool(&gsettings(&dir, &["get", SCHEMA, KEY])?)
+        .context("unexpected gsettings output")?;
+    println!("warm overlay: {}", if state { "on" } else { "off" });
+    Ok(())
+}
+
+pub fn parse_bool(output: &str) -> Option<bool> {
+    match output.trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_gsettings_booleans() {
+        assert_eq!(parse_bool("true\n"), Some(true));
+        assert_eq!(parse_bool("false\n"), Some(false));
+        assert_eq!(parse_bool("  true "), Some(true));
+    }
+
+    #[test]
+    fn rejects_anything_else() {
+        assert_eq!(parse_bool(""), None);
+        assert_eq!(parse_bool("\n"), None);
+        assert_eq!(parse_bool("TRUE"), None);
+        assert_eq!(parse_bool("yes"), None);
+        assert_eq!(parse_bool("true false"), None);
+        assert_eq!(parse_bool("No such key “warm-overlay”"), None);
+    }
+}

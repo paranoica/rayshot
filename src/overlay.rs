@@ -39,6 +39,18 @@ pub fn list_monitors() -> Result<()> {
 
 enum UserEvent {
     Captured(Result<Frame, String>),
+    Show {
+        id: u64,
+        width: u32,
+        height: u32,
+    },
+    SessionFrame {
+        id: u64,
+        result: Result<Frame, String>,
+    },
+    Cancel {
+        id: u64,
+    },
     Quit,
 }
 
@@ -88,21 +100,49 @@ pub fn run_live(width: u32, height: u32, rt: Handle) -> Result<()> {
     Ok(())
 }
 
+pub fn run_serve(rt: Handle) -> Result<()> {
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("failed to create winit event loop")?;
+    let proxy = event_loop.create_proxy();
+    std::thread::Builder::new()
+        .name("rayshot-stdin".into())
+        .spawn(move || read_commands(proxy))
+        .context("failed to spawn stdin reader")?;
+    let mut app = OverlayApp::new(rt);
+    app.serve = true;
+    event_loop.run_app(&mut app).context("event loop error")?;
+    Ok(())
+}
+
+fn reply(line: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "{line}").and_then(|_| out.flush());
+}
+
 fn read_commands(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+    use crate::live::Command;
     use std::io::BufRead;
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
-        match crate::live::parse_command(&line) {
-            Some(crate::live::Command::Frame(path)) => {
+        let event = match crate::live::parse_command(&line) {
+            Some(Command::Show { id, width, height }) => UserEvent::Show { id, width, height },
+            Some(Command::Frame { id, path }) => {
                 let started = std::time::Instant::now();
                 let result = crate::capture::read_frame_file(&path).map_err(|e| format!("{e:#}"));
                 eprintln!("[rayshot] live frame read {:?}", started.elapsed());
-                if proxy.send_event(UserEvent::Captured(result)).is_err() {
-                    return;
-                }
+                UserEvent::SessionFrame { id, result }
             }
-            Some(crate::live::Command::Quit) => break,
-            None => eprintln!("[rayshot] ignoring unknown command {line:?}"),
+            Some(Command::Cancel { id }) => UserEvent::Cancel { id },
+            Some(Command::Quit) => break,
+            None => {
+                eprintln!("[rayshot] ignoring unknown command {line:?}");
+                continue;
+            }
+        };
+        if proxy.send_event(event).is_err() {
+            return;
         }
     }
     let _ = proxy.send_event(UserEvent::Quit);
@@ -248,6 +288,14 @@ fn send_daemon(msg: &[u8]) -> Result<bool> {
     }
 }
 
+const DEFAULT_RECYCLE_LIMIT_KB: u64 = 128 * 1024;
+
+#[derive(Clone, Copy)]
+enum SessionEnd {
+    Closed,
+    Failed,
+}
+
 #[derive(Clone, Copy)]
 enum Action {
     Copy,
@@ -270,6 +318,11 @@ struct TextDraft {
 }
 
 struct OverlayApp {
+    serve: bool,
+    session: Option<u64>,
+    baseline_rss_kb: Option<u64>,
+    recycle_limit_kb: u64,
+    recycle: bool,
     live: bool,
     see_through: bool,
     frame_size: Option<(u32, u32)>,
@@ -301,6 +354,11 @@ struct OverlayApp {
 impl OverlayApp {
     fn new(rt: Handle) -> Self {
         Self {
+            serve: false,
+            session: None,
+            baseline_rss_kb: None,
+            recycle_limit_kb: DEFAULT_RECYCLE_LIMIT_KB,
+            recycle: false,
             live: false,
             see_through: false,
             frame_size: None,
@@ -413,6 +471,12 @@ struct WindowState {
 }
 
 impl ApplicationHandler<UserEvent> for OverlayApp {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.recycle {
+            event_loop.exit();
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.initialized {
             return;
@@ -421,6 +485,18 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
         if let Err(e) = self.ensure_device() {
             eprintln!("[rayshot] failed to init gpu device: {e:?}");
             event_loop.exit();
+            return;
+        }
+        if self.serve {
+            self.baseline_rss_kb = crate::live::rss_kb();
+            if let Some(limit) = std::env::var("RAYSHOT_RECYCLE_LIMIT_KB")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                self.recycle_limit_kb = limit;
+                eprintln!("[rayshot] rss recycle limit overridden: {limit} kB");
+            }
+            reply("ready");
             return;
         }
         if let Err(e) = self.create_windows(event_loop) {
@@ -437,13 +513,32 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            UserEvent::Show { id, width, height } => {
+                self.start_session(event_loop, id, width, height);
+            }
+            UserEvent::Cancel { id } => {
+                if self.session == Some(id) {
+                    eprintln!("[rayshot] session {id} cancelled");
+                    self.close(event_loop);
+                }
+            }
+            UserEvent::SessionFrame { id, result } => {
+                if self.serve && self.session != Some(id) {
+                    eprintln!(
+                        "[rayshot] dropping frame for session {id}, current {:?}",
+                        self.session
+                    );
+                    return;
+                }
+                self.user_event(event_loop, UserEvent::Captured(result));
+            }
             UserEvent::Captured(Ok(frame)) => {
                 if self.live && self.frame_size != Some((frame.width, frame.height)) {
                     eprintln!(
                         "[rayshot] live frame is {}x{}, expected {:?}",
                         frame.width, frame.height, self.frame_size
                     );
-                    self.close(event_loop);
+                    self.fail(event_loop);
                     return;
                 }
                 if self.initialized && self.shared.is_some() {
@@ -460,14 +555,19 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             UserEvent::Captured(Err(e)) => {
                 eprintln!("[rayshot] desktop capture failed: {e}");
                 if self.live {
-                    self.close(event_loop);
+                    self.fail(event_loop);
                 } else {
                     event_loop.exit();
                 }
             }
             UserEvent::Quit => {
                 eprintln!("[rayshot] exit: stdin closed");
-                self.close(event_loop);
+                if self.serve {
+                    self.end_session(SessionEnd::Closed);
+                    event_loop.exit();
+                } else {
+                    self.close(event_loop);
+                }
             }
         }
     }
@@ -2086,8 +2186,95 @@ impl OverlayApp {
                 crate::export::save_last_selection(sel.min.x, sel.min.y, sel.width(), sel.height());
             }
         }
+        if self.serve {
+            self.end_session(SessionEnd::Closed);
+            return;
+        }
         crate::anim::restore_detached();
         unsafe { libc::_exit(0) }
+    }
+
+    fn start_session(&mut self, event_loop: &ActiveEventLoop, id: u64, width: u32, height: u32) {
+        if !self.serve {
+            return;
+        }
+        if self.session.is_some() {
+            eprintln!("[rayshot] session {id} replaces {:?}", self.session);
+            self.end_session(SessionEnd::Closed);
+        }
+        if self.recycle {
+            eprintln!("[rayshot] session {id} refused, the server is restarting");
+            reply(&format!("failed {id}"));
+            return;
+        }
+        let started = std::time::Instant::now();
+        self.session = Some(id);
+        self.live = true;
+        self.frame_size = Some((width, height));
+        if let Err(e) = self.create_windows(event_loop) {
+            eprintln!("[rayshot] failed to create windows: {e:?}");
+            self.end_session(SessionEnd::Failed);
+            return;
+        }
+        self.show_live();
+        eprintln!("[rayshot] session {id} shown in {:?}", started.elapsed());
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop) {
+        if self.serve {
+            self.end_session(SessionEnd::Failed);
+        } else {
+            self.close(event_loop);
+        }
+    }
+
+    fn end_session(&mut self, end: SessionEnd) {
+        let id = self.session.take();
+        self.reset_session();
+        if let Some(id) = id {
+            let word = match end {
+                SessionEnd::Closed => "closed",
+                SessionEnd::Failed => "failed",
+            };
+            reply(&format!("{word} {id}"));
+        }
+        // wgpu frees dropped GPU resources only when the device is polled.
+        let poll = wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(std::time::Duration::from_secs(1)),
+        };
+        if let Some(Err(e)) = self.shared.as_ref().map(|s| s.device.poll(poll)) {
+            eprintln!("[rayshot] device poll after session failed: {e}");
+        }
+        self.recycle_if_bloated();
+    }
+
+    fn recycle_if_bloated(&mut self) {
+        let (Some(base), Some(now)) = (self.baseline_rss_kb, crate::live::rss_kb()) else {
+            return;
+        };
+        if crate::live::should_recycle(base, now, self.recycle_limit_kb) {
+            eprintln!("[rayshot] rss grew from {base} kB to {now} kB, restarting the server");
+            self.recycle = true;
+        }
+    }
+
+    fn reset_session(&mut self) {
+        let mut shared = self.shared.take();
+        if let Some(s) = shared.as_mut() {
+            s._frame_texture = None;
+            s.frame_view = None;
+            s._blur_texture = None;
+            s.blur_view = None;
+        }
+        let fresh = OverlayApp::new(self.rt.clone());
+        let old = std::mem::replace(self, fresh);
+        self.shared = shared;
+        self.serve = old.serve;
+        self.initialized = old.initialized;
+        self.baseline_rss_kb = old.baseline_rss_kb;
+        self.recycle_limit_kb = old.recycle_limit_kb;
+        self.recycle = old.recycle;
     }
 
     fn defer_until_frame(&mut self, action: Action) -> bool {
@@ -2183,6 +2370,50 @@ fn parse_crop(spec: &str) -> Option<egui::Rect> {
 #[cfg(test)]
 mod tests {
     use super::see_through_alpha;
+
+    #[test]
+    fn reset_session_clears_user_state_and_keeps_server_state() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut app = super::OverlayApp::new(rt.handle().clone());
+        app.serve = true;
+        app.initialized = true;
+        app.baseline_rss_kb = Some(123_456);
+        app.recycle = true;
+        app.recycle_limit_kb = 42;
+        app.live = true;
+        app.see_through = true;
+        app.frame_size = Some((3840, 1080));
+        app.selection = Some(egui::Rect::from_min_size(
+            egui::pos2(1.0, 2.0),
+            egui::vec2(30.0, 40.0),
+        ));
+        app.tool = crate::scene::Tool::Rect;
+        app.pending_export = Some(super::Action::Copy);
+        app.scene.push(crate::scene::Shape::Rect {
+            rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(5.0, 5.0)),
+            color: egui::Color32::RED,
+            width: 2.0,
+        });
+
+        app.reset_session();
+
+        assert!(app.serve);
+        assert!(app.initialized);
+        assert_eq!(app.baseline_rss_kb, Some(123_456));
+        assert!(app.recycle);
+        assert_eq!(app.recycle_limit_kb, 42);
+        assert!(!app.live);
+        assert!(!app.see_through);
+        assert_eq!(app.frame_size, None);
+        assert_eq!(app.selection, None);
+        assert!(matches!(app.tool, crate::scene::Tool::Select));
+        assert!(app.pending_export.is_none());
+        assert!(app.scene.shapes().is_empty());
+        assert!(app.windows.is_empty());
+        assert!(app.frame.is_none());
+    }
     use wgpu::CompositeAlphaMode::{Auto, Inherit, Opaque, PostMultiplied, PreMultiplied};
 
     #[test]

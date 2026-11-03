@@ -1,0 +1,6 @@
+{
+  "uuid": "rayshot-soak@paranoica",
+  "name": "rayshot soak driver",
+  "description": "Test-only driver that runs repeated rayshot captures and records memory. Never install outside a nested test shell.",
+  "shell-version": ["50", "51"]
+}

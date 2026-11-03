@@ -4,18 +4,34 @@ import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
 import St from 'gi://St';
+import System from 'system';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+import {respawnDelay} from './backoff.js';
 import {frameHeader} from './frame.js';
 import {pickClickPoint} from './geometry.js';
 
-const RAYSHOT_BIN = GLib.build_filenamev([
+const DEFAULT_BIN = GLib.build_filenamev([
     GLib.get_home_dir(),
     'projects/rayshot/target/release/rayshot',
 ]);
+
+function rayshotBin() {
+    const override = GLib.getenv('RAYSHOT_BIN');
+    if (!override)
+        return DEFAULT_BIN;
+    if (!GLib.path_is_absolute(override)) {
+        console.log(`rayshot: ignoring RAYSHOT_BIN=${override}, not an absolute path`);
+        return DEFAULT_BIN;
+    }
+    console.log(`rayshot: using RAYSHOT_BIN=${override}`);
+    return override;
+}
 const ARM_TIMEOUT_MS = 5000;
+const READY_TIMEOUT_MS = 10000;
+const STABLE_SERVER_MS = 10000;
 const KILL_GRACE_MS = 1000;
 const PAINT_FALLBACK_MS = 50;
 const SETTLE_INTERVAL_MS = 20;
@@ -83,6 +99,7 @@ function surfaceOf(windowActor) {
 export default class RayshotExtension extends Extension {
     enable() {
         this._epoch = (this._epoch ?? 0) + 1;
+        this._bin = rayshotBin();
         sweepFrames();
         this._settings = this.getSettings();
         this._busy = false;
@@ -92,6 +109,13 @@ export default class RayshotExtension extends Extension {
         this._frameWatches = [];
         this._settleId = 0;
         this._paintWait = null;
+        this._session = 0;
+        this._server = null;
+        this._serverFailures = 0;
+        this._respawnId = 0;
+        this._gcId = 0;
+        this._warmId = this._settings.connect('changed::warm-overlay', () => this._syncServer());
+        this._syncServer();
 
         Main.wm.addKeybinding(
             'capture',
@@ -117,7 +141,192 @@ export default class RayshotExtension extends Extension {
         }
         this._overlay = null;
         this._unfreeze();
+        this._stopServer();
+        this._gcId = removeSource(this._gcId);
+        this._settings.disconnect(this._warmId);
         this._settings = null;
+    }
+
+    _syncServer() {
+        if (!this._settings.get_boolean('warm-overlay')) {
+            this._stopServer();
+            console.log('rayshot: warm overlay off');
+        } else if (!this._server && !this._respawnId) {
+            this._serverFailures = 0;
+            this._startServer();
+        }
+    }
+
+    _startServer() {
+        this._respawnId = 0;
+        if (!this._settings?.get_boolean('warm-overlay'))
+            return;
+        const epoch = this._epoch;
+        let proc;
+        try {
+            proc = Gio.Subprocess.new([this._bin, 'serve'],
+                Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE);
+        } catch (e) {
+            logError(e, 'rayshot: cannot start the overlay server');
+            this._scheduleRespawn();
+            return;
+        }
+        const server = {
+            proc,
+            pid: Number(proc.get_identifier()),
+            ready: false,
+            startedAt: GLib.get_monotonic_time(),
+            readyId: 0,
+            killId: 0,
+            cancellable: new Gio.Cancellable(),
+            lines: new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()}),
+        };
+        server.readyId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, READY_TIMEOUT_MS, () => {
+            server.readyId = 0;
+            console.log('rayshot: overlay server not ready in time, restarting it');
+            this._killServer(server);
+            return GLib.SOURCE_REMOVE;
+        });
+        this._server = server;
+        this._readServer(server);
+        proc.wait_async(null, () => this._onServerExit(server, epoch));
+    }
+
+    _stopServer() {
+        this._respawnId = removeSource(this._respawnId);
+        const server = this._server;
+        if (!server)
+            return;
+        this._server = null;
+        server.cancellable.cancel();
+        this._killServer(server);
+    }
+
+    _killServer(server) {
+        server.ready = false;
+        server.readyId = removeSource(server.readyId);
+        if (server.killId)
+            return;
+        try {
+            server.proc.send_signal(SIGTERM);
+        } catch (e) {
+            logError(e, 'rayshot: cannot stop the overlay server');
+        }
+        server.killId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, KILL_GRACE_MS, () => {
+            server.killId = 0;
+            server.proc.force_exit();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _scheduleRespawn() {
+        if (!this._settings?.get_boolean('warm-overlay'))
+            return;
+        const delay = respawnDelay(this._serverFailures);
+        this._serverFailures++;
+        console.log(`rayshot: overlay server restarts in ${delay}ms`);
+        this._respawnId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
+            this._startServer();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _readServer(server) {
+        server.lines.read_line_async(GLib.PRIORITY_DEFAULT, server.cancellable, (stream, res) => {
+            let line;
+            try {
+                [line] = stream.read_line_finish_utf8(res);
+            } catch (e) {
+                if (!e.matches(Gio.IOErrorEnum, Gio.IOErrorEnum.CANCELLED))
+                    logError(e, 'rayshot: cannot read the overlay server');
+                return;
+            }
+            if (line === null)
+                return;
+            this._onServerLine(server, line);
+            this._readServer(server);
+        });
+    }
+
+    _onServerLine(server, line) {
+        if (this._server !== server)
+            return;
+        if (line === 'ready') {
+            server.ready = true;
+            server.readyId = removeSource(server.readyId);
+            console.log('rayshot: overlay server ready');
+            return;
+        }
+        const reply = /^(closed|failed) (\d+)$/.exec(line);
+        const overlay = this._overlay;
+        if (!reply || overlay?.server !== server || overlay.session !== Number(reply[2]))
+            return;
+        if (reply[1] === 'closed') {
+            this._serverFailures = 0;
+            this._endOverlay(overlay);
+        } else if (overlay.shown || !this._frozen) {
+            console.log(`rayshot: session ${overlay.session} failed on the server`);
+            this._endOverlay(overlay);
+        } else {
+            console.log(`rayshot: session ${overlay.session} failed before showing, falling back`);
+            this._retryOneShot(overlay);
+            this._killServer(server);
+        }
+    }
+
+    _retryOneShot(overlay) {
+        this._resetCapture();
+        this._overlay = null;
+        if (overlay.framePath)
+            deleteQuietly(overlay.framePath);
+        this._launch(overlay.texture, overlay.t0);
+    }
+
+    _onServerExit(server, epoch) {
+        server.cancellable.cancel();
+        server.readyId = removeSource(server.readyId);
+        server.killId = removeSource(server.killId);
+        if (server.ready && GLib.get_monotonic_time() - server.startedAt > STABLE_SERVER_MS * 1000)
+            this._serverFailures = 0;
+        const current = this._server === server && epoch === this._epoch;
+        if (current) {
+            this._server = null;
+            console.log(`rayshot: overlay server exited (status ${server.proc.get_status()})`);
+            this._scheduleRespawn();
+        }
+        const overlay = this._overlay;
+        if (overlay?.server === server) {
+            if (!overlay.shown && this._frozen)
+                this._retryOneShot(overlay);
+            else
+                this._endOverlay(overlay);
+        }
+    }
+
+    _endOverlay(overlay) {
+        overlay.killId = removeSource(overlay.killId);
+        if (overlay.framePath)
+            deleteQuietly(overlay.framePath);
+        if (this._overlay !== overlay)
+            return;
+        this._overlay = null;
+        this._busy = false;
+        this._resetCapture();
+        this._unfreeze();
+        this._collectSoon();
+    }
+
+    _collectSoon() {
+        // Frozen textures and pixbufs are native memory the JS heap does not see.
+        if (this._gcId)
+            return;
+        this._gcId = GLib.idle_add(GLib.PRIORITY_LOW, () => {
+            this._gcId = 0;
+            const started = GLib.get_monotonic_time();
+            System.gc();
+            trace(started, 'garbage collected');
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _resetCapture() {
@@ -177,7 +386,36 @@ export default class RayshotExtension extends Extension {
         this._freezeScreen(content, texture);
         trace(t0, `screen frozen ${texture.get_width()}x${texture.get_height()}`);
         this._closeShellChrome();
-        this._afterNextPaint(() => this._launch(texture, t0));
+        if (this._server?.ready)
+            this._showOnServer(this._server, texture, t0);
+        else
+            this._afterNextPaint(() => this._launch(texture, t0));
+    }
+
+    _showOnServer(server, texture, t0) {
+        const overlay = {
+            proc: server.proc,
+            pid: server.pid,
+            server,
+            texture,
+            t0,
+            session: ++this._session,
+            shown: false,
+            killId: 0,
+            framePath: null,
+        };
+        try {
+            server.proc.get_stdin_pipe().write_all(new TextEncoder().encode(
+                `show ${overlay.session} ${texture.get_width()} ${texture.get_height()}\n`), null);
+        } catch (e) {
+            logError(e, 'rayshot: overlay server unreachable, falling back');
+            this._afterNextPaint(() => this._launch(texture, t0));
+            return;
+        }
+        trace(t0, `session ${overlay.session} sent to the server`);
+        this._overlay = overlay;
+        this._arm(t0);
+        this._sendPixels(overlay, texture, t0);
     }
 
     _freezeScreen(content, texture) {
@@ -249,34 +487,28 @@ export default class RayshotExtension extends Extension {
         let proc;
         try {
             proc = Gio.Subprocess.new(
-                [RAYSHOT_BIN, 'overlay', '--live', `${texture.get_width()}`, `${texture.get_height()}`],
+                [this._bin, 'overlay', '--live', `${texture.get_width()}`, `${texture.get_height()}`],
                 Gio.SubprocessFlags.STDIN_PIPE);
         } catch (e) {
             logError(e, 'rayshot: spawn overlay failed');
             this._abort();
             return;
         }
-        trace(t0, 'overlay spawned');
+        trace(t0, 'one-shot overlay spawned');
         const overlay = {
             proc,
             pid: Number(proc.get_identifier()),
+            server: null,
+            texture,
+            t0,
+            session: ++this._session,
             shown: false,
             killId: 0,
             framePath: null,
         };
         this._overlay = overlay;
         this._arm(t0);
-        proc.wait_async(null, () => {
-            overlay.killId = removeSource(overlay.killId);
-            if (overlay.framePath)
-                deleteQuietly(overlay.framePath);
-            if (this._overlay !== overlay)
-                return;
-            this._overlay = null;
-            this._busy = false;
-            this._resetCapture();
-            this._unfreeze();
-        });
+        proc.wait_async(null, () => this._endOverlay(overlay));
         this._sendPixels(overlay, texture, t0);
     }
 
@@ -290,7 +522,7 @@ export default class RayshotExtension extends Extension {
                     return;
                 overlay.framePath = this._writeFrame(pixbuf, t0);
                 overlay.proc.get_stdin_pipe().write_all(
-                    new TextEncoder().encode(`frame ${overlay.framePath}\n`), null);
+                    new TextEncoder().encode(`frame ${overlay.session} ${overlay.framePath}\n`), null);
                 trace(t0, 'pixels sent');
             } catch (e) {
                 logError(e, 'rayshot: cannot hand pixels to the overlay');

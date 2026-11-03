@@ -7,5 +7,10 @@
       <summary>Capture and open rayshot</summary>
       <description>Keybinding that captures the whole screen and opens rayshot for annotation.</description>
     </key>
+    <key name="warm-overlay" type="b">
+      <default>true</default>
+      <summary>Keep the overlay process warm</summary>
+      <description>Keep a resident overlay process with an initialized GPU so the editor appears faster, at the cost of some idle memory. When off, every capture starts a fresh overlay.</description>
+    </key>
   </schema>
 </schemalist>

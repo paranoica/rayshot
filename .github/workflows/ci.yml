@@ -30,3 +30,9 @@ jobs:
 
       - name: Test extension frame header
         run: gjs -m gnome-extension/tests/frame.test.js
+
+      - name: Test extension respawn backoff
+        run: gjs -m gnome-extension/tests/backoff.test.js
+
+      - name: Test soak verdict math
+        run: gjs -m gnome-extension/tests/growth.test.js
