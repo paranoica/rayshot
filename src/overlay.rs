@@ -51,6 +51,11 @@ enum UserEvent {
     Cancel {
         id: u64,
     },
+    Select {
+        id: u64,
+        from: (f32, f32),
+        to: (f32, f32),
+    },
     Quit,
 }
 
@@ -121,6 +126,7 @@ fn read_commands(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
                 UserEvent::SessionFrame { id, result }
             }
             Some(Command::Cancel { id }) => UserEvent::Cancel { id },
+            Some(Command::Select { id, from, to }) => UserEvent::Select { id, from, to },
             Some(Command::Quit) => break,
             None => {
                 eprintln!("[rayshot] ignoring unknown command {line:?}");
@@ -162,6 +168,7 @@ struct TextDraft {
 }
 
 struct OverlayApp {
+    forwarded: bool,
     serve: bool,
     session: Option<u64>,
     live: bool,
@@ -195,6 +202,7 @@ struct OverlayApp {
 impl OverlayApp {
     fn new(rt: Handle) -> Self {
         Self {
+            forwarded: false,
             serve: false,
             session: None,
             live: false,
@@ -339,6 +347,18 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
         match event {
             UserEvent::Show { id, width, height } => {
                 self.start_session(event_loop, id, width, height);
+            }
+            UserEvent::Select { id, from, to } => {
+                if self.serve && self.session != Some(id) {
+                    return;
+                }
+                let Some((fw, fh)) = self.frame_dims() else {
+                    return;
+                };
+                let rect = forwarded_selection(from, to, fw as f32, fh as f32);
+                (self.selection, self.forwarded) =
+                    next_selection(self.selection, self.forwarded, rect);
+                self.request_redraw_all();
             }
             UserEvent::Cancel { id } => {
                 if self.session == Some(id) {
@@ -645,7 +665,7 @@ impl OverlayApp {
     }
 
     fn restore_selection(&mut self, fw: f32, fh: f32) {
-        if self.selection.is_none() {
+        if self.selection.is_none() && !self.forwarded {
             self.selection = crate::export::load_last_selection().and_then(|(x, y, w, h)| {
                 let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
                 (r.min.x >= 0.0 && r.min.y >= 0.0 && r.max.x <= fw && r.max.y <= fh).then_some(r)
@@ -2109,6 +2129,33 @@ impl OverlayApp {
     }
 }
 
+/// The selection a drag made over the freeze before the overlay appeared.
+fn forwarded_selection(
+    from: (f32, f32),
+    to: (f32, f32),
+    frame_w: f32,
+    frame_h: f32,
+) -> Option<egui::Rect> {
+    let frame = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(frame_w, frame_h));
+    let rect = egui::Rect::from_two_pos(egui::pos2(from.0, from.1), egui::pos2(to.0, to.1))
+        .intersect(frame);
+    (rect.width() >= MIN_SELECTION && rect.height() >= MIN_SELECTION).then_some(rect)
+}
+
+/// What the selection becomes after a forwarded drag update: a drag that
+/// shrinks back to a click clears the selection it made.
+fn next_selection(
+    current: Option<egui::Rect>,
+    forwarded: bool,
+    rect: Option<egui::Rect>,
+) -> (Option<egui::Rect>, bool) {
+    match rect {
+        Some(r) => (Some(r), true),
+        None if forwarded => (None, true),
+        None => (current, false),
+    }
+}
+
 // egui-wgpu blends into premultiplied RGB, so only PreMultiplied composites correctly.
 fn see_through_alpha(modes: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
     let mode = wgpu::CompositeAlphaMode::PreMultiplied;
@@ -2153,7 +2200,86 @@ fn parse_crop(spec: &str) -> Option<egui::Rect> {
 mod tests {
     use super::see_through_alpha;
 
+    use super::forwarded_selection;
     use wgpu::CompositeAlphaMode::{Auto, Inherit, Opaque, PostMultiplied, PreMultiplied};
+
+    fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Option<egui::Rect> {
+        Some(egui::Rect::from_min_max(
+            egui::pos2(x0, y0),
+            egui::pos2(x1, y1),
+        ))
+    }
+
+    #[test]
+    fn forwarded_drag_becomes_a_selection_in_any_direction() {
+        assert_eq!(
+            forwarded_selection((10.0, 20.0), (300.0, 400.0), 3840.0, 1080.0),
+            rect(10.0, 20.0, 300.0, 400.0)
+        );
+        assert_eq!(
+            forwarded_selection((300.0, 400.0), (10.0, 20.0), 3840.0, 1080.0),
+            rect(10.0, 20.0, 300.0, 400.0)
+        );
+    }
+
+    #[test]
+    fn forwarded_drag_is_clamped_to_the_frame() {
+        assert_eq!(
+            forwarded_selection((-50.0, -5.0), (5000.0, 2000.0), 3840.0, 1080.0),
+            rect(0.0, 0.0, 3840.0, 1080.0)
+        );
+    }
+
+    #[test]
+    fn minimum_selection_size_is_inclusive() {
+        assert!(forwarded_selection((0.0, 0.0), (5.0, 5.0), 100.0, 100.0).is_some());
+        assert!(forwarded_selection((0.0, 0.0), (4.9, 5.0), 100.0, 100.0).is_none());
+        assert!(forwarded_selection((0.0, 0.0), (5.0, 4.9), 100.0, 100.0).is_none());
+    }
+
+    #[test]
+    fn forwarded_rect_replaces_the_selection() {
+        let old = rect(1.0, 1.0, 50.0, 50.0);
+        let new = rect(10.0, 10.0, 90.0, 90.0);
+        assert_eq!(super::next_selection(old, false, new), (new, true));
+        assert_eq!(super::next_selection(old, true, new), (new, true));
+    }
+
+    #[test]
+    fn shrinking_a_forwarded_drag_clears_it() {
+        let made = rect(10.0, 10.0, 90.0, 90.0);
+        assert_eq!(super::next_selection(made, true, None), (None, true));
+    }
+
+    #[test]
+    fn a_click_before_any_drag_keeps_the_remembered_selection() {
+        let remembered = rect(1.0, 1.0, 50.0, 50.0);
+        assert_eq!(
+            super::next_selection(remembered, false, None),
+            (remembered, false)
+        );
+        assert_eq!(super::next_selection(None, false, None), (None, false));
+    }
+
+    #[test]
+    fn a_click_or_sliver_is_not_a_selection() {
+        assert_eq!(
+            forwarded_selection((10.0, 10.0), (10.0, 10.0), 3840.0, 1080.0),
+            None
+        );
+        assert_eq!(
+            forwarded_selection((10.0, 10.0), (12.0, 400.0), 3840.0, 1080.0),
+            None
+        );
+        assert_eq!(
+            forwarded_selection((10.0, 10.0), (400.0, 13.0), 3840.0, 1080.0),
+            None
+        );
+        assert_eq!(
+            forwarded_selection((-50.0, 10.0), (-10.0, 400.0), 3840.0, 1080.0),
+            None
+        );
+    }
 
     #[test]
     fn prefers_premultiplied() {

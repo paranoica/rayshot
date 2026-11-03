@@ -15,6 +15,7 @@ import {frameHeader} from './frame.js';
 import {pickClickPoint} from './geometry.js';
 
 const ARM_TIMEOUT_MS = 5000;
+const DRAG_WATCH_MS = 50;
 const PROTOCOL_MISMATCH_EXIT = 3;
 const UPDATED_TEXT = 'rayshot was updated. Log out and back in to finish the update.';
 const BINARY_OLD_TEXT = 'The rayshot program is older than its GNOME extension. Update rayshot.';
@@ -323,6 +324,10 @@ export default class RayshotExtension extends Extension {
     }
 
     _retryOneShot(overlay) {
+        if (overlay.cancelled) {
+            this._settleOverlay(overlay);
+            return;
+        }
         this._releaseWindows(overlay);
         this._cancelPixels(overlay);
         this._resetCapture();
@@ -485,6 +490,7 @@ export default class RayshotExtension extends Extension {
         this._freezeScreen(content, texture);
         trace(t0, `screen frozen ${texture.get_width()}x${texture.get_height()}`);
         this._closeShellChrome();
+        global.stage.set_key_focus(this._frozen.actor);
         if (this._server?.ready)
             this._showOnServer(this._server, texture, t0);
         else
@@ -532,9 +538,132 @@ export default class RayshotExtension extends Extension {
             reactive: true,
         });
         Main.layoutManager.uiGroup.add_child(actor);
+        // Until the overlay shows, keys would reach the app hidden under the
+        // freeze; the freeze takes them instead, and Esc cancels.
+        actor.connect('key-press-event', (_a, event) => {
+            if (event.get_key_symbol() === Clutter.KEY_Escape)
+                this._cancelCapture();
+            return Clutter.EVENT_STOP;
+        });
+        // A drag that starts before the overlay shows lands on the freeze, which
+        // keeps the pointer until release; the drag is forwarded as a selection.
+        actor.connect('button-press-event', (_a, event) => {
+            if (event.get_button() === Clutter.BUTTON_PRIMARY && this._frozen &&
+                !this._frozen.drag?.held) {
+                const [x, y] = event.get_coords();
+                this._frozen.drag = {from: [x, y], to: [x, y], held: true, watchId: 0};
+            }
+            return Clutter.EVENT_STOP;
+        });
+        actor.connect('motion-event', (_a, event) => {
+            const drag = this._frozen?.drag;
+            if (drag?.held) {
+                drag.to = event.get_coords();
+                this._forwardDrag();
+            }
+            return Clutter.EVENT_STOP;
+        });
+        actor.connect('button-release-event', (_a, event) => {
+            const drag = this._frozen?.drag;
+            if (event.get_button() === Clutter.BUTTON_PRIMARY && drag?.held) {
+                drag.to = event.get_coords();
+                this._endDrag();
+            }
+            return Clutter.EVENT_STOP;
+        });
         St.Settings.get().inhibit_animations();
         global.compositor.disable_unredirect();
-        this._frozen = {actor, texture, clones: []};
+        const frozen = {actor, texture, clones: [], focusReleased: false};
+        // A shell modal that ends after the overlay showed would hand the key
+        // focus back to the freeze and leave the overlay without keys.
+        frozen.focusId = global.stage.connect('notify::key-focus', () => {
+            if (frozen.focusReleased && global.stage.get_key_focus() === actor)
+                global.stage.set_key_focus(null);
+        });
+        this._frozen = frozen;
+    }
+
+    _forwardDrag() {
+        const freeze = this._frozen;
+        const drag = freeze?.drag;
+        const overlay = this._overlay;
+        if (!drag || !overlay?.shown || drag.forwardFailed)
+            return;
+        // The frame is in texture pixels, the events in stage units.
+        const sx = freeze.texture.get_width() / global.stage.width;
+        const sy = freeze.texture.get_height() / global.stage.height;
+        const [x0, y0] = drag.from;
+        const [x1, y1] = drag.to;
+        const line = `select ${overlay.session} ${x0 * sx} ${y0 * sy} ${x1 * sx} ${y1 * sy}\n`;
+        try {
+            overlay.proc.get_stdin_pipe().write_all(new TextEncoder().encode(line), null);
+        } catch (e) {
+            drag.forwardFailed = true;
+            logError(e, 'rayshot: cannot forward the selection');
+        }
+    }
+
+    _endDrag() {
+        const freeze = this._frozen;
+        const drag = freeze?.drag;
+        if (!drag)
+            return;
+        drag.held = false;
+        drag.watchId = removeSource(drag.watchId);
+        this._forwardDrag();
+        if (this._overlay?.shown)
+            freeze.actor.reactive = false;
+        const retry = drag.afterRelease;
+        drag.afterRelease = null;
+        retry?.();
+    }
+
+    // Clutter normally reports the release, but the pointer must never stay
+    // captured by the freeze if that event goes missing.
+    _watchDrag() {
+        const drag = this._frozen?.drag;
+        if (!drag?.held || drag.watchId)
+            return;
+        drag.watchId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, DRAG_WATCH_MS, () => {
+            const [x, y, mods] = global.get_pointer();
+            if (this._frozen?.drag !== drag || !drag.held) {
+                drag.watchId = 0;
+                return GLib.SOURCE_REMOVE;
+            }
+            if (mods & Clutter.ModifierType.BUTTON1_MASK)
+                return GLib.SOURCE_CONTINUE;
+            drag.watchId = 0;
+            drag.to = [x, y];
+            this._endDrag();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _releaseKeyFocus() {
+        if (!this._frozen)
+            return;
+        this._frozen.focusReleased = true;
+        if (global.stage.get_key_focus() === this._frozen.actor)
+            global.stage.set_key_focus(null);
+    }
+
+    _cancelCapture() {
+        const overlay = this._overlay;
+        if (!overlay) {
+            console.log('rayshot: capture cancelled before the overlay started');
+            this._cancelPaintWait();
+            this._abort();
+            return;
+        }
+        overlay.cancelled = true;
+        const line = overlay.server ? `cancel ${overlay.session}\n` : 'quit\n';
+        try {
+            overlay.proc.get_stdin_pipe().write_all(new TextEncoder().encode(line), null);
+            console.log('rayshot: capture cancelled before the overlay showed');
+        } catch (e) {
+            logError(e, 'rayshot: cannot cancel the overlay');
+            this._terminate(overlay);
+        }
     }
 
     _unfreeze() {
@@ -542,6 +671,9 @@ export default class RayshotExtension extends Extension {
         if (!freeze)
             return;
         this._frozen = null;
+        global.stage.disconnect(freeze.focusId);
+        if (freeze.drag)
+            freeze.drag.watchId = removeSource(freeze.drag.watchId);
         freeze.clones.forEach(c => c.destroy());
         freeze.actor.destroy();
         St.Settings.get().uninhibit_animations();
@@ -787,12 +919,15 @@ export default class RayshotExtension extends Extension {
             }
             const first = !overlay.shown;
             overlay.shown = true;
+            this._releaseKeyFocus();
             Main.activateWindow(win);
             this._breakGrab(win);
             // The texture readback blocks the compositor, so it waits until the
             // overlay has been painted instead of delaying it.
-            if (first)
+            if (first) {
+                this._forwardDrag();
                 this._sendPixelsAfterPaint(overlay);
+            }
         });
         const destroyId = actor.connect('destroy', () => {
             this._frameWatches = this._frameWatches.filter(([a]) => a !== actor);
@@ -814,7 +949,10 @@ export default class RayshotExtension extends Extension {
         }));
         Main.layoutManager.uiGroup.insert_child_above(clone, freeze.actor);
         freeze.clones.push(clone);
-        freeze.actor.reactive = false;
+        if (freeze.drag?.held)
+            this._watchDrag();
+        else
+            freeze.actor.reactive = false;
         return true;
     }
 
@@ -863,6 +1001,12 @@ export default class RayshotExtension extends Extension {
             onTop = hit !== null && this._isOverlay(hit.get_meta_window());
         }
         if (!onTop) {
+            if (this._frozen?.drag?.held && actor) {
+                // The freeze holds the pointer during a drag; retry on release.
+                this._frozen.drag.afterRelease = () =>
+                    this._clickWhenSettled(win, overlay, target, rects, t0, 0);
+                return;
+            }
             if (attempt >= SETTLE_ATTEMPTS || !actor) {
                 const why = settled
                     ? `target ${target.x},${target.y} is not over the overlay`

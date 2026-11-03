@@ -5,10 +5,36 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
-    Show { id: u64, width: u32, height: u32 },
-    Frame { id: u64, path: PathBuf },
-    Cancel { id: u64 },
+    Show {
+        id: u64,
+        width: u32,
+        height: u32,
+    },
+    Frame {
+        id: u64,
+        path: PathBuf,
+    },
+    Cancel {
+        id: u64,
+    },
+    Select {
+        id: u64,
+        from: (f32, f32),
+        to: (f32, f32),
+    },
     Quit,
+}
+
+fn parse_select(rest: &str) -> Option<Command> {
+    let mut parts = rest.split(' ');
+    let id = parts.next()?.parse().ok()?;
+    let mut coord = || parts.next()?.parse::<f32>().ok().filter(|v| v.is_finite());
+    let from = (coord()?, coord()?);
+    let to = (coord()?, coord()?);
+    parts
+        .next()
+        .is_none()
+        .then_some(Command::Select { id, from, to })
 }
 
 pub fn parse_command(line: &str) -> Option<Command> {
@@ -23,6 +49,9 @@ pub fn parse_command(line: &str) -> Option<Command> {
             id,
             path: PathBuf::from(path),
         });
+    }
+    if let Some(rest) = line.strip_prefix("select ") {
+        return parse_select(rest);
     }
     if let Some(id) = line.strip_prefix("cancel ") {
         return id.parse().ok().map(|id| Command::Cancel { id });
@@ -119,6 +148,33 @@ mod tests {
         assert_eq!(parse_command("cancel x"), None);
         assert_eq!(parse_command("cancel 9 9"), None);
         assert_eq!(parse_command("cancel -9"), None);
+    }
+
+    fn select(id: u64, from: (f32, f32), to: (f32, f32)) -> Option<Command> {
+        Some(Command::Select { id, from, to })
+    }
+
+    #[test]
+    fn parses_select() {
+        assert_eq!(
+            parse_command("select 4 10 20 300.5 400\n"),
+            select(4, (10.0, 20.0), (300.5, 400.0))
+        );
+        assert_eq!(
+            parse_command("select 4 -1920 0 5 6"),
+            select(4, (-1920.0, 0.0), (5.0, 6.0))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_select() {
+        assert_eq!(parse_command("select 4 10 20 30"), None);
+        assert_eq!(parse_command("select 4 10 20 30 40 9"), None);
+        assert_eq!(parse_command("select 4 a 20 30 40"), None);
+        assert_eq!(parse_command("select x 10 20 30 40"), None);
+        assert_eq!(parse_command("select 4 nan 20 30 40"), None);
+        assert_eq!(parse_command("select 4 10 inf 30 40"), None);
+        assert_eq!(parse_command("select"), None);
     }
 
     #[test]
