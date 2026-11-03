@@ -3,10 +3,12 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
 import Shell from 'gi://Shell';
+import St from 'gi://St';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+import {frameHeader} from './frame.js';
 import {pickClickPoint} from './geometry.js';
 
 const RAYSHOT_BIN = GLib.build_filenamev([
@@ -15,6 +17,7 @@ const RAYSHOT_BIN = GLib.build_filenamev([
 ]);
 const ARM_TIMEOUT_MS = 5000;
 const KILL_GRACE_MS = 1000;
+const PAINT_FALLBACK_MS = 50;
 const SETTLE_INTERVAL_MS = 20;
 const SETTLE_ATTEMPTS = 25;
 const SIGTERM = 15;
@@ -31,20 +34,64 @@ function trace(t0, what) {
     console.log(`rayshot: +${ms.toFixed(1)}ms ${what}`);
 }
 
+function frameDir() {
+    return GLib.build_filenamev([GLib.get_user_runtime_dir(), 'rayshot']);
+}
+
+function deleteQuietly(path) {
+    try {
+        Gio.File.new_for_path(path).delete(null);
+    } catch (_) {}
+}
+
+function sweepFrames() {
+    let entries;
+    try {
+        entries = Gio.File.new_for_path(frameDir()).enumerate_children(
+            'standard::name', Gio.FileQueryInfoFlags.NOFOLLOW_SYMLINKS, null);
+    } catch (_) {
+        return;
+    }
+    try {
+        for (let info; (info = entries.next_file(null));) {
+            const name = info.get_name();
+            if (/^frame-\d+\.(rsf|png)$/.test(name))
+                deleteQuietly(GLib.build_filenamev([frameDir(), name]));
+        }
+    } catch (e) {
+        logError(e, 'rayshot: cannot sweep old frames');
+    } finally {
+        entries.close(null);
+    }
+}
+
 function removeSource(id) {
     if (id)
         GLib.source_remove(id);
     return 0;
 }
 
+function typeName(obj) {
+    return obj.constructor.$gtype?.name ?? '';
+}
+
+function surfaceOf(windowActor) {
+    return windowActor.get_children().find(c => typeName(c).startsWith('MetaSurface')) ??
+        windowActor.get_last_child();
+}
+
 export default class RayshotExtension extends Extension {
     enable() {
+        this._epoch = (this._epoch ?? 0) + 1;
+        sweepFrames();
         this._settings = this.getSettings();
         this._busy = false;
         this._overlay = null;
         this._armed = null;
+        this._frozen = null;
         this._frameWatches = [];
         this._settleId = 0;
+        this._paintWait = null;
 
         Main.wm.addKeybinding(
             'capture',
@@ -58,6 +105,7 @@ export default class RayshotExtension extends Extension {
     }
 
     disable() {
+        this._epoch++;
         Main.wm.removeKeybinding('capture');
         global.display.disconnect(this._winCreatedId);
         this._winCreatedId = null;
@@ -68,6 +116,7 @@ export default class RayshotExtension extends Extension {
             logError(e, 'rayshot: cannot stop overlay');
         }
         this._overlay = null;
+        this._unfreeze();
         this._settings = null;
     }
 
@@ -78,6 +127,7 @@ export default class RayshotExtension extends Extension {
             this._armed = null;
         }
         this._settleId = removeSource(this._settleId);
+        this._cancelPaintWait();
         if (this._overlay)
             this._overlay.killId = removeSource(this._overlay.killId);
     }
@@ -92,82 +142,194 @@ export default class RayshotExtension extends Extension {
             this._startCapture();
         } catch (e) {
             logError(e, 'rayshot: capture failed');
-            this._busy = false;
+            this._abort();
         }
+    }
+
+    _abort() {
+        this._unfreeze();
+        this._busy = false;
     }
 
     _startCapture() {
         const t0 = GLib.get_monotonic_time();
-        const dir = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'rayshot']);
-        GLib.mkdir_with_parents(dir, 0o700);
-        const file = Gio.File.new_for_path(
-            GLib.build_filenamev([dir, `frame-${t0}.png`]));
-        const stream = file.replace(null, false, Gio.FileCreateFlags.PRIVATE, null);
-
+        const epoch = this._epoch;
         const shooter = new Shell.Screenshot();
-        shooter.screenshot(false, stream, (_o, res) => {
+        shooter.screenshot_stage_to_content((_o, res) => {
+            if (epoch !== this._epoch)
+                return;
             try {
-                this._onScreenshot(shooter, res, stream, file, t0);
+                this._onStageContent(shooter, res, t0);
             } catch (e) {
                 logError(e, 'rayshot: capture failed');
-                this._discard(file);
-                this._busy = false;
+                this._abort();
             }
         });
     }
 
-    _onScreenshot(shooter, res, stream, file, t0) {
-        let ok = true;
-        try {
-            shooter.screenshot_finish(res);
-        } catch (e) {
-            logError(e, 'rayshot: screenshot failed');
-            ok = false;
-        }
-        try {
-            stream.close(null);
-        } catch (e) {
-            logError(e, 'rayshot: cannot close frame file');
-            ok = false;
-        }
-        if (!ok || !this._settings) {
-            this._discard(file);
-            this._busy = false;
+    _onStageContent(shooter, res, t0) {
+        const [content] = shooter.screenshot_stage_to_content_finish(res);
+        if (this._frozen) {
+            console.log('rayshot: screen already frozen, capture dropped');
             return;
         }
-        trace(t0, 'frame captured');
+        const texture = content.get_texture();
+        this._freezeScreen(content, texture);
+        trace(t0, `screen frozen ${texture.get_width()}x${texture.get_height()}`);
         this._closeShellChrome();
-        this._spawnOverlay(file, t0);
+        this._afterNextPaint(() => this._launch(texture, t0));
     }
 
-    _spawnOverlay(file, t0) {
+    _freezeScreen(content, texture) {
+        const actor = new Clutter.Actor({
+            content,
+            x: 0,
+            y: 0,
+            width: global.stage.width,
+            height: global.stage.height,
+            reactive: true,
+        });
+        Main.layoutManager.uiGroup.add_child(actor);
+        St.Settings.get().inhibit_animations();
+        global.compositor.disable_unredirect();
+        this._frozen = {actor, texture, clones: []};
+    }
+
+    _unfreeze() {
+        const freeze = this._frozen;
+        if (!freeze)
+            return;
+        this._frozen = null;
+        freeze.clones.forEach(c => c.destroy());
+        freeze.actor.destroy();
+        St.Settings.get().uninhibit_animations();
+        global.compositor.enable_unredirect();
+    }
+
+    _afterNextPaint(fn) {
+        this._cancelPaintWait();
+        const wait = {paintId: 0, fallbackId: 0, idleId: 0};
+        const run = () => {
+            if (this._paintWait !== wait)
+                return;
+            this._cancelPaintWait();
+            fn();
+        };
+        wait.paintId = global.stage.connect('after-paint', () => {
+            if (!wait.idleId) {
+                wait.idleId = GLib.idle_add(GLib.PRIORITY_HIGH, () => {
+                    wait.idleId = 0;
+                    run();
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+        });
+        wait.fallbackId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, PAINT_FALLBACK_MS, () => {
+            wait.fallbackId = 0;
+            run();
+            return GLib.SOURCE_REMOVE;
+        });
+        this._paintWait = wait;
+    }
+
+    _cancelPaintWait() {
+        const wait = this._paintWait;
+        if (!wait)
+            return;
+        this._paintWait = null;
+        if (wait.paintId)
+            global.stage.disconnect(wait.paintId);
+        removeSource(wait.fallbackId);
+        removeSource(wait.idleId);
+    }
+
+    _launch(texture, t0) {
+        if (!this._settings || this._frozen?.texture !== texture)
+            return;
         let proc;
         try {
-            proc = Gio.Subprocess.new([RAYSHOT_BIN, 'overlay', file.get_path()],
-                Gio.SubprocessFlags.NONE);
+            proc = Gio.Subprocess.new(
+                [RAYSHOT_BIN, 'overlay', '--live', `${texture.get_width()}`, `${texture.get_height()}`],
+                Gio.SubprocessFlags.STDIN_PIPE);
         } catch (e) {
             logError(e, 'rayshot: spawn overlay failed');
-            this._discard(file);
-            this._busy = false;
+            this._abort();
             return;
         }
-        const overlay = {proc, pid: Number(proc.get_identifier()), shown: false, killId: 0};
+        trace(t0, 'overlay spawned');
+        const overlay = {
+            proc,
+            pid: Number(proc.get_identifier()),
+            shown: false,
+            killId: 0,
+            framePath: null,
+        };
         this._overlay = overlay;
         this._arm(t0);
         proc.wait_async(null, () => {
             overlay.killId = removeSource(overlay.killId);
+            if (overlay.framePath)
+                deleteQuietly(overlay.framePath);
             if (this._overlay !== overlay)
                 return;
             this._overlay = null;
             this._busy = false;
             this._resetCapture();
+            this._unfreeze();
+        });
+        this._sendPixels(overlay, texture, t0);
+    }
+
+    _sendPixels(overlay, texture, t0) {
+        const sink = Gio.File.new_for_path('/dev/null').append_to(Gio.FileCreateFlags.NONE, null);
+        Shell.Screenshot.composite_to_stream(texture, 0, 0, -1, -1, 1, null, 0, 0, 1, sink, (_o, res) => {
+            try {
+                sink.close(null);
+                const pixbuf = Shell.Screenshot.composite_to_stream_finish(res);
+                if (this._overlay !== overlay)
+                    return;
+                overlay.framePath = this._writeFrame(pixbuf, t0);
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`frame ${overlay.framePath}\n`), null);
+                trace(t0, 'pixels sent');
+            } catch (e) {
+                logError(e, 'rayshot: cannot hand pixels to the overlay');
+                if (overlay.framePath)
+                    deleteQuietly(overlay.framePath);
+                if (this._overlay === overlay)
+                    this._terminate(overlay);
+            }
         });
     }
 
-    _discard(file) {
+    _writeFrame(pixbuf, t0) {
+        if (pixbuf.get_n_channels() !== 4 || pixbuf.get_bits_per_sample() !== 8)
+            throw new Error(`unexpected pixbuf layout ${pixbuf.get_n_channels()}x${pixbuf.get_bits_per_sample()}`);
+        const started = GLib.get_monotonic_time();
+        const dir = frameDir();
+        GLib.mkdir_with_parents(dir, 0o700);
+        const file = Gio.File.new_for_path(GLib.build_filenamev([dir, `frame-${t0}.rsf`]));
+        const out = file.replace(null, false, Gio.FileCreateFlags.PRIVATE, null);
+        let written = false;
         try {
-            file.delete(null);
-        } catch (_) {}
+            out.write_all(frameHeader(pixbuf.get_width(), pixbuf.get_height(), pixbuf.get_rowstride()), null);
+            const pixels = pixbuf.read_pixel_bytes();
+            const size = pixels.get_size();
+            for (let off = 0; off < size;) {
+                const chunk = off === 0 ? pixels : GLib.Bytes.new_from_bytes(pixels, off, size - off);
+                const n = out.write_bytes(chunk, null);
+                if (n <= 0)
+                    throw new Error(`short write at ${off} of ${size}`);
+                off += n;
+            }
+            written = true;
+        } finally {
+            out.close(null);
+            if (!written)
+                deleteQuietly(file.get_path());
+        }
+        trace(started, `frame file written ${pixbuf.get_width()}x${pixbuf.get_height()}`);
+        return file.get_path();
     }
 
     _closeShellChrome() {
@@ -194,6 +356,8 @@ export default class RayshotExtension extends Extension {
     }
 
     _terminate(overlay) {
+        if (overlay.killId)
+            return;
         overlay.proc.send_signal(SIGTERM);
         overlay.killId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, KILL_GRACE_MS, () => {
             overlay.killId = 0;
@@ -232,13 +396,18 @@ export default class RayshotExtension extends Extension {
             trace(this._armed.t0, `overlay window on monitor ${win.get_monitor()}`);
         const actor = win.get_compositor_private();
         if (!actor) {
-            overlay.shown = true;
-            Main.activateWindow(win);
+            console.log('rayshot: overlay window has no actor, cannot show it over the freeze');
+            this._terminate(overlay);
             return;
         }
         const frameId = actor.connect('first-frame', () => {
-            overlay.shown = true;
             this._dropFrameWatch(actor);
+            if (!this._showThroughFreeze(actor)) {
+                console.log('rayshot: no overlay surface to show over the freeze');
+                this._terminate(overlay);
+                return;
+            }
+            overlay.shown = true;
             Main.activateWindow(win);
             this._breakGrab(win);
         });
@@ -246,6 +415,24 @@ export default class RayshotExtension extends Extension {
             this._frameWatches = this._frameWatches.filter(([a]) => a !== actor);
         });
         this._frameWatches.push([actor, frameId, destroyId]);
+    }
+
+    _showThroughFreeze(windowActor) {
+        const freeze = this._frozen;
+        if (!freeze)
+            return false;
+        const surface = surfaceOf(windowActor);
+        if (!surface)
+            return false;
+        const clone = new Clutter.Clone({source: surface, reactive: false});
+        clone.add_constraint(new Clutter.BindConstraint({
+            source: windowActor,
+            coordinate: Clutter.BindCoordinate.POSITION,
+        }));
+        Main.layoutManager.uiGroup.insert_child_above(clone, freeze.actor);
+        freeze.clones.push(clone);
+        freeze.actor.reactive = false;
+        return true;
     }
 
     _breakGrab(win) {
@@ -259,8 +446,6 @@ export default class RayshotExtension extends Extension {
         const windows = global.get_window_actors()
             .map(a => a.get_meta_window())
             .filter(w => w);
-        console.log(`rayshot: window types [${windows.map(w =>
-            `${w.get_window_type()}/${w.get_client_type()}`).join(',')}]`);
         const popups = windows
             .filter(w => POPUP_TYPES.includes(w.get_window_type()) &&
                 w.get_client_type() === Meta.WindowClientType.WAYLAND &&

@@ -2,6 +2,7 @@ mod anim;
 mod capture;
 mod export;
 mod hotkey;
+mod live;
 mod overlay;
 mod scene;
 mod screencast;
@@ -50,6 +51,21 @@ fn main() -> Result<()> {
                 .build()
                 .context("failed to build tokio runtime")?;
             return overlay::run_daemon(rt.handle().clone());
+        }
+        Some("overlay") if std::env::args().nth(2).as_deref() == Some("--live") => {
+            let dim = |i: usize| -> Result<u32> {
+                std::env::args()
+                    .nth(i)
+                    .context("overlay --live needs <width> <height>")?
+                    .parse()
+                    .context("overlay --live size must be a number")
+            };
+            let (width, height) = (dim(3)?, dim(4)?);
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            return overlay::run_live(width, height, rt.handle().clone());
         }
         Some("overlay") => {
             let path = std::env::args()

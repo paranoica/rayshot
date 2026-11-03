@@ -27,3 +27,6 @@ jobs:
 
       - name: Test extension geometry
         run: gjs -m gnome-extension/tests/geometry.test.js
+
+      - name: Test extension frame header
+        run: gjs -m gnome-extension/tests/frame.test.js

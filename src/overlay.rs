@@ -39,6 +39,7 @@ pub fn list_monitors() -> Result<()> {
 
 enum UserEvent {
     Captured(Result<Frame, String>),
+    Quit,
 }
 
 pub fn run(rt: Handle) -> Result<()> {
@@ -69,6 +70,42 @@ pub fn run_with_frame(frame: Frame, rt: Handle) -> Result<()> {
     app.pending_frame = Some(frame);
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
+}
+
+pub fn run_live(width: u32, height: u32, rt: Handle) -> Result<()> {
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("failed to create winit event loop")?;
+    let proxy = event_loop.create_proxy();
+    std::thread::Builder::new()
+        .name("rayshot-stdin".into())
+        .spawn(move || read_commands(proxy))
+        .context("failed to spawn stdin reader")?;
+    let mut app = OverlayApp::new(rt);
+    app.live = true;
+    app.frame_size = Some((width, height));
+    event_loop.run_app(&mut app).context("event loop error")?;
+    Ok(())
+}
+
+fn read_commands(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+    use std::io::BufRead;
+    for line in std::io::stdin().lock().lines() {
+        let Ok(line) = line else { break };
+        match crate::live::parse_command(&line) {
+            Some(crate::live::Command::Frame(path)) => {
+                let started = std::time::Instant::now();
+                let result = crate::capture::read_frame_file(&path).map_err(|e| format!("{e:#}"));
+                eprintln!("[rayshot] live frame read {:?}", started.elapsed());
+                if proxy.send_event(UserEvent::Captured(result)).is_err() {
+                    return;
+                }
+            }
+            Some(crate::live::Command::Quit) => break,
+            None => eprintln!("[rayshot] ignoring unknown command {line:?}"),
+        }
+    }
+    let _ = proxy.send_event(UserEvent::Quit);
 }
 
 pub fn run_daemon(rt: Handle) -> Result<()> {
@@ -233,6 +270,10 @@ struct TextDraft {
 }
 
 struct OverlayApp {
+    live: bool,
+    see_through: bool,
+    frame_size: Option<(u32, u32)>,
+    pending_export: Option<Action>,
     frame: Option<Arc<Frame>>,
     pending_frame: Option<Frame>,
     rt: Handle,
@@ -260,6 +301,10 @@ struct OverlayApp {
 impl OverlayApp {
     fn new(rt: Handle) -> Self {
         Self {
+            live: false,
+            see_through: false,
+            frame_size: None,
+            pending_export: None,
             frame: None,
             pending_frame: None,
             rt,
@@ -385,21 +430,44 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
         }
         if let Some(frame) = self.pending_frame.take() {
             self.attach_frame(event_loop, frame);
+        } else if self.live {
+            self.show_live();
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Captured(Ok(frame)) => {
+                if self.live && self.frame_size != Some((frame.width, frame.height)) {
+                    eprintln!(
+                        "[rayshot] live frame is {}x{}, expected {:?}",
+                        frame.width, frame.height, self.frame_size
+                    );
+                    self.close(event_loop);
+                    return;
+                }
                 if self.initialized && self.shared.is_some() {
                     self.attach_frame(event_loop, frame);
+                    match self.pending_export.take() {
+                        Some(Action::Copy) => self.finish_and_exit(event_loop),
+                        Some(Action::Save) => self.save_and_exit(event_loop),
+                        _ => {}
+                    }
                 } else {
                     self.pending_frame = Some(frame);
                 }
             }
             UserEvent::Captured(Err(e)) => {
                 eprintln!("[rayshot] desktop capture failed: {e}");
-                event_loop.exit();
+                if self.live {
+                    self.close(event_loop);
+                } else {
+                    event_loop.exit();
+                }
+            }
+            UserEvent::Quit => {
+                eprintln!("[rayshot] exit: stdin closed");
+                self.close(event_loop);
             }
         }
     }
@@ -581,6 +649,7 @@ impl OverlayApp {
                 let attrs = Window::default_attributes()
                     .with_title("rayshot")
                     .with_visible(false)
+                    .with_transparent(self.live)
                     .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
                 let window = Arc::new(event_loop.create_window(attrs).context("create window")?);
                 targets.push((window, region));
@@ -592,15 +661,26 @@ impl OverlayApp {
 
         let shared = self.shared.as_ref().context("device not initialized")?;
         let mut windows = Vec::with_capacity(targets.len());
+        let mut see_through = self.live;
         for (window, region) in targets {
             let surface = shared
                 .instance
                 .create_surface(window.clone())
                 .context("failed to create surface")?;
             let size = window.inner_size();
-            let config = surface
+            let mut config = surface
                 .get_default_config(&shared.adapter, size.width.max(1), size.height.max(1))
                 .context("surface not supported by adapter")?;
+            if self.live {
+                let modes = surface.get_capabilities(&shared.adapter).alpha_modes;
+                match see_through_alpha(&modes) {
+                    Some(mode) => config.alpha_mode = mode,
+                    None => {
+                        eprintln!("[rayshot] no see-through alpha ({modes:?}), drawing the frame");
+                        see_through = false;
+                    }
+                }
+            }
 
             let egui_ctx = egui::Context::default();
             let mut fonts = egui::FontDefinitions::default();
@@ -614,8 +694,7 @@ impl OverlayApp {
                 None,
                 Some(shared.device.limits().max_texture_dimension_2d as usize),
             );
-            let renderer =
-                Renderer::new(&shared.device, config.format, RendererOptions::default());
+            let renderer = Renderer::new(&shared.device, config.format, RendererOptions::default());
 
             windows.push(WindowState {
                 window,
@@ -633,8 +712,35 @@ impl OverlayApp {
             });
         }
         self.windows = windows;
+        self.see_through = see_through;
         eprintln!("[rayshot] windows created: {:?}", started.elapsed());
         Ok(())
+    }
+
+    fn frame_dims(&self) -> Option<(u32, u32)> {
+        self.frame
+            .as_ref()
+            .map(|f| (f.width, f.height))
+            .or(self.frame_size)
+    }
+
+    fn restore_selection(&mut self, fw: f32, fh: f32) {
+        if self.selection.is_none() {
+            self.selection = crate::export::load_last_selection().and_then(|(x, y, w, h)| {
+                let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
+                (r.min.x >= 0.0 && r.min.y >= 0.0 && r.max.x <= fw && r.max.y <= fh).then_some(r)
+            });
+        }
+    }
+
+    fn show_live(&mut self) {
+        if let Some((w, h)) = self.frame_size {
+            self.restore_selection(w as f32, h as f32);
+        }
+        for win in &self.windows {
+            win.window.set_visible(true);
+            win.window.request_redraw();
+        }
     }
 
     fn attach_frame(&mut self, event_loop: &ActiveEventLoop, frame: Frame) {
@@ -642,13 +748,7 @@ impl OverlayApp {
         let frame = Arc::new(frame);
         let (fw, fh) = (frame.width as f32, frame.height as f32);
         self.frame = Some(frame.clone());
-
-        if self.selection.is_none() {
-            self.selection = crate::export::load_last_selection().and_then(|(x, y, w, h)| {
-                let r = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(w, h));
-                (r.min.x >= 0.0 && r.min.y >= 0.0 && r.max.x <= fw && r.max.y <= fh).then_some(r)
-            });
-        }
+        self.restore_selection(fw, fh);
 
         if std::env::var_os("RAYSHOT_WINDOWED").is_some() {
             let region = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(fw, fh));
@@ -800,20 +900,25 @@ impl OverlayApp {
         if !self.windows[idx].configured {
             return Ok(());
         }
-        let Some(frame) = self.frame.clone() else {
+        let Some((frame_wu, frame_hu)) = self.frame_dims() else {
             return Ok(());
         };
-        let frame_w = frame.width as f32;
-        let frame_h = frame.height as f32;
-        if matches!(self.tool, crate::scene::Tool::Blur) && self.blurred.is_none() {
-            let b = crate::scene::blur_frame(&frame.rgba, frame.width, frame.height);
-            self.blurred = Some(Arc::new(b));
+        let frame_w = frame_wu as f32;
+        let frame_h = frame_hu as f32;
+        let live = self.live;
+        let see_through = self.see_through;
+        let frame_px = self.frame.clone();
+        if let Some(frame) = frame_px.as_ref() {
+            if matches!(self.tool, crate::scene::Tool::Blur) && self.blurred.is_none() {
+                let b = crate::scene::blur_frame(&frame.rgba, frame.width, frame.height);
+                self.blurred = Some(Arc::new(b));
+            }
         }
         if let (Some(b), Some(shared)) = (self.blurred.as_ref(), self.shared.as_mut()) {
             if shared.blur_view.is_none() {
                 let extent = wgpu::Extent3d {
-                    width: frame.width,
-                    height: frame.height,
+                    width: frame_wu,
+                    height: frame_hu,
                     depth_or_array_layers: 1,
                 };
                 let tex = shared.device.create_texture(&wgpu::TextureDescriptor {
@@ -836,8 +941,8 @@ impl OverlayApp {
                     b.as_slice(),
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(4 * frame.width),
-                        rows_per_image: Some(frame.height),
+                        bytes_per_row: Some(4 * frame_wu),
+                        rows_per_image: Some(frame_hu),
                     },
                     extent,
                 );
@@ -865,10 +970,11 @@ impl OverlayApp {
         }
 
         let region = win.region;
-        let Some(texture_id) = win.frame_texture_id else {
+        let frame_tex = win.frame_texture_id;
+        if frame_tex.is_none() && !live {
             return Ok(());
-        };
-        let blur_tex = win.blur_texture_id.unwrap_or(texture_id);
+        }
+        let blur_tex = win.blur_texture_id.or(frame_tex);
         let raw_cursor = win.cursor;
         let ctx = win.egui_ctx.clone();
         let raw_input = win.egui_state.take_egui_input(&win.window);
@@ -918,8 +1024,10 @@ impl OverlayApp {
                 egui::pos2(region.min.x / frame_w, region.min.y / frame_h),
                 egui::pos2(region.max.x / frame_w, region.max.y / frame_h),
             );
-            ui.painter()
-                .image(texture_id, image_rect, uv, egui::Color32::WHITE);
+            if let (false, Some(texture_id)) = (see_through, frame_tex) {
+                ui.painter()
+                    .image(texture_id, image_rect, uv, egui::Color32::WHITE);
+            }
 
             let resp = ui.interact(
                 image_rect,
@@ -1046,25 +1154,29 @@ impl OverlayApp {
                                     });
                                 }
                                 Tool::Pixelate => {
-                                    let (cell, brush, sample) = brush_params(tool);
-                                    let mut cells = Vec::new();
-                                    crate::scene::add_brush_cells(
-                                        &mut cells,
-                                        &frame.rgba,
-                                        frame.width,
-                                        frame.height,
-                                        fp,
-                                        cell,
-                                        brush,
-                                        sample,
-                                    );
-                                    draft = Some(Shape::Pixelate { cell, cells });
+                                    if let Some(frame) = frame_px.as_deref() {
+                                        let (cell, brush, sample) = brush_params(tool);
+                                        let mut cells = Vec::new();
+                                        crate::scene::add_brush_cells(
+                                            &mut cells,
+                                            &frame.rgba,
+                                            frame.width,
+                                            frame.height,
+                                            fp,
+                                            cell,
+                                            brush,
+                                            sample,
+                                        );
+                                        draft = Some(Shape::Pixelate { cell, cells });
+                                    }
                                 }
                                 Tool::Blur => {
-                                    draft = Some(Shape::Blur {
-                                        points: vec![fp],
-                                        radius: crate::scene::BLUR_BRUSH,
-                                    });
+                                    if frame_px.is_some() {
+                                        draft = Some(Shape::Blur {
+                                            points: vec![fp],
+                                            radius: crate::scene::BLUR_BRUSH,
+                                        });
+                                    }
                                 }
                                 _ => {}
                             }
@@ -1109,7 +1221,9 @@ impl OverlayApp {
                                     }
                                 }
                                 Tool::Pixelate => {
-                                    if let Some(Shape::Pixelate { cell, cells }) = &mut draft {
+                                    if let (Some(Shape::Pixelate { cell, cells }), Some(frame)) =
+                                        (&mut draft, frame_px.as_deref())
+                                    {
                                         let (_, brush, sample) = brush_params(tool);
                                         crate::scene::add_brush_cells(
                                             cells,
@@ -1261,16 +1375,26 @@ impl OverlayApp {
                 painter.rect_filled(image_rect, 0, dim);
             }
 
+            let paint_shape = |shape: &Shape| match (blur_tex, shape) {
+                (None, Shape::Blur { .. }) => {}
+                (tex, _) => crate::scene::paint(
+                    painter,
+                    shape,
+                    &to_screen,
+                    scale,
+                    tex.unwrap_or_default(),
+                    frame_w,
+                    frame_h,
+                ),
+            };
             for shape in shapes {
-                crate::scene::paint(
-                    painter, shape, &to_screen, scale, blur_tex, frame_w, frame_h,
-                );
+                paint_shape(shape);
             }
             if let Some(d) = &draft {
-                crate::scene::paint(painter, d, &to_screen, scale, blur_tex, frame_w, frame_h);
+                paint_shape(d);
             }
             if let Some(c) = &committed {
-                crate::scene::paint(painter, c, &to_screen, scale, blur_tex, frame_w, frame_h);
+                paint_shape(c);
             }
             if let (Some(r), Some(p)) = (brush_ring, raw_cursor) {
                 if brush_active {
@@ -1680,7 +1804,11 @@ impl OverlayApp {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: wgpu::LoadOp::Clear(if see_through {
+                            wgpu::Color::TRANSPARENT
+                        } else {
+                            wgpu::Color::BLACK
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1962,7 +2090,19 @@ impl OverlayApp {
         unsafe { libc::_exit(0) }
     }
 
+    fn defer_until_frame(&mut self, action: Action) -> bool {
+        if self.frame.is_some() {
+            return false;
+        }
+        eprintln!("[rayshot] export waits for the frame");
+        self.pending_export = Some(action);
+        true
+    }
+
     fn finish_and_exit(&mut self, event_loop: &ActiveEventLoop) {
+        if self.defer_until_frame(Action::Copy) {
+            return;
+        }
         match self.finish() {
             Ok(Some(path)) => {
                 eprintln!("[rayshot] copied to clipboard + saved {}", path.display());
@@ -1974,6 +2114,9 @@ impl OverlayApp {
     }
 
     fn save_and_exit(&mut self, event_loop: &ActiveEventLoop) {
+        if self.defer_until_frame(Action::Save) {
+            return;
+        }
         let img = match self.render_selection_to_image() {
             Ok(Some(img)) => img,
             Ok(None) => {
@@ -1995,6 +2138,12 @@ impl OverlayApp {
             Err(e) => eprintln!("[rayshot] save failed: {e:#}"),
         }
     }
+}
+
+// egui-wgpu blends into premultiplied RGB, so only PreMultiplied composites correctly.
+fn see_through_alpha(modes: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
+    let mode = wgpu::CompositeAlphaMode::PreMultiplied;
+    modes.contains(&mode).then_some(mode)
 }
 
 fn marker_color(c: egui::Color32) -> egui::Color32 {
@@ -2029,4 +2178,34 @@ fn parse_crop(spec: &str) -> Option<egui::Rect> {
         egui::pos2(parts[0], parts[1]),
         egui::vec2(parts[2], parts[3]),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::see_through_alpha;
+    use wgpu::CompositeAlphaMode::{Auto, Inherit, Opaque, PostMultiplied, PreMultiplied};
+
+    #[test]
+    fn prefers_premultiplied() {
+        assert_eq!(
+            see_through_alpha(&[Opaque, PreMultiplied]),
+            Some(PreMultiplied)
+        );
+        assert_eq!(
+            see_through_alpha(&[PostMultiplied, Opaque, PreMultiplied]),
+            Some(PreMultiplied)
+        );
+    }
+
+    #[test]
+    fn postmultiplied_alone_is_not_see_through() {
+        assert_eq!(see_through_alpha(&[Opaque, PostMultiplied]), None);
+    }
+
+    #[test]
+    fn opaque_only_is_not_see_through() {
+        assert_eq!(see_through_alpha(&[Opaque]), None);
+        assert_eq!(see_through_alpha(&[Opaque, Inherit, Auto]), None);
+        assert_eq!(see_through_alpha(&[]), None);
+    }
 }
