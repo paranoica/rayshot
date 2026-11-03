@@ -32,6 +32,7 @@ function rayshotBin() {
 const ARM_TIMEOUT_MS = 5000;
 const READY_TIMEOUT_MS = 10000;
 const STABLE_SERVER_MS = 10000;
+const WINDOWS_GONE_TIMEOUT_MS = 500;
 const KILL_GRACE_MS = 1000;
 const PAINT_FALLBACK_MS = 50;
 const SETTLE_INTERVAL_MS = 20;
@@ -134,6 +135,8 @@ export default class RayshotExtension extends Extension {
         global.display.disconnect(this._winCreatedId);
         this._winCreatedId = null;
         this._resetCapture();
+        if (this._overlay)
+            this._releaseWindows(this._overlay);
         try {
             this._overlay?.proc.send_signal(SIGTERM);
         } catch (e) {
@@ -175,6 +178,8 @@ export default class RayshotExtension extends Extension {
             proc,
             pid: Number(proc.get_identifier()),
             ready: false,
+            served: false,
+            showSent: false,
             startedAt: GLib.get_monotonic_time(),
             readyId: 0,
             killId: 0,
@@ -219,11 +224,14 @@ export default class RayshotExtension extends Extension {
         });
     }
 
-    _scheduleRespawn() {
+    _scheduleRespawn(served) {
         if (!this._settings?.get_boolean('warm-overlay'))
             return;
-        const delay = respawnDelay(this._serverFailures);
-        this._serverFailures++;
+        let delay = 0;
+        if (!served) {
+            delay = respawnDelay(this._serverFailures);
+            this._serverFailures++;
+        }
         console.log(`rayshot: overlay server restarts in ${delay}ms`);
         this._respawnId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
             this._startServer();
@@ -262,11 +270,13 @@ export default class RayshotExtension extends Extension {
         if (!reply || overlay?.server !== server || overlay.session !== Number(reply[2]))
             return;
         if (reply[1] === 'closed') {
+            server.served = true;
+            overlay.closed = true;
             this._serverFailures = 0;
-            this._endOverlay(overlay);
+            this._settleOverlay(overlay);
         } else if (overlay.shown || !this._frozen) {
             console.log(`rayshot: session ${overlay.session} failed on the server`);
-            this._endOverlay(overlay);
+            this._settleOverlay(overlay);
         } else {
             console.log(`rayshot: session ${overlay.session} failed before showing, falling back`);
             this._retryOneShot(overlay);
@@ -275,6 +285,7 @@ export default class RayshotExtension extends Extension {
     }
 
     _retryOneShot(overlay) {
+        this._releaseWindows(overlay);
         this._resetCapture();
         this._overlay = null;
         if (overlay.framePath)
@@ -288,22 +299,64 @@ export default class RayshotExtension extends Extension {
         server.killId = removeSource(server.killId);
         if (server.ready && GLib.get_monotonic_time() - server.startedAt > STABLE_SERVER_MS * 1000)
             this._serverFailures = 0;
+        // The reader is cancelled on exit, so a clean exit after a sent session
+        // counts as served even if its `closed` line was never read.
+        if (server.showSent && server.proc.get_if_exited() && server.proc.get_exit_status() === 0)
+            server.served = true;
         const current = this._server === server && epoch === this._epoch;
         if (current) {
             this._server = null;
-            console.log(`rayshot: overlay server exited (status ${server.proc.get_status()})`);
-            this._scheduleRespawn();
+            if (!server.served)
+                console.log(`rayshot: overlay server exited (status ${server.proc.get_status()})`);
+            this._scheduleRespawn(server.served);
         }
         const overlay = this._overlay;
         if (overlay?.server === server) {
-            if (!overlay.shown && this._frozen)
+            if (!overlay.shown && !overlay.closed && !server.served && this._frozen)
                 this._retryOneShot(overlay);
             else
-                this._endOverlay(overlay);
+                this._settleOverlay(overlay);
         }
     }
 
+    // Unfreezing while an overlay window is still mapped would expose the
+    // opaque backdrop mutter puts under fullscreen windows.
+    _settleOverlay(overlay) {
+        if (overlay.settleId || this._overlay !== overlay)
+            return;
+        if (overlay.windows.size === 0) {
+            this._endOverlay(overlay);
+            return;
+        }
+        overlay.settleId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, WINDOWS_GONE_TIMEOUT_MS, () => {
+            overlay.settleId = 0;
+            console.log(`rayshot: ${overlay.windows.size} overlay window(s) still mapped, unfreezing anyway`);
+            this._endOverlay(overlay);
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _trackWindow(overlay, win) {
+        const id = win.connect('unmanaged', () => {
+            win.disconnect(id);
+            overlay.windows.delete(win);
+            if (overlay.settleId && overlay.windows.size === 0) {
+                overlay.settleId = removeSource(overlay.settleId);
+                this._endOverlay(overlay);
+            }
+        });
+        overlay.windows.set(win, id);
+    }
+
+    _releaseWindows(overlay) {
+        overlay.settleId = removeSource(overlay.settleId);
+        for (const [win, id] of overlay.windows)
+            win.disconnect(id);
+        overlay.windows.clear();
+    }
+
     _endOverlay(overlay) {
+        this._releaseWindows(overlay);
         overlay.killId = removeSource(overlay.killId);
         if (overlay.framePath)
             deleteQuietly(overlay.framePath);
@@ -402,6 +455,8 @@ export default class RayshotExtension extends Extension {
             session: ++this._session,
             shown: false,
             killId: 0,
+            settleId: 0,
+            windows: new Map(),
             framePath: null,
         };
         try {
@@ -412,6 +467,8 @@ export default class RayshotExtension extends Extension {
             this._afterNextPaint(() => this._launch(texture, t0));
             return;
         }
+        server.ready = false;
+        server.showSent = true;
         trace(t0, `session ${overlay.session} sent to the server`);
         this._overlay = overlay;
         this._arm(t0);
@@ -504,11 +561,13 @@ export default class RayshotExtension extends Extension {
             session: ++this._session,
             shown: false,
             killId: 0,
+            settleId: 0,
+            windows: new Map(),
             framePath: null,
         };
         this._overlay = overlay;
         this._arm(t0);
-        proc.wait_async(null, () => this._endOverlay(overlay));
+        proc.wait_async(null, () => this._settleOverlay(overlay));
         this._sendPixels(overlay, texture, t0);
     }
 
@@ -624,6 +683,7 @@ export default class RayshotExtension extends Extension {
         if (!this._isOverlay(win))
             return;
         const overlay = this._overlay;
+        this._trackWindow(overlay, win);
         if (this._armed)
             trace(this._armed.t0, `overlay window on monitor ${win.get_monitor()}`);
         const actor = win.get_compositor_private();

@@ -82,7 +82,7 @@ RAYSHOT_NESTED_TAG="$TAG" dbus-run-session -- sh -c "
     gsettings set org.gnome.shell disable-user-extensions false
     gsettings set org.gnome.shell enabled-extensions \"['rayshot@paranoica', 'rayshot-soak@paranoica']\"
     gsettings set org.gnome.shell welcome-dialog-last-shown-version '999'
-    exec gnome-shell --headless --wayland --virtual-monitor 1920x1080
+    exec gnome-shell --headless --wayland --virtual-monitor 1920x1080 --virtual-monitor 1920x1080
 " >"$WORK/shell.log" 2>&1 &
 SHELL_PID=$!
 

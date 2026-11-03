@@ -1,7 +1,7 @@
 import GLib from 'gi://GLib';
 import System from 'system';
 
-import {growth, restarts} from './growth.js';
+import {growth} from './growth.js';
 
 const [path, serverRssLimit, serverVramLimit, shellRssLimit] = ARGV;
 const [, bytes] = GLib.file_get_contents(path);
@@ -26,13 +26,14 @@ if (error) {
 const warm = samples.filter(s => s.phase === 'warm');
 const cold = samples.filter(s => s.phase === 'cold');
 print(`sessions: warm ${warm.at(-1)?.i ?? 0}, cold ${cold.at(-1)?.i ?? 0}`);
-report('server restarts', restarts(warm), 0, '');
-// Both processes settle over the first ~30 sessions: the server warms shader
-// and glyph caches, the shell runs its first garbage collections.
+// The shell settles over its first ~30 sessions (startup garbage collection).
+// Every session now runs in a fresh spare, so the spare metrics catch drift in
+// the per-process footprint, not a leak inside one process.
 const WARMUP_SAMPLES = 3;
-report('server rss growth', growth(warm, 'server_rss_kb', WARMUP_SAMPLES),
-    Number(serverRssLimit), 'kB');
-report('server vram growth', growth(warm, 'server_vram_mib', WARMUP_SAMPLES),
+const spares = Math.max(0, ...samples.map(s => s.serve_processes ?? 0));
+report('live spare processes at once', spares, 1, '');
+report('spare rss drift', growth(warm, 'server_rss_kb', WARMUP_SAMPLES), Number(serverRssLimit), 'kB');
+report('spare vram drift', growth(warm, 'server_vram_mib', WARMUP_SAMPLES),
     Number(serverVramLimit), 'MiB');
 report('shell rss growth', growth(samples, 'shell_rss_kb', WARMUP_SAMPLES),
     Number(shellRssLimit), 'kB');

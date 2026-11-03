@@ -1,4 +1,4 @@
-import {growth, restarts} from './soak/growth.js';
+import {growth} from './soak/growth.js';
 
 let failed = 0;
 let total = 0;
@@ -26,13 +26,6 @@ check('warmup of three samples', growth(s(100, 150, 180, 190, 191, 192), 'v', 3)
 check('warmup longer than the run uses the previous sample',
     growth(s(100, 150, 180), 'v', 9), 30);
 check('warmup zero uses the first sample', growth(s(100, 150, 180), 'v', 0), 80);
-check('same server', restarts(s(1, 2, 3)), 0);
-check('server restarted twice', restarts([
-    {server_pid: 7}, {server_pid: 7}, {server_pid: 9}, {server_pid: 11},
-]), 2);
-check('cold samples without a server are ignored', restarts([
-    {server_pid: 7}, {server_pid: null}, {server_pid: 7},
-]), 0);
 
 print(`${total - failed}/${total} passed`);
 if (failed)

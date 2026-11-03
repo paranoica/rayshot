@@ -288,8 +288,6 @@ fn send_daemon(msg: &[u8]) -> Result<bool> {
     }
 }
 
-const DEFAULT_RECYCLE_LIMIT_KB: u64 = 128 * 1024;
-
 #[derive(Clone, Copy)]
 enum SessionEnd {
     Closed,
@@ -320,9 +318,6 @@ struct TextDraft {
 struct OverlayApp {
     serve: bool,
     session: Option<u64>,
-    baseline_rss_kb: Option<u64>,
-    recycle_limit_kb: u64,
-    recycle: bool,
     live: bool,
     see_through: bool,
     frame_size: Option<(u32, u32)>,
@@ -356,9 +351,6 @@ impl OverlayApp {
         Self {
             serve: false,
             session: None,
-            baseline_rss_kb: None,
-            recycle_limit_kb: DEFAULT_RECYCLE_LIMIT_KB,
-            recycle: false,
             live: false,
             see_through: false,
             frame_size: None,
@@ -471,12 +463,6 @@ struct WindowState {
 }
 
 impl ApplicationHandler<UserEvent> for OverlayApp {
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.recycle {
-            event_loop.exit();
-        }
-    }
-
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.initialized {
             return;
@@ -488,14 +474,6 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             return;
         }
         if self.serve {
-            self.baseline_rss_kb = crate::live::rss_kb();
-            if let Some(limit) = std::env::var("RAYSHOT_RECYCLE_LIMIT_KB")
-                .ok()
-                .and_then(|v| v.parse().ok())
-            {
-                self.recycle_limit_kb = limit;
-                eprintln!("[rayshot] rss recycle limit overridden: {limit} kB");
-            }
             reply("ready");
             return;
         }
@@ -562,12 +540,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             }
             UserEvent::Quit => {
                 eprintln!("[rayshot] exit: stdin closed");
-                if self.serve {
-                    self.end_session(SessionEnd::Closed);
-                    event_loop.exit();
-                } else {
-                    self.close(event_loop);
-                }
+                self.close(event_loop);
             }
         }
     }
@@ -2188,7 +2161,6 @@ impl OverlayApp {
         }
         if self.serve {
             self.end_session(SessionEnd::Closed);
-            return;
         }
         crate::anim::restore_detached();
         unsafe { libc::_exit(0) }
@@ -2199,11 +2171,7 @@ impl OverlayApp {
             return;
         }
         if self.session.is_some() {
-            eprintln!("[rayshot] session {id} replaces {:?}", self.session);
-            self.end_session(SessionEnd::Closed);
-        }
-        if self.recycle {
-            eprintln!("[rayshot] session {id} refused, the server is restarting");
+            eprintln!("[rayshot] session {id} refused, this process serves one session");
             reply(&format!("failed {id}"));
             return;
         }
@@ -2214,7 +2182,6 @@ impl OverlayApp {
         if let Err(e) = self.create_windows(event_loop) {
             eprintln!("[rayshot] failed to create windows: {e:?}");
             self.end_session(SessionEnd::Failed);
-            return;
         }
         self.show_live();
         eprintln!("[rayshot] session {id} shown in {:?}", started.elapsed());
@@ -2228,53 +2195,21 @@ impl OverlayApp {
         }
     }
 
-    fn end_session(&mut self, end: SessionEnd) {
-        let id = self.session.take();
-        self.reset_session();
-        if let Some(id) = id {
+    // One process serves one session: exiting releases every window, surface and
+    // GPU resource at once, and the extension keeps the next process warm.
+    fn end_session(&mut self, end: SessionEnd) -> ! {
+        if let Some(id) = self.session.take() {
             let word = match end {
                 SessionEnd::Closed => "closed",
                 SessionEnd::Failed => "failed",
             };
             reply(&format!("{word} {id}"));
         }
-        // wgpu frees dropped GPU resources only when the device is polled.
-        let poll = wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: Some(std::time::Duration::from_secs(1)),
+        let code = match end {
+            SessionEnd::Closed => 0,
+            SessionEnd::Failed => 1,
         };
-        if let Some(Err(e)) = self.shared.as_ref().map(|s| s.device.poll(poll)) {
-            eprintln!("[rayshot] device poll after session failed: {e}");
-        }
-        self.recycle_if_bloated();
-    }
-
-    fn recycle_if_bloated(&mut self) {
-        let (Some(base), Some(now)) = (self.baseline_rss_kb, crate::live::rss_kb()) else {
-            return;
-        };
-        if crate::live::should_recycle(base, now, self.recycle_limit_kb) {
-            eprintln!("[rayshot] rss grew from {base} kB to {now} kB, restarting the server");
-            self.recycle = true;
-        }
-    }
-
-    fn reset_session(&mut self) {
-        let mut shared = self.shared.take();
-        if let Some(s) = shared.as_mut() {
-            s._frame_texture = None;
-            s.frame_view = None;
-            s._blur_texture = None;
-            s.blur_view = None;
-        }
-        let fresh = OverlayApp::new(self.rt.clone());
-        let old = std::mem::replace(self, fresh);
-        self.shared = shared;
-        self.serve = old.serve;
-        self.initialized = old.initialized;
-        self.baseline_rss_kb = old.baseline_rss_kb;
-        self.recycle_limit_kb = old.recycle_limit_kb;
-        self.recycle = old.recycle;
+        unsafe { libc::_exit(code) }
     }
 
     fn defer_until_frame(&mut self, action: Action) -> bool {
@@ -2371,49 +2306,6 @@ fn parse_crop(spec: &str) -> Option<egui::Rect> {
 mod tests {
     use super::see_through_alpha;
 
-    #[test]
-    fn reset_session_clears_user_state_and_keeps_server_state() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .unwrap();
-        let mut app = super::OverlayApp::new(rt.handle().clone());
-        app.serve = true;
-        app.initialized = true;
-        app.baseline_rss_kb = Some(123_456);
-        app.recycle = true;
-        app.recycle_limit_kb = 42;
-        app.live = true;
-        app.see_through = true;
-        app.frame_size = Some((3840, 1080));
-        app.selection = Some(egui::Rect::from_min_size(
-            egui::pos2(1.0, 2.0),
-            egui::vec2(30.0, 40.0),
-        ));
-        app.tool = crate::scene::Tool::Rect;
-        app.pending_export = Some(super::Action::Copy);
-        app.scene.push(crate::scene::Shape::Rect {
-            rect: egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(5.0, 5.0)),
-            color: egui::Color32::RED,
-            width: 2.0,
-        });
-
-        app.reset_session();
-
-        assert!(app.serve);
-        assert!(app.initialized);
-        assert_eq!(app.baseline_rss_kb, Some(123_456));
-        assert!(app.recycle);
-        assert_eq!(app.recycle_limit_kb, 42);
-        assert!(!app.live);
-        assert!(!app.see_through);
-        assert_eq!(app.frame_size, None);
-        assert_eq!(app.selection, None);
-        assert!(matches!(app.tool, crate::scene::Tool::Select));
-        assert!(app.pending_export.is_none());
-        assert!(app.scene.shapes().is_empty());
-        assert!(app.windows.is_empty());
-        assert!(app.frame.is_none());
-    }
     use wgpu::CompositeAlphaMode::{Auto, Inherit, Opaque, PostMultiplied, PreMultiplied};
 
     #[test]

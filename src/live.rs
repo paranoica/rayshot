@@ -8,16 +8,6 @@ pub enum Command {
     Quit,
 }
 
-pub fn should_recycle(baseline_kb: u64, current_kb: u64, limit_kb: u64) -> bool {
-    current_kb.saturating_sub(baseline_kb) > limit_kb
-}
-
-pub fn rss_kb() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
-    line.split_whitespace().nth(1)?.parse().ok()
-}
-
 pub fn parse_command(line: &str) -> Option<Command> {
     let line = line.trim_end_matches(['\n', '\r']);
     if line == "quit" {
@@ -126,26 +116,6 @@ mod tests {
         assert_eq!(parse_command("cancel x"), None);
         assert_eq!(parse_command("cancel 9 9"), None);
         assert_eq!(parse_command("cancel -9"), None);
-    }
-
-    #[test]
-    fn recycles_only_past_the_limit() {
-        assert!(!should_recycle(100_000, 100_000, 131_072));
-        assert!(!should_recycle(100_000, 231_072, 131_072));
-        assert!(should_recycle(100_000, 231_073, 131_072));
-    }
-
-    #[test]
-    fn shrinking_memory_never_recycles() {
-        assert!(!should_recycle(100_000, 50_000, 131_072));
-        assert!(!should_recycle(100_000, 0, 0));
-    }
-
-    #[test]
-    fn recycle_check_survives_extreme_values() {
-        assert!(!should_recycle(u64::MAX, u64::MAX, u64::MAX));
-        assert!(!should_recycle(u64::MAX - 1, u64::MAX, 1));
-        assert!(should_recycle(0, u64::MAX, u64::MAX - 1));
     }
 
     #[test]

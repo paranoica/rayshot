@@ -31,6 +31,25 @@ function vramMib(pid) {
     }
 }
 
+function serveProcesses() {
+    const shell = `${new TextDecoder().decode(GLib.file_get_contents('/proc/self/stat')[1]).split(' ')[0]}`;
+    let count = 0;
+    const dir = GLib.Dir.open('/proc', 0);
+    for (let name; (name = dir.read_name());) {
+        if (!/^\d+$/.test(name))
+            continue;
+        try {
+            const stat = new TextDecoder().decode(GLib.file_get_contents(`/proc/${name}/stat`)[1]);
+            const ppid = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1];
+            const cmd = new TextDecoder().decode(GLib.file_get_contents(`/proc/${name}/cmdline`)[1]);
+            if (ppid === shell && cmd.split('\0')[1] === 'serve')
+                count++;
+        } catch (_) {}
+    }
+    dir.close();
+    return count;
+}
+
 function waitFor(cond, then, fail) {
     const started = GLib.get_monotonic_time();
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, TICK_MS, () => {
@@ -66,6 +85,14 @@ export default class SoakDriver extends Extension {
             this._finish('rayshot extension not loaded');
             return;
         }
+        const unfreeze = this._rayshot._unfreeze.bind(this._rayshot);
+        this._rayshot._unfreeze = () => {
+            if (this._sessionPid) {
+                this._leftAtUnfreeze = global.get_window_actors()
+                    .filter(a => a.get_meta_window()?.get_pid() === this._sessionPid).length;
+            }
+            unfreeze();
+        };
         waitFor(() => this._rayshot._server?.ready, () => this._run('warm', this._warm, 0),
             () => this._finish('server never became ready'));
     }
@@ -77,12 +104,19 @@ export default class SoakDriver extends Extension {
             i,
             shell_rss_kb: rssKb('self'),
             server_pid: server?.pid ?? null,
+            serve_processes: serveProcesses(),
             server_rss_kb: server ? rssKb(server.pid) : null,
             server_vram_mib: server ? vramMib(server.pid) : null,
         });
     }
 
     _run(phase, total, i) {
+        const r = this._rayshot;
+        if (phase === 'warm' && !r._server?.ready) {
+            waitFor(() => r._server?.ready, () => this._run(phase, total, i),
+                () => this._finish(`${phase} ${i}: no warm spare in time`));
+            return;
+        }
         if (i % 10 === 0 || i === total)
             this._sample(phase, i);
         if (i === total) {
@@ -95,10 +129,15 @@ export default class SoakDriver extends Extension {
             }
             return;
         }
-        const r = this._rayshot;
         r._capture();
         waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
             const o = r._overlay;
+            if (phase === 'warm' && !o.server) {
+                this._finish(`warm ${i}: session took the one-shot path`);
+                return;
+            }
+            this._sessionPid = o.pid;
+            this._leftAtUnfreeze = null;
             const line = o.server ? `cancel ${o.session}\n` : 'quit\n';
             try {
                 o.proc.get_stdin_pipe().write_all(new TextEncoder().encode(line), null);
@@ -106,8 +145,16 @@ export default class SoakDriver extends Extension {
                 this._finish(`${phase} ${i}: cannot end the session: ${e.message}`);
                 return;
             }
-            waitFor(() => !r._busy, () => this._run(phase, total, i + 1),
-                () => this._finish(`${phase} ${i}: session did not end`));
+            waitFor(() => !r._busy, () => {
+                const left = this._leftAtUnfreeze;
+                this._sessionPid = null;
+                if (left === null)
+                    this._finish(`${phase} ${i}: unfreeze was not observed`);
+                else if (left > 0)
+                    this._finish(`${phase} ${i}: ${left} overlay window(s) still mapped at unfreeze`);
+                else
+                    this._run(phase, total, i + 1);
+            }, () => this._finish(`${phase} ${i}: session did not end`));
         }, () => this._finish(`${phase} ${i}: overlay did not show`));
     }
 
