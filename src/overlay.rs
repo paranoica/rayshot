@@ -70,20 +70,6 @@ pub fn run(rt: Handle) -> Result<()> {
     Ok(())
 }
 
-pub fn daemon_socket_path() -> std::path::PathBuf {
-    crate::export::scratch_dir().join("daemon.sock")
-}
-
-pub fn run_with_frame(frame: Frame, rt: Handle) -> Result<()> {
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
-        .build()
-        .context("failed to create winit event loop")?;
-    let mut app = OverlayApp::new(rt);
-    app.pending_frame = Some(frame);
-    event_loop.run_app(&mut app).context("event loop error")?;
-    Ok(())
-}
-
 pub fn run_live(width: u32, height: u32, rt: Handle) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -146,146 +132,6 @@ fn read_commands(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
         }
     }
     let _ = proxy.send_event(UserEvent::Quit);
-}
-
-pub fn run_daemon(rt: Handle) -> Result<()> {
-    use std::io::Read;
-    use std::os::unix::io::AsRawFd;
-    let dir = crate::export::scratch_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("daemon.lock"))
-        .context("open daemon lock")?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        eprintln!("[rayshot] daemon already running");
-        return Ok(());
-    }
-    std::mem::forget(lock);
-
-    let exe = std::env::current_exe().context("cannot find rayshot's own path")?;
-    let mut session = crate::screencast::ScreencastSession::start(&rt)
-        .context("failed to start screencast session")?;
-    if !session.wait_ready(std::time::Duration::from_secs(15)) {
-        anyhow::bail!("screencast stream did not start in time");
-    }
-    eprintln!("[rayshot] daemon: screencast stream live");
-
-    let sock_path = daemon_socket_path();
-    let _ = std::fs::remove_file(&sock_path);
-    let listener = std::os::unix::net::UnixListener::bind(&sock_path)
-        .context("failed to bind daemon socket")?;
-    eprintln!("[rayshot] daemon: listening on {}", sock_path.display());
-
-    let mut child: Option<std::process::Child> = None;
-    let mut counter: u64 = 0;
-    for stream in listener.incoming() {
-        let Ok(mut s) = stream else {
-            continue;
-        };
-        let mut buf = [0u8; 8];
-        let n = s.read(&mut buf).unwrap_or(0);
-        if let Some(c) = child.as_mut() {
-            let _ = c.try_wait();
-        }
-        if n > 0 && buf[0] == b'c' {
-            if let Some(c) = child.as_ref() {
-                unsafe { libc::kill(c.id() as libc::pid_t, libc::SIGTERM) };
-            }
-            continue;
-        }
-        let healthy = session.is_healthy();
-        let fresh = healthy && session.is_trusted();
-        let frame = if fresh {
-            match session.grab() {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[rayshot] daemon: grab failed ({e:?}), falling back to portal");
-                    match rt.block_on(crate::capture::capture_frame()) {
-                        Ok(f) => f,
-                        Err(e2) => {
-                            eprintln!("[rayshot] daemon: portal fallback failed: {e2:?}");
-                            continue;
-                        }
-                    }
-                }
-            }
-        } else {
-            eprintln!(
-                "[rayshot] daemon: screencast not fresh (healthy={healthy}, trusted={}), via portal",
-                session.is_trusted()
-            );
-            match rt.block_on(crate::capture::capture_frame()) {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("[rayshot] daemon: portal capture failed ({e:?}), trying screencast");
-                    match session.grab() {
-                        Ok(f) => f,
-                        Err(e2) => {
-                            eprintln!("[rayshot] daemon: screencast grab also failed: {e2:?}");
-                            continue;
-                        }
-                    }
-                }
-            }
-        };
-        eprintln!(
-            "[rayshot] daemon: shot {}x{} via {}",
-            frame.width,
-            frame.height,
-            if fresh { "screencast" } else { "portal" }
-        );
-        counter += 1;
-        let frame_path = dir.join(format!("frame-{counter}.raw"));
-        if let Err(e) = crate::capture::write_frame_raw(&frame, &frame_path) {
-            eprintln!("[rayshot] daemon write frame failed: {e:?}");
-            continue;
-        }
-        match std::process::Command::new(&exe)
-            .arg("overlay")
-            .arg(&frame_path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            Ok(ch) => child = Some(ch),
-            Err(e) => eprintln!("[rayshot] daemon spawn overlay failed: {e:?}"),
-        }
-        if !healthy {
-            eprintln!("[rayshot] daemon: rebuilding screencast (untrusted until a fresh frame)");
-            match crate::screencast::ScreencastSession::start_recovery(&rt) {
-                Ok(s) => {
-                    let ready = s.wait_ready(std::time::Duration::from_secs(3));
-                    session = s;
-                    eprintln!("[rayshot] daemon: screencast rebuilt (ready={ready})");
-                }
-                Err(e) => eprintln!("[rayshot] daemon: screencast rebuild failed: {e:?}"),
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn trigger() -> Result<bool> {
-    send_daemon(b"go")
-}
-
-pub fn close_remote() -> Result<bool> {
-    send_daemon(b"close")
-}
-
-fn send_daemon(msg: &[u8]) -> Result<bool> {
-    use std::io::Write;
-    match std::os::unix::net::UnixStream::connect(daemon_socket_path()) {
-        Ok(mut s) => {
-            let _ = s.write_all(msg);
-            Ok(true)
-        }
-        Err(_) => Ok(false),
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -474,7 +320,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             return;
         }
         if self.serve {
-            reply("ready");
+            reply(&format!("ready {}", crate::live::PROTOCOL_VERSION));
             return;
         }
         if let Err(e) = self.create_windows(event_loop) {

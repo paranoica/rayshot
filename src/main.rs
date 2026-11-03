@@ -5,10 +5,11 @@ mod hotkey;
 mod live;
 mod overlay;
 mod scene;
-mod screencast;
 mod warm;
 
 use anyhow::{Context, Result};
+
+const PROTOCOL_MISMATCH_EXIT: i32 = 3;
 
 fn acquire_single_instance() -> bool {
     use std::os::unix::io::AsRawFd;
@@ -47,13 +48,7 @@ fn main() -> Result<()> {
         Some("uninstall-hotkey") => return hotkey::uninstall(),
         Some("warm") => return warm::run(std::env::args().nth(2).as_deref()),
         Some("monitors") => return overlay::list_monitors(),
-        Some("daemon") => {
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("failed to build tokio runtime")?;
-            return overlay::run_daemon(rt.handle().clone());
-        }
+        Some("daemon") => return hotkey::retire_daemon(),
         Some("serve") => {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -70,46 +65,34 @@ fn main() -> Result<()> {
                     .context("overlay --live size must be a number")
             };
             let (width, height) = (dim(3)?, dim(4)?);
+            if std::env::args().nth(5).as_deref() == Some("--protocol") {
+                let theirs: u32 = std::env::args()
+                    .nth(6)
+                    .and_then(|v| v.parse().ok())
+                    .context("--protocol needs a number")?;
+                if theirs != live::PROTOCOL_VERSION {
+                    eprintln!(
+                        "[rayshot] extension speaks protocol {theirs}, this binary {}",
+                        live::PROTOCOL_VERSION
+                    );
+                    std::process::exit(PROTOCOL_MISMATCH_EXIT);
+                }
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("failed to build tokio runtime")?;
             return overlay::run_live(width, height, rt.handle().clone());
         }
-        Some("overlay") => {
-            let path = std::env::args()
-                .nth(2)
-                .context("overlay needs a frame file path")?;
-            let t0 = std::time::Instant::now();
-            let frame = capture::read_frame_file(std::path::Path::new(&path))
-                .context("failed to read frame file")?;
-            eprintln!("[rayshot] frame read+decode {:?}", t0.elapsed());
-            let _anim = anim::AnimationGuard::disable();
-            let rt = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .context("failed to build tokio runtime")?;
-            return overlay::run_with_frame(frame, rt.handle().clone());
-        }
-        Some(cmd) if !matches!(cmd, "close" | "trigger" | "shot" | "shot-pw") => {
+        // `trigger` was the old daemon hotkey command; it now just captures.
+        Some(cmd) if !matches!(cmd, "trigger" | "shot") => {
             anyhow::bail!("unknown command {cmd:?}");
         }
         _ => {}
     }
 
-    if std::env::args().nth(1).as_deref() == Some("close") {
-        overlay::close_remote()?;
-        return Ok(());
-    }
-
-    if std::env::args().nth(1).as_deref() == Some("trigger") && overlay::trigger()? {
-        return Ok(());
-    }
-
-    let shot_pw = std::env::args().nth(1).as_deref() == Some("shot-pw");
     let shot = std::env::args().nth(1).as_deref() == Some("shot");
-
-    let interactive = !shot && !shot_pw;
+    let interactive = !shot;
 
     if interactive && !acquire_single_instance() {
         return Ok(());
@@ -123,25 +106,6 @@ fn main() -> Result<()> {
         .enable_all()
         .build()
         .context("failed to build tokio runtime")?;
-
-    if shot_pw {
-        let t0 = std::time::Instant::now();
-        let frame = screencast::capture_once(rt.handle()).context("screencast capture failed")?;
-        eprintln!(
-            "[rayshot] screencast capture: {:?} ({}x{})",
-            t0.elapsed(),
-            frame.width,
-            frame.height
-        );
-        let path = std::env::args()
-            .nth(2)
-            .unwrap_or_else(|| "/tmp/rayshot-pw.png".to_string());
-        let img = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba)
-            .context("frame buffer size mismatch")?;
-        img.save(&path).context("failed to save capture")?;
-        println!("saved screencast capture to {path}");
-        return Ok(());
-    }
 
     if shot {
         let frame = rt

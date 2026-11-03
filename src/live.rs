@@ -1,5 +1,8 @@
 use std::path::PathBuf;
 
+/// Bumped whenever the extension and the binary would misread each other.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, PartialEq)]
 pub enum Command {
     Show { id: u64, width: u32, height: u32 },

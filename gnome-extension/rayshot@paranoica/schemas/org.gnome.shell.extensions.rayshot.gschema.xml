@@ -7,6 +7,11 @@
       <summary>Capture and open rayshot</summary>
       <description>Keybinding that captures the whole screen and opens rayshot for annotation.</description>
     </key>
+    <key name="binary" type="s">
+      <default>''</default>
+      <summary>Path to the rayshot program</summary>
+      <description>Absolute path of the rayshot binary. Empty means the rayshot found on PATH.</description>
+    </key>
     <key name="warm-overlay" type="b">
       <default>true</default>
       <summary>Keep the overlay process warm</summary>

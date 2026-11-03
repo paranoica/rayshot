@@ -36,3 +36,6 @@ jobs:
 
       - name: Test soak verdict math
         run: gjs -m gnome-extension/tests/growth.test.js
+
+      - name: Test extension compatibility helpers
+        run: gjs -m gnome-extension/tests/compat.test.js

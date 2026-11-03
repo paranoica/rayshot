@@ -10,26 +10,14 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {respawnDelay} from './backoff.js';
+import {PROTOCOL_VERSION, readyVersion, resolveBin} from './compat.js';
 import {frameHeader} from './frame.js';
 import {pickClickPoint} from './geometry.js';
 
-const DEFAULT_BIN = GLib.build_filenamev([
-    GLib.get_home_dir(),
-    'projects/rayshot/target/release/rayshot',
-]);
-
-function rayshotBin() {
-    const override = GLib.getenv('RAYSHOT_BIN');
-    if (!override)
-        return DEFAULT_BIN;
-    if (!GLib.path_is_absolute(override)) {
-        console.log(`rayshot: ignoring RAYSHOT_BIN=${override}, not an absolute path`);
-        return DEFAULT_BIN;
-    }
-    console.log(`rayshot: using RAYSHOT_BIN=${override}`);
-    return override;
-}
 const ARM_TIMEOUT_MS = 5000;
+const PROTOCOL_MISMATCH_EXIT = 3;
+const UPDATED_TEXT = 'rayshot was updated. Log out and back in to finish the update.';
+const BINARY_OLD_TEXT = 'The rayshot program is older than its GNOME extension. Update rayshot.';
 const READY_TIMEOUT_MS = 10000;
 const STABLE_SERVER_MS = 10000;
 const WINDOWS_GONE_TIMEOUT_MS = 500;
@@ -100,9 +88,11 @@ function surfaceOf(windowActor) {
 export default class RayshotExtension extends Extension {
     enable() {
         this._epoch = (this._epoch ?? 0) + 1;
-        this._bin = rayshotBin();
         sweepFrames();
         this._settings = this.getSettings();
+        this._notified = new Set();
+        console.log(`rayshot: using ${this._bin() ?? 'no rayshot binary'}`);
+        this._watchOwnFiles();
         this._busy = false;
         this._overlay = null;
         this._armed = null;
@@ -149,7 +139,37 @@ export default class RayshotExtension extends Extension {
         this._stopServer();
         this._gcId = removeSource(this._gcId);
         this._settings.disconnect(this._warmId);
+        this._selfMonitor?.cancel();
+        this._selfMonitor = null;
         this._settings = null;
+    }
+
+    _bin() {
+        return resolveBin(GLib.getenv('RAYSHOT_BIN'), this._settings.get_string('binary'),
+            GLib.find_program_in_path('rayshot'),
+            path => GLib.file_test(path, GLib.FileTest.IS_EXECUTABLE));
+    }
+
+    _notifyOnce(key, body) {
+        if (this._notified.has(key))
+            return;
+        this._notified.add(key);
+        Main.notify('rayshot', body);
+    }
+
+    // A package upgrade replaces these files while the old code stays loaded
+    // until the next login on Wayland.
+    _watchOwnFiles() {
+        try {
+            const file = Gio.File.new_for_path(GLib.build_filenamev([this.path, 'extension.js']));
+            this._selfMonitor = file.monitor_file(Gio.FileMonitorFlags.NONE, null);
+            this._selfMonitor.connect('changed', (_m, _f, _o, event) => {
+                if (event === Gio.FileMonitorEvent.CHANGES_DONE_HINT || event === Gio.FileMonitorEvent.CREATED)
+                    this._notifyOnce('updated', UPDATED_TEXT);
+            });
+        } catch (e) {
+            logError(e, 'rayshot: cannot watch for updates');
+        }
     }
 
     _syncServer() {
@@ -167,9 +187,15 @@ export default class RayshotExtension extends Extension {
         if (!this._settings?.get_boolean('warm-overlay'))
             return;
         const epoch = this._epoch;
+        const bin = this._bin();
+        if (!bin) {
+            this._notifyOnce('no-bin', 'The rayshot program was not found. Install rayshot or set the binary path.');
+            this._scheduleRespawn();
+            return;
+        }
         let proc;
         try {
-            proc = Gio.Subprocess.new([this._bin, 'serve'],
+            proc = Gio.Subprocess.new([bin, 'serve'],
                 Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE);
         } catch (e) {
             logError(e, 'rayshot: cannot start the overlay server');
@@ -261,9 +287,19 @@ export default class RayshotExtension extends Extension {
     _onServerLine(server, line) {
         if (this._server !== server)
             return;
-        if (line === 'ready') {
-            server.ready = true;
+        const version = readyVersion(line);
+        if (version !== null) {
             server.readyId = removeSource(server.readyId);
+            if (version !== PROTOCOL_VERSION) {
+                console.log(`rayshot: overlay server speaks protocol ${version}, expected ${PROTOCOL_VERSION}`);
+                if (version > PROTOCOL_VERSION)
+                    this._notifyOnce('updated', UPDATED_TEXT);
+                else
+                    this._notifyOnce('binary-old', BINARY_OLD_TEXT);
+                this._stopServer();
+                return;
+            }
+            server.ready = true;
             console.log('rayshot: overlay server ready');
             return;
         }
@@ -400,7 +436,13 @@ export default class RayshotExtension extends Extension {
 
     _capture() {
         if (this._busy) {
-            console.log('rayshot: capture already in progress, ignored');
+            const windows = [...this._overlay?.windows.keys() ?? []];
+            if (this._overlay?.shown && windows.length > 0) {
+                windows.forEach(w => Main.activateWindow(w));
+                console.log('rayshot: capture already open, brought it to the front');
+            } else {
+                console.log('rayshot: capture already in progress, ignored');
+            }
             return;
         }
         this._busy = true;
@@ -546,10 +588,17 @@ export default class RayshotExtension extends Extension {
     _launch(texture, t0) {
         if (!this._settings || this._frozen?.texture !== texture)
             return;
+        const bin = this._bin();
+        if (!bin) {
+            this._notifyOnce('no-bin', 'The rayshot program was not found. Install rayshot or set the binary path.');
+            this._abort();
+            return;
+        }
         let proc;
         try {
             proc = Gio.Subprocess.new(
-                [this._bin, 'overlay', '--live', `${texture.get_width()}`, `${texture.get_height()}`],
+                [bin, 'overlay', '--live', `${texture.get_width()}`, `${texture.get_height()}`,
+                    '--protocol', `${PROTOCOL_VERSION}`],
                 Gio.SubprocessFlags.STDIN_PIPE);
         } catch (e) {
             logError(e, 'rayshot: spawn overlay failed');
@@ -574,7 +623,11 @@ export default class RayshotExtension extends Extension {
         };
         this._overlay = overlay;
         this._arm(t0);
-        proc.wait_async(null, () => this._settleOverlay(overlay));
+        proc.wait_async(null, () => {
+            if (proc.get_if_exited() && proc.get_exit_status() === PROTOCOL_MISMATCH_EXIT)
+                this._notifyOnce('mismatch', 'rayshot and its GNOME extension do not match. Update rayshot, then log out and back in.');
+            this._settleOverlay(overlay);
+        });
     }
 
     _sendPixelsAfterPaint(overlay) {

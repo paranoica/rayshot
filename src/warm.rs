@@ -2,26 +2,27 @@ use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::process::Command;
 
-const SCHEMA: &str = "org.gnome.shell.extensions.rayshot";
+pub const SCHEMA: &str = "org.gnome.shell.extensions.rayshot";
 const KEY: &str = "warm-overlay";
 
-fn schema_dir() -> Result<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
-        .filter(|v| !v.is_empty())
+/// The installed extension's schema directory: the user copy wins over a
+/// system-wide one, as GNOME Shell itself prefers it.
+pub fn schema_dir() -> Result<PathBuf> {
+    let env_dir = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
+    let user = env_dir("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .context("neither XDG_DATA_HOME nor HOME is set")?;
-    let dir = data.join("gnome-shell/extensions/rayshot@paranoica/schemas");
-    if !dir.join("gschemas.compiled").exists() {
-        bail!(
-            "rayshot GNOME extension is not installed ({})",
-            dir.display()
-        );
-    }
-    Ok(dir)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")));
+    let system = env_dir("XDG_DATA_DIRS")
+        .map(|v| std::env::split_paths(&v).collect::<Vec<_>>())
+        .unwrap_or_else(|| vec!["/usr/local/share".into(), "/usr/share".into()]);
+    user.into_iter()
+        .chain(system)
+        .map(|d| d.join("gnome-shell/extensions/rayshot@paranoica/schemas"))
+        .find(|d| d.join("gschemas.compiled").exists())
+        .context("the rayshot GNOME extension is not installed")
 }
 
-fn gsettings(dir: &PathBuf, args: &[&str]) -> Result<String> {
+pub fn gsettings(dir: &PathBuf, args: &[&str]) -> Result<String> {
     let out = Command::new("gsettings")
         .arg("--schemadir")
         .arg(dir)

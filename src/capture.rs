@@ -7,18 +7,6 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
-pub fn write_frame_raw(frame: &Frame, path: &std::path::Path) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).ok();
-    }
-    let mut buf = Vec::with_capacity(8 + frame.rgba.len());
-    buf.extend_from_slice(&frame.width.to_le_bytes());
-    buf.extend_from_slice(&frame.height.to_le_bytes());
-    buf.extend_from_slice(&frame.rgba);
-    std::fs::write(path, buf).with_context(|| format!("write frame {}", path.display()))?;
-    Ok(())
-}
-
 pub const STRIDED_MAGIC: [u8; 4] = *b"RSF1";
 
 fn decode_strided(data: &[u8]) -> Result<Frame> {
@@ -65,37 +53,12 @@ fn decode_strided(data: &[u8]) -> Result<Frame> {
 }
 
 pub fn read_frame_file(path: &std::path::Path) -> Result<Frame> {
-    const PNG_MAGIC: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     let data = std::fs::read(path).with_context(|| format!("read frame {}", path.display()))?;
     let _ = std::fs::remove_file(path);
-    if data.len() >= 4 && data[..4] == STRIDED_MAGIC {
-        return decode_strided(&data);
+    if !data.starts_with(&STRIDED_MAGIC) {
+        return Err(anyhow!("not an RSF1 frame file"));
     }
-    if data.len() >= 8 && data[..8] == PNG_MAGIC {
-        let img = image::load_from_memory(&data)
-            .context("failed to decode png frame")?
-            .into_rgba8();
-        let (width, height) = img.dimensions();
-        return Ok(Frame {
-            width,
-            height,
-            rgba: img.into_raw(),
-        });
-    }
-    if data.len() < 8 {
-        return Err(anyhow!("frame file too small"));
-    }
-    let width = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    let height = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    let rgba = data[8..].to_vec();
-    if rgba.len() != width as usize * height as usize * 4 {
-        return Err(anyhow!("frame file size mismatch"));
-    }
-    Ok(Frame {
-        width,
-        height,
-        rgba,
-    })
+    decode_strided(&data)
 }
 
 pub async fn capture_frame() -> Result<Frame> {
@@ -146,61 +109,32 @@ mod tests {
     const PIXELS: [u8; 8] = [255, 0, 0, 255, 0, 128, 255, 64];
 
     #[test]
-    fn reads_png_frame_and_removes_file() {
+    fn rejects_png_frames_now_that_only_rsf1_is_written() {
         let path = temp_path("frame.png");
         image::RgbaImage::from_raw(2, 1, PIXELS.to_vec())
             .unwrap()
             .save_with_format(&path, image::ImageFormat::Png)
             .unwrap();
-        let frame = read_frame_file(&path).unwrap();
-        assert_eq!((frame.width, frame.height), (2, 1));
-        assert_eq!(frame.rgba, PIXELS);
+        assert!(read_frame_file(&path).is_err());
         assert!(!path.exists());
     }
 
     #[test]
-    fn reads_raw_frame_and_removes_file() {
+    fn rejects_the_old_daemon_raw_format() {
         let path = temp_path("frame.raw");
-        let src = Frame {
-            width: 2,
-            height: 1,
-            rgba: PIXELS.to_vec(),
-        };
-        write_frame_raw(&src, &path).unwrap();
-        let frame = read_frame_file(&path).unwrap();
-        assert_eq!((frame.width, frame.height), (2, 1));
-        assert_eq!(frame.rgba, PIXELS);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn rejects_corrupt_png_instead_of_reading_it_as_raw() {
-        let path = temp_path("corrupt.png");
-        let mut data = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        data.extend_from_slice(&[0u8; 32]);
-        std::fs::write(&path, data).unwrap();
-        let Err(err) = read_frame_file(&path) else {
-            panic!("corrupt png was accepted");
-        };
-        assert!(format!("{err:#}").contains("decode png"), "{err:#}");
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn rejects_raw_size_mismatch() {
-        let path = temp_path("short.raw");
         let mut data = Vec::new();
         data.extend_from_slice(&2u32.to_le_bytes());
         data.extend_from_slice(&1u32.to_le_bytes());
-        data.extend_from_slice(&[0u8; 7]);
+        data.extend_from_slice(&PIXELS);
         std::fs::write(&path, data).unwrap();
         assert!(read_frame_file(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]
-    fn rejects_file_shorter_than_header() {
-        let path = temp_path("tiny.raw");
-        std::fs::write(&path, [1u8, 2, 3]).unwrap();
+    fn rejects_file_shorter_than_magic() {
+        let path = temp_path("tiny.rsf");
+        std::fs::write(&path, [b'R', b'S', b'F']).unwrap();
         assert!(read_frame_file(&path).is_err());
     }
 
