@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.rayshot"
+          path="/org/gnome/shell/extensions/rayshot/">
+    <key name="capture" type="as">
+      <default><![CDATA[['<Control>Print']]]></default>
+      <summary>Capture and open rayshot</summary>
+      <description>Keybinding that captures the whole screen and opens rayshot for annotation.</description>
+    </key>
+  </schema>
+</schemalist>

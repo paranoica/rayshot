@@ -55,8 +55,10 @@ fn main() -> Result<()> {
             let path = std::env::args()
                 .nth(2)
                 .context("overlay needs a frame file path")?;
-            let frame = capture::read_frame_raw(std::path::Path::new(&path))
+            let t0 = std::time::Instant::now();
+            let frame = capture::read_frame_file(std::path::Path::new(&path))
                 .context("failed to read frame file")?;
+            eprintln!("[rayshot] frame read+decode {:?}", t0.elapsed());
             let _anim = anim::AnimationGuard::disable();
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
