@@ -723,6 +723,7 @@ impl OverlayApp {
                     .with_title("rayshot")
                     .with_visible(false)
                     .with_transparent(self.live)
+                    .with_decorations(false)
                     .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
                 let window = Arc::new(event_loop.create_window(attrs).context("create window")?);
                 targets.push((window, region));

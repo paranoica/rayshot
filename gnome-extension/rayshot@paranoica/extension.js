@@ -135,8 +135,10 @@ export default class RayshotExtension extends Extension {
         global.display.disconnect(this._winCreatedId);
         this._winCreatedId = null;
         this._resetCapture();
-        if (this._overlay)
+        if (this._overlay) {
             this._releaseWindows(this._overlay);
+            this._cancelPixels(this._overlay);
+        }
         try {
             this._overlay?.proc.send_signal(SIGTERM);
         } catch (e) {
@@ -286,6 +288,7 @@ export default class RayshotExtension extends Extension {
 
     _retryOneShot(overlay) {
         this._releaseWindows(overlay);
+        this._cancelPixels(overlay);
         this._resetCapture();
         this._overlay = null;
         if (overlay.framePath)
@@ -357,6 +360,7 @@ export default class RayshotExtension extends Extension {
 
     _endOverlay(overlay) {
         this._releaseWindows(overlay);
+        this._cancelPixels(overlay);
         overlay.killId = removeSource(overlay.killId);
         if (overlay.framePath)
             deleteQuietly(overlay.framePath);
@@ -457,6 +461,8 @@ export default class RayshotExtension extends Extension {
             killId: 0,
             settleId: 0,
             windows: new Map(),
+            pixelIds: [],
+            pixelPaintId: 0,
             framePath: null,
         };
         try {
@@ -472,7 +478,6 @@ export default class RayshotExtension extends Extension {
         trace(t0, `session ${overlay.session} sent to the server`);
         this._overlay = overlay;
         this._arm(t0);
-        this._sendPixels(overlay, texture, t0);
     }
 
     _freezeScreen(content, texture) {
@@ -563,12 +568,40 @@ export default class RayshotExtension extends Extension {
             killId: 0,
             settleId: 0,
             windows: new Map(),
+            pixelIds: [],
+            pixelPaintId: 0,
             framePath: null,
         };
         this._overlay = overlay;
         this._arm(t0);
         proc.wait_async(null, () => this._settleOverlay(overlay));
-        this._sendPixels(overlay, texture, t0);
+    }
+
+    _sendPixelsAfterPaint(overlay) {
+        const send = () => {
+            overlay.pixelIds.forEach(id => removeSource(id));
+            if (overlay.pixelPaintId)
+                global.stage.disconnect(overlay.pixelPaintId);
+            overlay.pixelIds = [];
+            overlay.pixelPaintId = 0;
+            if (this._overlay === overlay)
+                this._sendPixels(overlay, overlay.texture, overlay.t0);
+            return GLib.SOURCE_REMOVE;
+        };
+        overlay.pixelPaintId = global.stage.connect('after-paint', () => {
+            global.stage.disconnect(overlay.pixelPaintId);
+            overlay.pixelPaintId = 0;
+            overlay.pixelIds.push(GLib.idle_add(GLib.PRIORITY_HIGH, send));
+        });
+        overlay.pixelIds.push(GLib.timeout_add(GLib.PRIORITY_DEFAULT, PAINT_FALLBACK_MS, send));
+    }
+
+    _cancelPixels(overlay) {
+        overlay.pixelIds.forEach(id => removeSource(id));
+        overlay.pixelIds = [];
+        if (overlay.pixelPaintId)
+            global.stage.disconnect(overlay.pixelPaintId);
+        overlay.pixelPaintId = 0;
     }
 
     _sendPixels(overlay, texture, t0) {
@@ -699,9 +732,14 @@ export default class RayshotExtension extends Extension {
                 this._terminate(overlay);
                 return;
             }
+            const first = !overlay.shown;
             overlay.shown = true;
             Main.activateWindow(win);
             this._breakGrab(win);
+            // The texture readback blocks the compositor, so it waits until the
+            // overlay has been painted instead of delaying it.
+            if (first)
+                this._sendPixelsAfterPaint(overlay);
         });
         const destroyId = actor.connect('destroy', () => {
             this._frameWatches = this._frameWatches.filter(([a]) => a !== actor);
