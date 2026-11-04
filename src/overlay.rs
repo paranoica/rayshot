@@ -1995,7 +1995,12 @@ impl OverlayApp {
         let t3 = std::time::Instant::now();
         match crate::export::copy_png_to_clipboard(&png) {
             Ok(()) => eprintln!("[rayshot] copied to clipboard"),
-            Err(e) => eprintln!("[rayshot] clipboard copy failed: {e:#}"),
+            Err(e) => {
+                eprintln!("[rayshot] clipboard copy failed: {e:#}");
+                // A notification from this process would vanish with it, so the
+                // extension tells the user.
+                reply(&format!("copy-failed {}", path.display()));
+            }
         }
         eprintln!(
             "[rayshot] finish: render {:?}, encode {:?}, save {:?}, clip {:?}",

@@ -8,6 +8,7 @@ import System from 'system';
 
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 
 import {MAX_FAILURES, respawnDelay, shouldRespawn} from './backoff.js';
 import {PROTOCOL_VERSION, readyVersion, resolveBin} from './compat.js';
@@ -112,6 +113,7 @@ export default class RayshotExtension extends Extension {
         sweepFrames();
         this._settings = this.getSettings();
         this._notified = new Set();
+        this._copyNotice = null;
         console.log(`rayshot: using ${this._bin() ?? 'no rayshot binary'}`);
         this._watchOwnFiles();
         this._busy = false;
@@ -169,6 +171,8 @@ export default class RayshotExtension extends Extension {
         this._settings.disconnect(this._warmId);
         this._selfMonitor?.cancel();
         this._selfMonitor = null;
+        this._copyNotice?.destroy();
+        this._copyNotice = null;
         this._settings = null;
     }
 
@@ -308,6 +312,48 @@ export default class RayshotExtension extends Extension {
         });
     }
 
+    _onCopyFailed(line) {
+        const path = /^copy-failed (.+)$/.exec(line)?.[1];
+        if (!path)
+            return false;
+        if (!this._settings)
+            return true;
+        // Main.notify is transient and would leave the tray after its banner;
+        // an empty clipboard should still be explained when the user looks.
+        // One notice at a time, so repeated failures do not crowd the tray.
+        this._copyNotice?.destroy();
+        const source = MessageTray.getSystemSource();
+        const notice = new MessageTray.Notification({
+            source,
+            title: 'rayshot',
+            body: `The screenshot could not be copied to the clipboard. A temporary copy is at ${path}.`,
+            isTransient: false,
+        });
+        notice.connect('destroy', () => {
+            if (this._copyNotice === notice)
+                this._copyNotice = null;
+        });
+        this._copyNotice = notice;
+        source.addNotification(notice);
+        return true;
+    }
+
+    _readOneShot(lines) {
+        lines.read_line_async(GLib.PRIORITY_DEFAULT, null, (stream, res) => {
+            let line;
+            try {
+                [line] = stream.read_line_finish_utf8(res);
+            } catch (e) {
+                logError(e, 'rayshot: cannot read the overlay');
+                return;
+            }
+            if (line === null)
+                return;
+            this._onCopyFailed(line);
+            this._readOneShot(lines);
+        });
+    }
+
     _readServer(server) {
         server.lines.read_line_async(GLib.PRIORITY_DEFAULT, server.cancellable, (stream, res) => {
             let line;
@@ -326,6 +372,8 @@ export default class RayshotExtension extends Extension {
     }
 
     _onServerLine(server, line) {
+        if (this._onCopyFailed(line))
+            return;
         if (this._server !== server)
             return;
         const version = readyVersion(line);
@@ -378,13 +426,12 @@ export default class RayshotExtension extends Extension {
     }
 
     _onServerExit(server, epoch) {
-        server.cancellable.cancel();
         server.readyId = removeSource(server.readyId);
         server.killId = removeSource(server.killId);
         if (server.ready && GLib.get_monotonic_time() - server.startedAt > STABLE_SERVER_MS * 1000)
             this._serverFailures = 0;
-        // The reader is cancelled on exit, so a clean exit after a sent session
-        // counts as served even if its `closed` line was never read.
+        // The reader runs on to EOF so a late `copy-failed` still lands, but a
+        // late `closed` is dropped as stale; a clean exit counts as served.
         if (server.showSent && server.proc.get_if_exited() && server.proc.get_exit_status() === 0)
             server.served = true;
         const current = this._server === server && epoch === this._epoch;
@@ -771,13 +818,14 @@ export default class RayshotExtension extends Extension {
             proc = Gio.Subprocess.new(
                 [bin, 'overlay', '--live', `${texture.get_width()}`, `${texture.get_height()}`,
                     '--protocol', `${PROTOCOL_VERSION}`],
-                Gio.SubprocessFlags.STDIN_PIPE);
+                Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE);
         } catch (e) {
             logError(e, 'rayshot: spawn overlay failed');
             this._abort();
             return;
         }
         trace(t0, 'one-shot overlay spawned');
+        this._readOneShot(new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()}));
         const overlay = {
             proc,
             pid: Number(proc.get_identifier()),
