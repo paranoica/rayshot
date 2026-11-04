@@ -35,7 +35,10 @@ report('live spare processes at once', spares, 1, '');
 report('spare rss drift', growth(warm, 'server_rss_kb', WARMUP_SAMPLES), Number(serverRssLimit), 'kB');
 report('spare vram drift', growth(warm, 'server_vram_mib', WARMUP_SAMPLES),
     Number(serverVramLimit), 'MiB');
-report('shell rss growth', growth(samples, 'shell_rss_kb', WARMUP_SAMPLES),
+// Apart, so a leak that starts in one phase cannot hide behind the other.
+report('shell rss growth in warm sessions', growth(warm, 'shell_rss_kb', WARMUP_SAMPLES),
+    Number(shellRssLimit), 'kB');
+report('shell rss growth in cold sessions', growth(cold, 'shell_rss_kb', 0),
     Number(shellRssLimit), 'kB');
 report('spares lost to a GPU driver crash', driverCrashes, 3, '');
 for (const {name, ok, detail} of scenarios) {
