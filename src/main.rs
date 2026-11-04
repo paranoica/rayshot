@@ -50,6 +50,7 @@ fn main() -> Result<()> {
         Some("monitors") => return overlay::list_monitors(),
         Some("daemon") => return hotkey::retire_daemon(),
         Some("serve") => {
+            live::skip_core_dumps();
             export::cleanup_old(&export::scratch_dir(), export::SCRATCH_MAX_AGE);
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -66,6 +67,7 @@ fn main() -> Result<()> {
                     .context("overlay --live size must be a number")
             };
             let (width, height) = (dim(3)?, dim(4)?);
+            live::skip_core_dumps();
             export::cleanup_old(&export::scratch_dir(), export::SCRATCH_MAX_AGE);
             if std::env::args().nth(5).as_deref() == Some("--protocol") {
                 let theirs: u32 = std::env::args()

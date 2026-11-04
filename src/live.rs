@@ -67,9 +67,47 @@ pub fn parse_command(line: &str) -> Option<Command> {
         .then_some(Command::Show { id, width, height })
 }
 
+/// A crash is reported to the extension only once the kernel has finished the
+/// core dump, which for a GPU process takes long enough to hold the freeze up.
+pub fn skip_core_dumps() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) } == 0 {
+        lim.rlim_cur = 0;
+        unsafe { libc::setrlimit(libc::RLIMIT_CORE, &lim) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn core_limit() -> (u64, u64) {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut lim) }, 0);
+        (lim.rlim_cur as u64, lim.rlim_max as u64)
+    }
+
+    #[test]
+    fn skipping_core_dumps_zeroes_the_soft_limit_only() {
+        let (_, hard) = core_limit();
+        let raised = libc::rlimit {
+            rlim_cur: hard as libc::rlim_t,
+            rlim_max: hard as libc::rlim_t,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raised) }, 0);
+        if hard == 0 {
+            return;
+        }
+        assert_ne!(core_limit().0, 0, "precondition: dumps enabled");
+        super::skip_core_dumps();
+        assert_eq!(core_limit(), (0, hard));
+    }
 
     fn frame(id: u64, path: &str) -> Option<Command> {
         Some(Command::Frame {
