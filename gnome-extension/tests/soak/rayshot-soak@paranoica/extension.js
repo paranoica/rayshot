@@ -7,6 +7,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {MAX_FAILURES} from '../rayshot@paranoica/backoff.js';
+import {defaultSeat} from '../rayshot@paranoica/compat.js';
 
 const TICK_MS = 20;
 const STEP_TIMEOUT_MS = 5000;
@@ -38,8 +39,11 @@ function vramMib(pid) {
 function serveProcesses() {
     const shell = `${new TextDecoder().decode(GLib.file_get_contents('/proc/self/stat')[1]).split(' ')[0]}`;
     let count = 0;
-    const dir = GLib.Dir.open('/proc', 0);
-    for (let name; (name = dir.read_name());) {
+    // GLib.Dir is not usable from GJS on GNOME 45.
+    const dir = Gio.File.new_for_path('/proc')
+        .enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
+    for (let info; (info = dir.next_file(null));) {
+        const name = info.get_name();
         if (!/^\d+$/.test(name))
             continue;
         try {
@@ -50,8 +54,13 @@ function serveProcesses() {
                 count++;
         } catch (_) {}
     }
-    dir.close();
+    dir.close(null);
     return count;
+}
+
+// GNOME 45 keeps the body in bannerBodyText.
+function noticeText(n) {
+    return `${n.title} ${n.body ?? n.bannerBodyText ?? ''}`;
 }
 
 function waitFor(cond, then, fail, timeoutMs = STEP_TIMEOUT_MS) {
@@ -182,7 +191,7 @@ export default class SoakDriver extends Extension {
         const r = this._rayshot;
         r._settings.set_boolean('warm-overlay', true);
         // A virtual device drops events sent right after it is created.
-        this._keyboard = global.stage.context.get_backend().get_default_seat()
+        this._keyboard = defaultSeat(global.stage, Clutter)
             .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         const steps = [
             next => this._copies(next),
@@ -257,7 +266,7 @@ export default class SoakDriver extends Extension {
         const disarm = () => GLib.unlink(flag);
         const notified = () => Main.messageTray.getSources()
             .flatMap(source => source.notifications ?? [])
-            .find(n => !before.has(n) && /clipboard/i.test(`${n.title} ${n.body}`));
+            .find(n => !before.has(n) && /clipboard/i.test(noticeText(n)));
         r._capture();
         waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
             const o = r._overlay;
@@ -278,13 +287,13 @@ export default class SoakDriver extends Extension {
                     const n = notified();
                     const notices = Main.messageTray.getSources()
                         .flatMap(source => source.notifications ?? [])
-                        .filter(m => /clipboard/i.test(`${m.title} ${m.body}`)).length;
+                        .filter(m => /clipboard/i.test(noticeText(m))).length;
                     let problem = null;
                     if (n.isTransient)
                         problem = 'notified, but the notice leaves the tray after its banner';
                     else if (notices !== 1)
                         problem = `${notices} clipboard notices in the tray, expected 1`;
-                    this._result(name, !problem, problem ?? `overlay closed, notified: "${n.body}"`);
+                    this._result(name, !problem, problem ?? `overlay closed, notified: "${noticeText(n)}"`);
                     next();
                 }, () => {
                     disarm();

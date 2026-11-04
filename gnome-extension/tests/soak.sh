@@ -51,12 +51,13 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT HUP TERM
 
-BIN="$REPO/target/release/rayshot"
+# RAYSHOT_SOAK_BIN tests a binary built elsewhere, such as in a container.
+BIN="${RAYSHOT_SOAK_BIN:-$REPO/target/release/rayshot}"
 if [ ! -x "$BIN" ]; then
     echo "soak: build first, $BIN is missing" >&2
     exit 1
 fi
-if [ -n "$(find "$REPO/src" -newer "$BIN" -name '*.rs' | head -n1)" ]; then
+if [ -z "${RAYSHOT_SOAK_BIN:-}" ] && [ -n "$(find "$REPO/src" -newer "$BIN" -name '*.rs' | head -n1)" ]; then
     echo "soak: $BIN is older than src/, rebuild it" >&2
     exit 1
 fi
@@ -85,6 +86,10 @@ WLCOPY
 chmod +x "$WORK/bin/wl-copy"
 export PATH="$WORK/bin:$PATH" RAYSHOT_SOAK_WLCOPY_HANG="$WORK/wl-copy-hang"
 
+# RAYSHOT_SOAK_ANY_SHELL=1 loads the extensions on shells they do not list.
+ANY_SHELL=false
+[ -n "${RAYSHOT_SOAK_ANY_SHELL:-}" ] && ANY_SHELL=true
+
 export RAYSHOT_BIN="$BIN"
 export RAYSHOT_SOAK_OUT="$WORK/result.json"
 export RAYSHOT_SOAK_WARM="${1:-100}" RAYSHOT_SOAK_COLD="${2:-20}"
@@ -94,6 +99,7 @@ RAYSHOT_NESTED_TAG="$TAG" dbus-run-session -- sh -c "
     gsettings set org.gnome.shell disable-user-extensions false
     gsettings set org.gnome.shell enabled-extensions \"['rayshot@paranoica', 'rayshot-soak@paranoica']\"
     gsettings set org.gnome.shell welcome-dialog-last-shown-version '999'
+    gsettings set org.gnome.shell disable-extension-version-validation $ANY_SHELL
     exec gnome-shell --headless --wayland --virtual-monitor 1920x1080 --virtual-monitor 1920x1080
 " >"$WORK/shell.log" 2>&1 &
 SHELL_PID=$!
