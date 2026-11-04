@@ -107,6 +107,10 @@ function surfaceOf(windowActor) {
         windowActor.get_last_child();
 }
 
+// GNOME disables extensions on every lock, so on every resume too; a spare
+// that gave up stays given up, and quiet, until warm is turned off and on.
+const givenUp = {failures: 0, notified: false};
+
 export default class RayshotExtension extends Extension {
     enable() {
         this._epoch = (this._epoch ?? 0) + 1;
@@ -125,12 +129,14 @@ export default class RayshotExtension extends Extension {
         this._paintWait = null;
         this._session = 0;
         this._server = null;
-        this._serverFailures = 0;
+        this._serverFailures = givenUp.failures;
+        if (givenUp.notified)
+            this._notified.add('spare-failed');
         this._binMisses = 0;
         this._respawnId = 0;
         this._gcId = 0;
         this._warmId = this._settings.connect('changed::warm-overlay', () => this._syncServer());
-        this._syncServer();
+        this._syncServer(false);
 
         Main.wm.addKeybinding(
             'capture',
@@ -147,6 +153,10 @@ export default class RayshotExtension extends Extension {
     }
 
     disable() {
+        // Only a lock keeps it; turning the extension off and on starts over.
+        const keep = Main.sessionMode.isLocked && !shouldRespawn(this._serverFailures);
+        givenUp.failures = keep ? this._serverFailures : 0;
+        givenUp.notified = keep && this._notified.has('spare-failed');
         this._epoch++;
         Main.wm.removeKeybinding('capture');
         global.display.disconnect(this._winCreatedId);
@@ -204,15 +214,20 @@ export default class RayshotExtension extends Extension {
         }
     }
 
-    _syncServer() {
+    _syncServer(fresh = true) {
         if (!this._settings.get_boolean('warm-overlay')) {
             this._stopServer();
             console.log('rayshot: warm overlay off');
         } else if (!this._server && !this._respawnId) {
-            this._serverFailures = 0;
+            if (fresh) {
+                this._serverFailures = 0;
+                this._notified.delete('spare-failed');
+            }
             this._binMisses = 0;
-            this._notified.delete('spare-failed');
-            this._startServer();
+            if (shouldRespawn(this._serverFailures))
+                this._startServer();
+            else
+                console.log('rayshot: overlay server gave up earlier, run "rayshot warm off" and "on" to retry');
         }
     }
 
