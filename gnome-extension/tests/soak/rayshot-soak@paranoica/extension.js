@@ -273,26 +273,40 @@ export default class SoakDriver extends Extension {
             this._finish(`cannot start the helper window: ${e.message}`);
             return;
         }
-        waitFor(() => helperWindow()?.get_compositor_private(), () => {
+        // A window activated before it is ready to take the focus is passed
+        // over, so the helper has to hold it once before the capture.
+        waitFor(() => {
+            const helper = helperWindow();
+            if (!helper?.get_compositor_private())
+                return false;
+            if (global.display.focus_window !== helper)
+                Main.activateWindow(helper, global.display.get_current_time_roundtrip());
+            return global.display.focus_window === helper;
+        }, () => {
             const helper = helperWindow();
             r._capture();
             waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
                 const overlays = [...r._overlay.windows.keys()];
-                Main.activateWindow(helper);
-                if (global.display.focus_window !== helper) {
-                    this._result(name, false, 'the app never got the focus, nothing was tested');
+                // The guard may take the focus back before this code runs again,
+                // so the helper's turn is caught as it happens.
+                let helperFocused = false;
+                const focusId = global.display.connect('notify::focus-window', () => {
+                    if (global.display.focus_window === helper)
+                        helperFocused = true;
+                });
+                const done = (ok, detail) => {
+                    global.display.disconnect(focusId);
+                    this._result(name, ok, detail);
                     this._endSession(next);
-                    return;
-                }
-                waitFor(() => overlays.includes(global.display.focus_window), () => {
+                };
+                Main.activateWindow(helper, global.display.get_current_time_roundtrip());
+                waitFor(() => helperFocused && overlays.includes(global.display.focus_window), () => {
                     const top = global.display.sort_windows_by_stacking([helper, ...overlays]).at(-1);
                     const onTop = overlays.includes(top);
-                    this._result(name, onTop, `focus came back, overlay ${onTop ? 'on top' : 'under the app'}`);
-                    this._endSession(next);
-                }, () => {
-                    this._result(name, false, `focus stayed on ${global.display.focus_window?.get_title()}`);
-                    this._endSession(next);
-                }, 1000);
+                    done(onTop, `focus came back, overlay ${onTop ? 'on top' : 'under the app'}`);
+                }, () => done(false, helperFocused
+                    ? `focus stayed on ${global.display.focus_window?.get_title()}`
+                    : 'the app never got the focus, nothing was tested'), 1000);
             }, () => this._finish(`${name}: overlay did not show`));
         }, () => this._finish(`${name}: helper window did not show`));
     }
