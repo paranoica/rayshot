@@ -73,6 +73,18 @@ cp -r "$REPO/gnome-extension/rayshot@paranoica" "$EXT/"
 cp -r "$HERE/soak/rayshot-soak@paranoica" "$EXT/"
 glib-compile-schemas "$EXT/rayshot@paranoica/schemas"
 
+# wl-copy that reads the image and then never finishes, as when it cannot get
+# the focus; armed per scenario by creating the flag file.
+mkdir -p "$WORK/bin"
+REAL_WL_COPY=$(command -v wl-copy) || { echo "soak: wl-copy is not installed" >&2; exit 1; }
+cat >"$WORK/bin/wl-copy" <<WLCOPY
+#!/bin/sh
+if [ -e "$WORK/wl-copy-hang" ]; then cat >/dev/null; exec sleep 30; fi
+exec "$REAL_WL_COPY" "\$@"
+WLCOPY
+chmod +x "$WORK/bin/wl-copy"
+export PATH="$WORK/bin:$PATH" RAYSHOT_SOAK_WLCOPY_HANG="$WORK/wl-copy-hang"
+
 export RAYSHOT_BIN="$BIN"
 export RAYSHOT_SOAK_OUT="$WORK/result.json"
 export RAYSHOT_SOAK_WARM="${1:-100}" RAYSHOT_SOAK_COLD="${2:-20}"

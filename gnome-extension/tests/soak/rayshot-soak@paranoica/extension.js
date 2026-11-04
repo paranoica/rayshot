@@ -172,6 +172,8 @@ export default class SoakDriver extends Extension {
         const steps = [
             next => this._copies(next),
             next => this._coldCopies(next),
+            next => this._copyFails(next),
+            next => this._coldCopyFails(next),
             next => this._focusStolen(next),
             next => this._cancelBeforeFirstFrame(next, 0, {cancels: 0, framesAfter: 0, shown: 0}),
             next => this._spareGivesUp(next),
@@ -216,6 +218,74 @@ export default class SoakDriver extends Extension {
             next();
         }, 'enter copies the selection without a spare', true),
         () => this._finish('warm off did not stop the spare'));
+    }
+
+    // wl-copy that never finishes must not leave the freeze up, and the user
+    // has to learn that the clipboard is empty.
+    _coldCopyFails(next) {
+        const r = this._rayshot;
+        r._settings.set_boolean('warm-overlay', false);
+        waitFor(() => !r._server && !r._respawnId, () => this._copyFails(() => {
+            r._settings.set_boolean('warm-overlay', true);
+            next();
+        }, 'copy that never finishes without a spare'),
+        () => this._finish('warm off did not stop the spare'));
+    }
+
+    _copyFails(next, name = 'copy that never finishes') {
+        const r = this._rayshot;
+        const before = new Set(Main.messageTray.getSources().flatMap(src => src.notifications ?? []));
+        const flag = GLib.getenv('RAYSHOT_SOAK_WLCOPY_HANG');
+        GLib.file_set_contents(flag, '');
+        const disarm = () => GLib.unlink(flag);
+        const notified = () => Main.messageTray.getSources()
+            .flatMap(source => source.notifications ?? [])
+            .find(n => !before.has(n) && /clipboard/i.test(`${n.title} ${n.body}`));
+        r._capture();
+        waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
+            const o = r._overlay;
+            try {
+                o.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${o.session} 100 100 600 400\n`), null);
+            } catch (e) {
+                disarm();
+                this._finish(`${name}: cannot select: ${e.message}`);
+                return;
+            }
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+                const now = GLib.get_monotonic_time();
+                this._keyboard.notify_keyval(now, Clutter.KEY_Return, Clutter.KeyState.PRESSED);
+                this._keyboard.notify_keyval(now + 1000, Clutter.KEY_Return, Clutter.KeyState.RELEASED);
+                waitFor(() => !r._busy && notified(), () => {
+                    disarm();
+                    const n = notified();
+                    const notices = Main.messageTray.getSources()
+                        .flatMap(source => source.notifications ?? [])
+                        .filter(m => /clipboard/i.test(`${m.title} ${m.body}`)).length;
+                    let problem = null;
+                    if (n.isTransient)
+                        problem = 'notified, but the notice leaves the tray after its banner';
+                    else if (notices !== 1)
+                        problem = `${notices} clipboard notices in the tray, expected 1`;
+                    this._result(name, !problem, problem ?? `overlay closed, notified: "${n.body}"`);
+                    next();
+                }, () => {
+                    disarm();
+                    const tray = Main.messageTray.getSources()
+                        .map(src => `${src.title}: ${(src.notifications ?? []).map(n => n.title).join(' | ')}`);
+                    this._result(name, false, (r._busy ? 'overlay still up'
+                        : 'overlay closed without a notification') + `; tray: ${tray.join('; ') || 'empty'}`);
+                    if (r._busy)
+                        this._endSession(next);
+                    else
+                        next();
+                }, 8000);
+                return GLib.SOURCE_REMOVE;
+            });
+        }, () => {
+            disarm();
+            this._finish(`${name}: overlay did not show`);
+        });
     }
 
     _copies(next, name = 'enter copies the selection', cold = false) {
