@@ -25,7 +25,7 @@ jobs:
           name="rayshot-${GITHUB_REF_NAME}-x86_64-linux"
           mkdir -p "dist/$name"
           cp target/release/rayshot "dist/$name/"
-          cp README.md LICENSE "dist/$name/"
+          cp README.md README.ru.md LICENSE "dist/$name/"
           mkdir -p "dist/$name/gnome-extension"
           cp -r gnome-extension/rayshot@paranoica gnome-extension/install.sh \
             gnome-extension/uninstall.sh "dist/$name/gnome-extension/"
