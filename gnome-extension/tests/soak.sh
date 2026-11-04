@@ -14,7 +14,7 @@ TIMEOUT_S=${TIMEOUT_S:-600}
 
 TAG="rayshot-soak-$$-$(date +%s%N)"
 SHELL_PID=
-KEEP_WORK=
+KEEP_WORK=${SOAK_KEEP:-}
 
 descendants() {
     for child in $(pgrep -P "$1"); do

@@ -9,7 +9,7 @@ import System from 'system';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
-import {respawnDelay} from './backoff.js';
+import {MAX_FAILURES, respawnDelay, shouldRespawn} from './backoff.js';
 import {PROTOCOL_VERSION, readyVersion, resolveBin} from './compat.js';
 import {frameHeader} from './frame.js';
 import {pickClickPoint} from './geometry.js';
@@ -19,6 +19,8 @@ const DRAG_WATCH_MS = 50;
 const PROTOCOL_MISMATCH_EXIT = 3;
 const UPDATED_TEXT = 'rayshot was updated. Log out and back in to finish the update.';
 const BINARY_OLD_TEXT = 'The rayshot program is older than its GNOME extension. Update rayshot.';
+const SPARE_FAILED_TEXT = 'rayshot keeps failing to prepare its overlay, so captures open slower. ' +
+    'Run "rayshot warm off" and then "rayshot warm on" to try again.';
 const READY_TIMEOUT_MS = 10000;
 const STABLE_SERVER_MS = 10000;
 const WINDOWS_GONE_TIMEOUT_MS = 500;
@@ -77,6 +79,24 @@ function removeSource(id) {
     return 0;
 }
 
+function parentPid(pid) {
+    try {
+        const stat = new TextDecoder().decode(GLib.file_get_contents(`/proc/${pid}/stat`)[1]);
+        return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+    } catch (_) {
+        return 0;
+    }
+}
+
+function spawnedBy(pid, ancestor) {
+    for (let i = 0; pid > 1 && i < 8; i++) {
+        pid = parentPid(pid);
+        if (pid === ancestor)
+            return true;
+    }
+    return false;
+}
+
 function typeName(obj) {
     return obj.constructor.$gtype?.name ?? '';
 }
@@ -104,6 +124,7 @@ export default class RayshotExtension extends Extension {
         this._session = 0;
         this._server = null;
         this._serverFailures = 0;
+        this._binMisses = 0;
         this._respawnId = 0;
         this._gcId = 0;
         this._warmId = this._settings.connect('changed::warm-overlay', () => this._syncServer());
@@ -118,6 +139,9 @@ export default class RayshotExtension extends Extension {
         );
         this._winCreatedId = global.display.connect('window-created',
             (_d, win) => this._onWindowCreated(win));
+        this._refocusId = 0;
+        this._focusId = global.display.connect('notify::focus-window',
+            () => this._keepOverlayFocused());
     }
 
     disable() {
@@ -125,6 +149,9 @@ export default class RayshotExtension extends Extension {
         Main.wm.removeKeybinding('capture');
         global.display.disconnect(this._winCreatedId);
         this._winCreatedId = null;
+        global.display.disconnect(this._focusId);
+        this._focusId = null;
+        this._refocusId = removeSource(this._refocusId);
         this._resetCapture();
         if (this._overlay) {
             this._releaseWindows(this._overlay);
@@ -179,6 +206,8 @@ export default class RayshotExtension extends Extension {
             console.log('rayshot: warm overlay off');
         } else if (!this._server && !this._respawnId) {
             this._serverFailures = 0;
+            this._binMisses = 0;
+            this._notified.delete('spare-failed');
             this._startServer();
         }
     }
@@ -191,9 +220,15 @@ export default class RayshotExtension extends Extension {
         const bin = this._bin();
         if (!bin) {
             this._notifyOnce('no-bin', 'The rayshot program was not found. Install rayshot or set the binary path.');
-            this._scheduleRespawn();
+            // Kept apart from the failure count, so an install after login
+            // starts with a clean slate.
+            this._respawnId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, respawnDelay(this._binMisses++), () => {
+                this._startServer();
+                return GLib.SOURCE_REMOVE;
+            });
             return;
         }
+        this._binMisses = 0;
         let proc;
         try {
             proc = Gio.Subprocess.new([bin, 'serve'],
@@ -260,6 +295,11 @@ export default class RayshotExtension extends Extension {
         if (!served) {
             delay = respawnDelay(this._serverFailures);
             this._serverFailures++;
+            if (!shouldRespawn(this._serverFailures)) {
+                console.log(`rayshot: overlay server failed ${MAX_FAILURES} times in a row, not restarting it`);
+                this._notifyOnce('spare-failed', SPARE_FAILED_TEXT);
+                return;
+            }
         }
         console.log(`rayshot: overlay server restarts in ${delay}ms`);
         this._respawnId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
@@ -912,6 +952,8 @@ export default class RayshotExtension extends Extension {
         }
         const frameId = actor.connect('first-frame', () => {
             this._dropFrameWatch(actor);
+            if (overlay.cancelled)
+                return;
             if (!this._showThroughFreeze(actor)) {
                 console.log('rayshot: no overlay surface to show over the freeze');
                 this._terminate(overlay);
@@ -933,6 +975,30 @@ export default class RayshotExtension extends Extension {
             this._frameWatches = this._frameWatches.filter(([a]) => a !== actor);
         });
         this._frameWatches.push([actor, frameId, destroyId]);
+    }
+
+    // An app focused under the freeze would take every key while hidden. The
+    // overlay's own helpers are exempt: wl-copy needs the focus to copy. The
+    // check waits a turn so windows of an ending session are already gone.
+    _keepOverlayFocused() {
+        if (this._refocusId || !this._overlay?.shown)
+            return;
+        this._refocusId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._refocusId = 0;
+            const overlay = this._overlay;
+            const focus = global.display.focus_window;
+            if (!overlay?.shown || overlay.cancelled || overlay.closed || overlay.settleId ||
+                !focus || overlay.windows.has(focus) || spawnedBy(focus.get_pid(), overlay.pid))
+                return GLib.SOURCE_REMOVE;
+            const windows = [...overlay.windows.keys()];
+            const monitor = global.display.get_current_monitor();
+            const target = windows.find(w => w.get_monitor() === monitor) ?? windows[0];
+            if (target) {
+                console.log(`rayshot: ${focus.get_wm_class() ?? 'a window'} took the focus from the overlay, taking it back`);
+                Main.activateWindow(target);
+            }
+            return GLib.SOURCE_REMOVE;
+        });
     }
 
     _showThroughFreeze(windowActor) {

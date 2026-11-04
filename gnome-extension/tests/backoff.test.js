@@ -1,4 +1,4 @@
-import {respawnDelay} from '../rayshot@paranoica/backoff.js';
+import {MAX_FAILURES, respawnDelay, shouldRespawn} from '../rayshot@paranoica/backoff.js';
 
 let failed = 0;
 let total = 0;
@@ -23,6 +23,13 @@ check('huge count stays finite', respawnDelay(5000), 30000);
 check('negative counts as zero', respawnDelay(-3), 250);
 check('NaN counts as zero', respawnDelay(NaN), 250);
 check('fraction rounds down', respawnDelay(1.9), 500);
+check('gives up after five failures', MAX_FAILURES, 5);
+check('respawns after the first failure', shouldRespawn(1), true);
+check('respawns after the fourth failure', shouldRespawn(4), true);
+check('stops at the fifth failure', shouldRespawn(5), false);
+check('stays stopped past the limit', shouldRespawn(6), false);
+check('respawns with no failures', shouldRespawn(0), true);
+check('NaN failures still respawn', shouldRespawn(NaN), true);
 
 print(`${total - failed}/${total} passed`);
 if (failed)
