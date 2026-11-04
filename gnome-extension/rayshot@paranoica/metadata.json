@@ -1,8 +1,9 @@
 {
   "uuid": "rayshot@paranoica",
-  "name": "rayshot capture",
-  "description": "Captures the GNOME Shell stage synchronously and hands it to rayshot for annotation. Replaces the portal/screencast capture path on GNOME.",
+  "name": "rayshot",
+  "description": "Freezes the screen on the rayshot hotkey and opens the rayshot editor over it. Needs the rayshot program.",
   "shell-version": ["50", "51"],
   "settings-schema": "org.gnome.shell.extensions.rayshot",
-  "version": 1
+  "version": 2,
+  "version-name": "0.2.0"
 }
