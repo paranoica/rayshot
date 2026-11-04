@@ -17,8 +17,7 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config \
-            libpipewire-0.3-dev libwayland-dev libxkbcommon-dev
+          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -31,6 +30,9 @@ jobs:
           mkdir -p "dist/$name"
           cp target/release/rayshot "dist/$name/"
           cp README.md LICENSE "dist/$name/"
+          mkdir -p "dist/$name/gnome-extension"
+          cp -r gnome-extension/rayshot@paranoica gnome-extension/install.sh \
+            gnome-extension/uninstall.sh "dist/$name/gnome-extension/"
           tar -C dist -czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
