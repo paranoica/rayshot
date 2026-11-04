@@ -76,6 +76,8 @@ export default class SoakDriver extends Extension {
         this._cold = Number(GLib.getenv('RAYSHOT_SOAK_COLD') ?? '20');
         this._samples = [];
         this._scenarioResults = [];
+        this._driverCrashes = 0;
+        this._lastSegv = 0;
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1000, () => {
             this._start();
             return GLib.SOURCE_REMOVE;
@@ -90,6 +92,14 @@ export default class SoakDriver extends Extension {
             this._finish('rayshot extension not loaded');
             return;
         }
+        // The NVIDIA driver now and then segfaults while a spare opens its
+        // windows; such a session falls back to one-shot and is counted.
+        const onServerExit = this._rayshot._onServerExit.bind(this._rayshot);
+        this._rayshot._onServerExit = (server, epoch) => {
+            if (server.proc.get_if_signaled() && server.proc.get_term_sig() === 11)
+                this._lastSegv = GLib.get_monotonic_time();
+            onServerExit(server, epoch);
+        };
         const unfreeze = this._rayshot._unfreeze.bind(this._rayshot);
         this._rayshot._unfreeze = () => {
             if (this._sessionPid) {
@@ -138,8 +148,13 @@ export default class SoakDriver extends Extension {
         waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
             const o = r._overlay;
             if (phase === 'warm' && !o.server) {
-                this._finish(`warm ${i}: session took the one-shot path`);
-                return;
+                const crashed = GLib.get_monotonic_time() - this._lastSegv < 5 * GLib.USEC_PER_SEC;
+                if (!crashed) {
+                    this._finish(`warm ${i}: session took the one-shot path`);
+                    return;
+                }
+                this._driverCrashes++;
+                this._lastSegv = 0;
             }
             this._sessionPid = o.pid;
             this._leftAtUnfreeze = null;
@@ -175,6 +190,7 @@ export default class SoakDriver extends Extension {
             next => this._copyFails(next),
             next => this._coldCopyFails(next),
             next => this._focusStolen(next),
+            next => this._spareCrashes(next),
             next => this._cancelBeforeFirstFrame(next, 0, {cancels: 0, framesAfter: 0, shown: 0}),
             next => this._spareGivesUp(next),
             next => this._missingBinary(next),
@@ -199,7 +215,8 @@ export default class SoakDriver extends Extension {
         const o = r._overlay;
         if (o) {
             try {
-                o.proc.get_stdin_pipe().write_all(new TextEncoder().encode(`cancel ${o.session}\n`), null);
+                const line = o.server ? `cancel ${o.session}\n` : 'quit\n';
+                o.proc.get_stdin_pipe().write_all(new TextEncoder().encode(line), null);
             } catch (e) {
                 this._finish(`cannot end the session: ${e.message}`);
                 return;
@@ -327,6 +344,34 @@ export default class SoakDriver extends Extension {
                 return GLib.SOURCE_REMOVE;
             });
         }, () => this._finish(`${name}: overlay did not show`));
+    }
+
+    // A spare that dies while opening its windows, as the NVIDIA driver does
+    // now and then, must be replaced before the freeze feels stuck.
+    _spareCrashes(next) {
+        const r = this._rayshot;
+        const name = 'spare crashes while opening its windows';
+        let killedAt = 0;
+        const createdId = global.display.connect('window-created', (_d, win) => {
+            const server = r._overlay?.server;
+            if (killedAt || !server || !r._isOverlay(win))
+                return;
+            killedAt = GLib.get_monotonic_time();
+            // SIGABRT dumps core like a real crash; a sent SIGSEGV only resets
+            // Rust's stack-overflow handler and the process lives on.
+            server.proc.send_signal(6);
+        });
+        r._capture();
+        waitFor(() => killedAt && r._overlay && !r._overlay.server, () => {
+            global.display.disconnect(createdId);
+            const ms = Math.round((GLib.get_monotonic_time() - killedAt) / 1000);
+            this._result(name, ms < 300, `one-shot overlay ${ms} ms after the crash (limit 300)`);
+            waitFor(() => r._overlay?.shown && r._overlay.framePath, () => this._endSession(next),
+                () => this._finish(`${name}: one-shot overlay did not show`));
+        }, () => {
+            global.display.disconnect(createdId);
+            this._finish(`${name}: ${killedAt ? 'no one-shot after the crash' : 'no overlay window to crash'}`);
+        });
     }
 
     // Stands in for a stray click that focuses and raises an app hidden under
@@ -502,7 +547,12 @@ export default class SoakDriver extends Extension {
     _finish(error) {
         this._rayshot?._settings?.set_boolean('warm-overlay', true);
         this._helper?.force_exit();
-        const result = JSON.stringify({error, samples: this._samples, scenarios: this._scenarioResults}, null, 1);
+        const result = JSON.stringify({
+            error,
+            samples: this._samples,
+            scenarios: this._scenarioResults,
+            driverCrashes: this._driverCrashes,
+        }, null, 1);
         if (this._out)
             GLib.file_set_contents(this._out, result);
         console.log(`rayshot-soak: done ${error ?? 'ok'}`);

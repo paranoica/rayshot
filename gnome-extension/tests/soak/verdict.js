@@ -5,7 +5,7 @@ import {growth} from './growth.js';
 
 const [path, serverRssLimit, serverVramLimit, shellRssLimit] = ARGV;
 const [, bytes] = GLib.file_get_contents(path);
-const {error, samples, scenarios = []} = JSON.parse(new TextDecoder().decode(bytes));
+const {error, samples, scenarios = [], driverCrashes = 0} = JSON.parse(new TextDecoder().decode(bytes));
 
 let failed = false;
 function report(name, value, limit, unit) {
@@ -37,6 +37,7 @@ report('spare vram drift', growth(warm, 'server_vram_mib', WARMUP_SAMPLES),
     Number(serverVramLimit), 'MiB');
 report('shell rss growth', growth(samples, 'shell_rss_kb', WARMUP_SAMPLES),
     Number(shellRssLimit), 'kB');
+report('spares lost to a GPU driver crash', driverCrashes, 3, '');
 for (const {name, ok, detail} of scenarios) {
     failed ||= !ok;
     print(`${ok ? 'ok  ' : 'FAIL'} ${name}: ${detail}`);
