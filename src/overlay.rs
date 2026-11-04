@@ -312,6 +312,7 @@ struct WindowState {
     blur_texture_id: Option<egui::TextureId>,
     region: egui::Rect,
     configured: bool,
+    suboptimal_reconfigured: bool,
     frames: u64,
     cursor: Option<egui::Pos2>,
 }
@@ -652,6 +653,7 @@ impl OverlayApp {
                 blur_texture_id: None,
                 region,
                 configured: false,
+                suboptimal_reconfigured: false,
                 frames: 0,
                 cursor: None,
             });
@@ -1711,9 +1713,9 @@ impl OverlayApp {
                 .update_texture(&shared.device, &shared.queue, *id, delta);
         }
 
-        let surface_texture = match win.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
+        let (surface_texture, suboptimal) = match win.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 win.surface.configure(&shared.device, &win.config);
                 win.window.request_redraw();
@@ -1773,6 +1775,11 @@ impl OverlayApp {
                 .chain(std::iter::once(encoder.finish())),
         );
         surface_texture.present();
+        if reconfigure_after_suboptimal(suboptimal, win.suboptimal_reconfigured) {
+            win.suboptimal_reconfigured = true;
+            win.surface.configure(&shared.device, &win.config);
+            win.window.request_redraw();
+        }
 
         for id in &full_output.textures_delta.free {
             win.renderer.free_texture(id);
@@ -2167,6 +2174,12 @@ fn next_selection(
     }
 }
 
+// Once per window: a driver that reports every frame as suboptimal would
+// otherwise rebuild the swapchain on each one.
+fn reconfigure_after_suboptimal(suboptimal: bool, done_before: bool) -> bool {
+    suboptimal && !done_before
+}
+
 // Wayland repeats the same size on every configure; rebuilding the swapchain
 // for it is wasted work and one more trip through a driver call that has crashed.
 fn surface_needs_configure(configured: bool, current: (u32, u32), new: (u32, u32)) -> bool {
@@ -2215,6 +2228,7 @@ fn parse_crop(spec: &str) -> Option<egui::Rect> {
 
 #[cfg(test)]
 mod tests {
+    use super::reconfigure_after_suboptimal;
     use super::see_through_alpha;
     use super::surface_needs_configure;
 
@@ -2226,6 +2240,18 @@ mod tests {
             egui::pos2(x0, y0),
             egui::pos2(x1, y1),
         ))
+    }
+
+    #[test]
+    fn a_suboptimal_frame_reconfigures_the_surface_once() {
+        assert!(reconfigure_after_suboptimal(true, false));
+        assert!(!reconfigure_after_suboptimal(true, true));
+    }
+
+    #[test]
+    fn a_good_frame_never_reconfigures() {
+        assert!(!reconfigure_after_suboptimal(false, false));
+        assert!(!reconfigure_after_suboptimal(false, true));
     }
 
     #[test]
