@@ -162,7 +162,8 @@ export default class SoakDriver extends Extension {
                 () => this._finish(`${phase} ${i}: no warm spare in time`));
             return;
         }
-        if (i % 10 === 0 || i === total)
+        // Cold runs are short, so they are sampled more often.
+        if (i % (phase === 'cold' ? 5 : 10) === 0 || i === total)
             this._sample(phase, i);
         if (i === total) {
             if (phase === 'warm' && this._cold > 0) {
