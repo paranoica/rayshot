@@ -1272,7 +1272,7 @@ impl OverlayApp {
                 ];
                 painter.extend(egui::Shape::dashed_line(
                     &corners,
-                    egui::Stroke::new(1.5, egui::Color32::WHITE),
+                    egui::Stroke::new(1.5f32, egui::Color32::WHITE),
                     6.0,
                     4.0,
                 ));
@@ -1292,7 +1292,7 @@ impl OverlayApp {
                     painter.rect_stroke(
                         hr,
                         1,
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                        egui::Stroke::new(1.0f32, egui::Color32::from_gray(70)),
                         egui::StrokeKind::Outside,
                     );
                 }
@@ -1347,12 +1347,12 @@ impl OverlayApp {
                     painter.circle_stroke(
                         p,
                         rs,
-                        egui::Stroke::new(2.5, egui::Color32::from_black_alpha(130)),
+                        egui::Stroke::new(2.5f32, egui::Color32::from_black_alpha(130)),
                     );
                     painter.circle_stroke(
                         p,
                         rs,
-                        egui::Stroke::new(1.2, egui::Color32::from_white_alpha(235)),
+                        egui::Stroke::new(1.2f32, egui::Color32::from_white_alpha(235)),
                     );
                     painter.circle_filled(p, 1.4, egui::Color32::from_white_alpha(235));
                 }
@@ -1392,7 +1392,7 @@ impl OverlayApp {
                             bb.left_bottom(),
                             bb.left_top(),
                         ],
-                        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)),
+                        egui::Stroke::new(1.0f32, egui::Color32::from_white_alpha(160)),
                         4.0,
                         3.0,
                     ));
@@ -1468,7 +1468,7 @@ impl OverlayApp {
                                     egui::pos2(caret_x, origin.y),
                                     egui::pos2(caret_x, origin.y + line_h),
                                 ],
-                                egui::Stroke::new(2.0, col),
+                                egui::Stroke::new(2.0f32, col),
                             );
                             let bb = egui::Rect::from_min_size(
                                 r.rect.min,
@@ -1484,7 +1484,7 @@ impl OverlayApp {
                             ];
                             ui.painter().extend(egui::Shape::dashed_line(
                                 &pts,
-                                egui::Stroke::new(1.0, egui::Color32::from_white_alpha(160)),
+                                egui::Stroke::new(1.0f32, egui::Color32::from_white_alpha(160)),
                                 4.0,
                                 3.0,
                             ));
@@ -1500,7 +1500,7 @@ impl OverlayApp {
                             ui.painter().rect_stroke(
                                 grip,
                                 2,
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
+                                egui::Stroke::new(1.0f32, egui::Color32::from_gray(60)),
                                 egui::StrokeKind::Outside,
                             );
                             if gh.hovered() || gh.dragged() {
