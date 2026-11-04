@@ -280,7 +280,7 @@ Press the hotkey, drag a region, annotate, press Enter.
 | Key | Tool | | Key | Action |
 |---|---|---|---|---|
 | `S` / `V` | select, move, resize | | `Enter` / `Ctrl+C` | copy |
-| `P` | pen | | floppy button | save to `~/Pictures` |
+| `P` | pen | | floppy button | save to your pictures folder |
 | `L` | line | | `Ctrl+Z` | undo |
 | `A` | arrow | | `Ctrl+Y` / `Ctrl+Shift+Z` | redo |
 | `R` | rectangle | | `Esc` | cancel |
@@ -291,9 +291,11 @@ Press the hotkey, drag a region, annotate, press Enter.
 
 **Where screenshots go.** Copying puts the image on the clipboard and keeps a
 temporary copy in `$XDG_RUNTIME_DIR/rayshot/`, which lives in RAM, is cleared
-at logout and pruned after 24 hours. Saving writes to
-`~/Pictures/rayshot-DD-MM-YYYY-HH-MM-SS.png`; the folder has to be named
-exactly `Pictures`, otherwise the file goes to `/tmp`.
+at logout and pruned after 24 hours. Saving writes
+`rayshot-DD-MM-YYYY-HH-MM-SS.png` to the pictures folder from your desktop
+settings (`XDG_PICTURES_DIR`, such as `~/Pictures` or its translated name),
+creating it if it is missing inside your home. If that folder cannot be used,
+the file goes to `~/Pictures` if it exists, and only as a last resort to `/tmp`.
 
 <details>
 <summary>Commands and environment variables</summary>
