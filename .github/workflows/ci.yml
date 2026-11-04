@@ -38,3 +38,42 @@ jobs:
 
       - name: Test extension compatibility helpers
         run: gjs -m gnome-extension/tests/compat.test.js
+
+  # Debian 12's old glibc, so one binary runs in every image below.
+  portable-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Debian 12
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/tmp/cargo -v "$PWD:/src" -w /src \
+            rust:bookworm cargo build --release --locked
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rayshot-portable
+          path: target/release/rayshot
+          retention-days: 3
+
+  soak:
+    needs: portable-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [fedora-39, ubuntu-24.04, fedora-41, debian-13, fedora-43, ubuntu-26.04, arch]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: rayshot-portable
+          path: bin
+
+      - name: Soak in a headless GNOME Shell
+        run: |
+          chmod +x bin/rayshot
+          gnome-extension/tests/containers/run.sh ${{ matrix.image }} bin/rayshot 20 5

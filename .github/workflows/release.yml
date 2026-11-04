@@ -14,15 +14,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      # Debian 12's old glibc, so the binary also runs on older distributions.
+      - name: Build in Debian 12
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build
-        run: cargo build --release --locked
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/tmp/cargo -v "$PWD:/src" -w /src \
+            rust:bookworm cargo build --release --locked
 
       - name: Package
         run: |
