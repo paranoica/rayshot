@@ -7,7 +7,11 @@ rm -rf "$DST"
 mkdir -p "$DST"
 cp -r "$HERE/$UUID/." "$DST/"
 glib-compile-schemas "$DST/schemas"
-BIN="$(cd "$HERE/.." && pwd)/target/release/rayshot"
+ROOT=$(cd "$HERE/.." && pwd)
+# A source checkout builds into target/release; a release archive ships the
+# binary next to this folder.
+BIN="$ROOT/target/release/rayshot"
+[ -x "$BIN" ] || BIN="$ROOT/rayshot"
 if [ -x "$BIN" ]; then
     gsettings --schemadir "$DST/schemas" set org.gnome.shell.extensions.rayshot binary "$BIN"
     echo "rayshot binary: $BIN"

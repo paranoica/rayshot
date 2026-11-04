@@ -70,7 +70,10 @@ pub fn cleanup_old(dir: &Path, max_age: Duration) {
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        if !meta.is_file() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Only screenshot copies: lock files and frames share this folder.
+        if !meta.is_file() || !(name.starts_with("rayshot-") && name.ends_with(".png")) {
             continue;
         }
         if let Ok(modified) = meta.modified() {
@@ -163,17 +166,95 @@ pub fn copy_png_to_clipboard(png: &[u8]) -> Result<()> {
         .context("wl-copy stdin unavailable")?
         .write_all(png)
         .context("failed to write image to wl-copy")?;
-    let status = child.wait().context("failed to wait for wl-copy")?;
+    // Without a data-control protocol wl-copy needs the keyboard focus, and
+    // an unbounded wait would leave the overlay and the freeze up for good.
+    let status = wait_bounded(&mut child, std::time::Duration::from_secs(3))
+        .context("wl-copy did not finish")?;
     if !status.success() {
         anyhow::bail!("wl-copy exited with {status}");
     }
     Ok(())
 }
 
+fn wait_bounded(
+    child: &mut std::process::Child,
+    timeout: std::time::Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    let err = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if std::time::Instant::now() < deadline => {}
+            Ok(None) => break anyhow::anyhow!("gave up after {timeout:?}"),
+            Err(e) => break e.into(),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(err)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn bounded_wait_returns_the_status_of_a_quick_child() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 3"])
+            .spawn()
+            .unwrap();
+        let status = wait_bounded(&mut child, Duration::from_secs(5)).unwrap();
+        assert_eq!(status.code(), Some(3));
+    }
+
+    #[test]
+    fn bounded_wait_gives_up_on_a_hung_child_and_kills_it() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let started = Instant::now();
+        assert!(wait_bounded(&mut child, Duration::from_millis(200)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "hung child left running"
+        );
+    }
+
+    fn file_aged(dir: &Path, name: &str, age: Duration) -> PathBuf {
+        let path = dir.join(name);
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn cleanup_removes_only_old_screenshots() {
+        let dir = temp_file();
+        std::fs::create_dir_all(&dir).unwrap();
+        let hour = Duration::from_secs(3600);
+        let old_shot = file_aged(&dir, "rayshot-01-11-2026-10-00-00.png", hour);
+        let old_dup = file_aged(&dir, "rayshot-01-11-2026-10-00-00-2.png", hour);
+        let new_shot = file_aged(&dir, "rayshot-04-11-2026-10-00-00.png", Duration::ZERO);
+        let lock = file_aged(&dir, "instance.lock", hour);
+        let frame = file_aged(&dir, "frame-123.rsf", hour);
+        let other = file_aged(&dir, "notes.png", hour);
+
+        cleanup_old(&dir, Duration::from_secs(60));
+
+        assert!(!old_shot.exists() && !old_dup.exists());
+        assert!(new_shot.exists(), "fresh screenshot removed");
+        assert!(lock.exists(), "a held lock file must survive");
+        assert!(frame.exists(), "frames belong to the extension's sweep");
+        assert!(other.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 

@@ -497,7 +497,12 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 }
             }
             WindowEvent::Resized(size) => {
-                if size.width > 0 && size.height > 0 {
+                let win = &self.windows[idx];
+                if surface_needs_configure(
+                    win.configured,
+                    (win.config.width, win.config.height),
+                    (size.width, size.height),
+                ) {
                     if let Some(shared) = self.shared.as_ref() {
                         let win = &mut self.windows[idx];
                         win.config.width = size.width;
@@ -821,7 +826,7 @@ impl OverlayApp {
         if let Some(spec) = std::env::var_os("RAYSHOT_TEST_CROP") {
             self.selection = parse_crop(&spec.to_string_lossy());
             match self.finish() {
-                Ok(Some(path)) => eprintln!("[rayshot] test saved + copied {}", path.display()),
+                Ok(Some(path)) => eprintln!("[rayshot] test kept a copy at {}", path.display()),
                 Ok(None) => eprintln!("[rayshot] test: empty selection"),
                 Err(e) => eprintln!("[rayshot] test finish failed: {e:?}"),
             }
@@ -1988,8 +1993,9 @@ impl OverlayApp {
         let path = crate::export::save_to_scratch(&png)?;
         let t_save = t2.elapsed();
         let t3 = std::time::Instant::now();
-        if let Err(e) = crate::export::copy_png_to_clipboard(&png) {
-            eprintln!("[rayshot] clipboard copy failed: {e:#}");
+        match crate::export::copy_png_to_clipboard(&png) {
+            Ok(()) => eprintln!("[rayshot] copied to clipboard"),
+            Err(e) => eprintln!("[rayshot] clipboard copy failed: {e:#}"),
         }
         eprintln!(
             "[rayshot] finish: render {:?}, encode {:?}, save {:?}, clip {:?}",
@@ -2094,7 +2100,7 @@ impl OverlayApp {
         }
         match self.finish() {
             Ok(Some(path)) => {
-                eprintln!("[rayshot] copied to clipboard + saved {}", path.display());
+                eprintln!("[rayshot] kept a copy at {}", path.display());
                 self.close(event_loop);
             }
             Ok(None) => eprintln!("[rayshot] nothing to copy (no selection)"),
@@ -2156,6 +2162,12 @@ fn next_selection(
     }
 }
 
+// Wayland repeats the same size on every configure; rebuilding the swapchain
+// for it is wasted work and one more trip through a driver call that has crashed.
+fn surface_needs_configure(configured: bool, current: (u32, u32), new: (u32, u32)) -> bool {
+    new.0 > 0 && new.1 > 0 && (!configured || current != new)
+}
+
 // egui-wgpu blends into premultiplied RGB, so only PreMultiplied composites correctly.
 fn see_through_alpha(modes: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
     let mode = wgpu::CompositeAlphaMode::PreMultiplied;
@@ -2199,6 +2211,7 @@ fn parse_crop(spec: &str) -> Option<egui::Rect> {
 #[cfg(test)]
 mod tests {
     use super::see_through_alpha;
+    use super::surface_needs_configure;
 
     use super::forwarded_selection;
     use wgpu::CompositeAlphaMode::{Auto, Inherit, Opaque, PostMultiplied, PreMultiplied};
@@ -2208,6 +2221,28 @@ mod tests {
             egui::pos2(x0, y0),
             egui::pos2(x1, y1),
         ))
+    }
+
+    #[test]
+    fn first_resize_configures_the_surface_even_at_the_initial_size() {
+        assert!(surface_needs_configure(false, (1920, 1080), (1920, 1080)));
+    }
+
+    #[test]
+    fn repeated_resize_to_the_same_size_skips_reconfigure() {
+        assert!(!surface_needs_configure(true, (1920, 1080), (1920, 1080)));
+    }
+
+    #[test]
+    fn resize_to_a_new_size_reconfigures() {
+        assert!(surface_needs_configure(true, (1920, 1080), (1920, 1079)));
+        assert!(surface_needs_configure(true, (1920, 1080), (3840, 1080)));
+    }
+
+    #[test]
+    fn zero_sized_resize_never_configures() {
+        assert!(!surface_needs_configure(false, (1920, 1080), (0, 1080)));
+        assert!(!surface_needs_configure(true, (1920, 1080), (1920, 0)));
     }
 
     #[test]
