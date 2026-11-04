@@ -11,7 +11,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 
 import {MAX_FAILURES, respawnDelay, shouldRespawn} from './backoff.js';
-import {PROTOCOL_VERSION, readyVersion, resolveBin} from './compat.js';
+import {PROTOCOL_VERSION, defaultSeat, persistentNotice, readyVersion, resolveBin, unredirect} from './compat.js';
 import {frameHeader} from './frame.js';
 import {pickClickPoint} from './geometry.js';
 
@@ -322,19 +322,13 @@ export default class RayshotExtension extends Extension {
         // an empty clipboard should still be explained when the user looks.
         // One notice at a time, so repeated failures do not crowd the tray.
         this._copyNotice?.destroy();
-        const source = MessageTray.getSystemSource();
-        const notice = new MessageTray.Notification({
-            source,
-            title: 'rayshot',
-            body: `The screenshot could not be copied to the clipboard. A temporary copy is at ${path}.`,
-            isTransient: false,
-        });
+        const notice = persistentNotice(MessageTray, Main.messageTray, 'rayshot',
+            `The screenshot could not be copied to the clipboard. A temporary copy is at ${path}.`);
         notice.connect('destroy', () => {
             if (this._copyNotice === notice)
                 this._copyNotice = null;
         });
         this._copyNotice = notice;
-        source.addNotification(notice);
         return true;
     }
 
@@ -659,7 +653,7 @@ export default class RayshotExtension extends Extension {
             return Clutter.EVENT_STOP;
         });
         St.Settings.get().inhibit_animations();
-        global.compositor.disable_unredirect();
+        unredirect(global.compositor, global.display, Meta, false);
         const frozen = {actor, texture, clones: [], focusReleased: false};
         // A shell modal that ends after the overlay showed would hand the key
         // focus back to the freeze and leave the overlay without keys.
@@ -764,7 +758,7 @@ export default class RayshotExtension extends Extension {
         freeze.clones.forEach(c => c.destroy());
         freeze.actor.destroy();
         St.Settings.get().uninhibit_animations();
-        global.compositor.enable_unredirect();
+        unredirect(global.compositor, global.display, Meta, true);
     }
 
     _afterNextPaint(fn) {
@@ -1137,7 +1131,7 @@ export default class RayshotExtension extends Extension {
         }
 
         const [x, y] = global.get_pointer();
-        const seat = global.stage.context.get_backend().get_default_seat();
+        const seat = defaultSeat(global.stage, Clutter);
         const ptr = seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
         ptr.notify_absolute_motion(Clutter.CURRENT_TIME, target.x, target.y);
         ptr.notify_button(Clutter.CURRENT_TIME, Clutter.BUTTON_MIDDLE, Clutter.ButtonState.PRESSED);
