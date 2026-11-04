@@ -245,7 +245,7 @@ capture, no screen recording, and the fast path is GNOME only.
 
 ## How it is tested
 
-- **Unit tests:** 61 in Rust and 5 suites for the extension (geometry, frame
+- **Unit tests:** 68 in Rust and 5 suites for the extension (geometry, frame
   format, respawn backoff, GNOME version shims, the memory metric).
 - **Soak test:** a headless GNOME Shell, a real rayshot and a driver extension
   run 100 warm and 20 cold captures and then 15 scenarios, and fail on a leak
