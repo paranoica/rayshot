@@ -22,6 +22,7 @@ if gnome-extensions enable "$UUID" 2>/dev/null; then
 else
     echo "Wayland: log out and back in, then run: gnome-extensions enable $UUID"
 fi
-echo "Ctrl+Print opens rayshot. To move it to Print, run: rayshot install-hotkey Print"
+[ -x "$BIN" ] || BIN=rayshot
+echo "Ctrl+Print opens rayshot. To move it to Print, run: $BIN install-hotkey Print"
 echo "The overlay stays warm for a faster start. To turn that off:"
 echo "  gsettings --schemadir \"$DST/schemas\" set org.gnome.shell.extensions.rayshot warm-overlay false"
