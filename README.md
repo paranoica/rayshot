@@ -46,8 +46,8 @@ machine. Turn it off with `rayshot warm off` if you would rather save that.
 
 | Desktop                 | Status |
 |-------------------------|--------|
-| **GNOME 50/51 (Wayland)** | Full support through the extension: instant freeze, hotkey setup. |
-| **Other GNOME versions** | The extension is not marked compatible. Bind a key to `rayshot` by hand for the portal mode below. |
+| **GNOME 45–51 (Wayland)** | Full support through the extension: instant freeze, hotkey setup. Every version is tested in CI with software rendering. |
+| **Older GNOME** | The extension does not load there. Bind a key to `rayshot` by hand for the portal mode below. |
 | **KDE / other Wayland** | Portal mode: `rayshot` captures through the screenshot portal (about 400 ms and a flash per shot). Bind the key by hand. |
 | **wlroots (Sway/Hyprland)** | Not supported: the portal screenshot backend is usually missing. |
 | **X11**                 | Not supported. |
