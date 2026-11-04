@@ -73,7 +73,7 @@ pub fn cleanup_old(dir: &Path, max_age: Duration) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         // Only screenshot copies: lock files and frames share this folder.
-        if !meta.is_file() || !(name.starts_with("rayshot-") && name.ends_with(".png")) {
+        if !(meta.is_file() && name.starts_with("rayshot-") && name.ends_with(".png")) {
             continue;
         }
         if let Ok(modified) = meta.modified() {
@@ -134,16 +134,75 @@ pub fn save_to_scratch(png: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn save_to_pictures(png: &[u8]) -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
+/// The folder from `user-dirs.dirs`, which is localized (`~/Изображения`,
+/// `~/Bilder`). Values are double-quoted shell strings; "$HOME" alone means
+/// the user turned the folder off.
+fn configured_pictures_dir(home: &Path, user_dirs: &str) -> Option<PathBuf> {
+    let raw = user_dirs
+        .lines()
+        .rev()
+        .find_map(|line| line.trim().strip_prefix("XDG_PICTURES_DIR="))?;
+    let mut chars = raw.strip_prefix('"')?.chars();
+    let mut value = String::new();
+    loop {
+        match chars.next()? {
+            '"' => break,
+            '\\' => value.push(chars.next()?),
+            c => value.push(c),
+        }
+    }
+    let dir = match value.strip_prefix("$HOME/") {
+        Some(rest) => home.join(rest.trim_matches('/')),
+        None if value.starts_with('/') => PathBuf::from(&value),
+        None => return None,
+    };
+    let usable = dir != home
+        && dir.parent().is_some()
+        && !dir
+            .components()
+            .any(|c| c == std::path::Component::ParentDir);
+    usable.then_some(dir)
+}
+
+/// Configured folder, then ~/Pictures, then /tmp. Only a folder inside the
+/// home is created; elsewhere it could land on an unmounted drive.
+fn pictures_dir(
+    home: Option<&Path>,
+    user_dirs: Option<&str>,
+    exists: &dyn Fn(&Path) -> bool,
+    create: &dyn Fn(&Path) -> bool,
+) -> PathBuf {
+    let Some(home) = home.filter(|h| h.is_absolute() && h.parent().is_some()) else {
+        return PathBuf::from("/tmp");
+    };
+    if let Some(dir) = user_dirs.and_then(|d| configured_pictures_dir(home, d))
+        && (exists(&dir) || (dir.starts_with(home) && create(&dir)))
+    {
+        return dir;
+    }
     let pictures = home.join("Pictures");
-    let dir = if pictures.is_dir() {
+    if exists(&pictures) {
         pictures
     } else {
         PathBuf::from("/tmp")
-    };
+    }
+}
+
+pub fn save_to_pictures(png: &[u8]) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute());
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| home.as_ref().map(|h| h.join(".config")));
+    let user_dirs = config.and_then(|c| std::fs::read_to_string(c.join("user-dirs.dirs")).ok());
+    let dir = pictures_dir(
+        home.as_deref(),
+        user_dirs.as_deref(),
+        &|p| p.is_dir(),
+        &|p| std::fs::create_dir_all(p).is_ok(),
+    );
     let path = unique_path(&dir, &timestamped_filename());
     std::fs::write(&path, png).with_context(|| format!("write {}", path.display()))?;
     Ok(path)
@@ -254,6 +313,123 @@ mod tests {
         assert!(frame.exists(), "frames belong to the extension's sweep");
         assert!(other.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const HOME: &str = "/home/u";
+
+    fn pick(user_dirs: Option<&str>, existing: &[&str], creatable: &[&str]) -> PathBuf {
+        pictures_dir(
+            Some(Path::new(HOME)),
+            user_dirs,
+            &|p| existing.iter().any(|e| p == Path::new(e)),
+            &|p| creatable.iter().any(|c| p == Path::new(c)),
+        )
+    }
+
+    #[test]
+    fn pictures_go_to_the_localized_folder_the_desktop_configured() {
+        let dirs =
+            "XDG_DESKTOP_DIR=\"$HOME/Рабочий стол\"\nXDG_PICTURES_DIR=\"$HOME/Изображения\"\n";
+        assert_eq!(
+            pick(Some(dirs), &["/home/u/Изображения"], &[]),
+            PathBuf::from("/home/u/Изображения")
+        );
+    }
+
+    #[test]
+    fn a_missing_configured_folder_in_home_is_created() {
+        let dirs = "XDG_PICTURES_DIR=\"$HOME/Изображения\"\n";
+        assert_eq!(
+            pick(Some(dirs), &[], &["/home/u/Изображения"]),
+            PathBuf::from("/home/u/Изображения")
+        );
+    }
+
+    #[test]
+    fn a_configured_folder_that_cannot_be_made_falls_back_to_pictures_first() {
+        let dirs = "XDG_PICTURES_DIR=\"$HOME/Изображения\"\n";
+        assert_eq!(
+            pick(Some(dirs), &["/home/u/Pictures"], &[]),
+            PathBuf::from("/home/u/Pictures")
+        );
+    }
+
+    #[test]
+    fn an_absolute_folder_is_used_only_if_it_exists() {
+        let dirs = "XDG_PICTURES_DIR=\"/data/pics\"\n";
+        assert_eq!(
+            pick(Some(dirs), &["/data/pics"], &[]),
+            PathBuf::from("/data/pics")
+        );
+        assert_eq!(
+            pick(Some(dirs), &[], &["/data/pics"]),
+            PathBuf::from("/tmp")
+        );
+    }
+
+    #[test]
+    fn the_value_is_read_as_a_quoted_shell_string() {
+        let cases = [
+            ("XDG_PICTURES_DIR=\"$HOME/Pics\"  # mine\n", "/home/u/Pics"),
+            (
+                "XDG_PICTURES_DIR=\"$HOME/My \\$tuff\"\n",
+                "/home/u/My $tuff",
+            ),
+            ("XDG_PICTURES_DIR=\"$HOME/Fotos\"\r\n", "/home/u/Fotos"),
+            (
+                "XDG_PICTURES_DIR=\"$HOME/Old\"\nXDG_PICTURES_DIR=\"$HOME/New\"\n",
+                "/home/u/New",
+            ),
+            (
+                "# XDG_PICTURES_DIR=\"$HOME/Wrong\"\n  XDG_PICTURES_DIR=\"$HOME/Fotos\"\n",
+                "/home/u/Fotos",
+            ),
+        ];
+        for (dirs, want) in cases {
+            assert_eq!(
+                pick(Some(dirs), &[want], &[]),
+                PathBuf::from(want),
+                "{dirs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_a_usable_setting_pictures_then_tmp() {
+        for dirs in [
+            None,
+            Some("XDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n"),
+            Some("XDG_PICTURES_DIR=\"$HOME/\"\n"),
+            Some("XDG_PICTURES_DIR=\"$HOME\"\n"),
+            Some("XDG_PICTURES_DIR=\"Pics\"\n"),
+            Some("XDG_PICTURES_DIR=\"\"\n"),
+            Some("XDG_PICTURES_DIR=$HOME/Unquoted\n"),
+            Some("XDG_PICTURES_DIR=\"$HOME/..\"\n"),
+            Some("XDG_PICTURES_DIR=\"/\"\n"),
+        ] {
+            assert_eq!(
+                pick(dirs, &["/home/u/Pictures"], &["/home/u/Unquoted"]),
+                PathBuf::from("/home/u/Pictures"),
+                "{dirs:?}"
+            );
+            assert_eq!(pick(dirs, &[], &[]), PathBuf::from("/tmp"), "{dirs:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_home_only_tmp_is_safe() {
+        let dirs = Some("XDG_PICTURES_DIR=\"/data/pics\"\n");
+        for home in [
+            None,
+            Some(Path::new("")),
+            Some(Path::new("relative")),
+            Some(Path::new("/")),
+        ] {
+            assert_eq!(
+                pictures_dir(home, dirs, &|_| true, &|_| true),
+                PathBuf::from("/tmp")
+            );
+        }
     }
 
     static COUNTER: AtomicU32 = AtomicU32::new(0);

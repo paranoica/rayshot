@@ -1605,7 +1605,7 @@ impl OverlayApp {
                                         action = Some(Action::Copy);
                                     }
                                     if tool_button(ui, p::FLOPPY_DISK, false)
-                                        .on_hover_text("Save to ~/Pictures")
+                                        .on_hover_text("Save to Pictures")
                                         .clicked()
                                     {
                                         action = Some(Action::Save);
