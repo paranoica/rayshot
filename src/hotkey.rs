@@ -187,11 +187,42 @@ fn is_gnome() -> bool {
     current_desktop().to_ascii_uppercase().contains("GNOME")
 }
 
+/// Runs once at login for users of the old daemon, from its autostart entry,
+/// which is removed here; nobody reads stderr there, so they get a notice.
 pub fn retire_daemon() -> Result<()> {
-    let _ = std::fs::remove_file(autostart_path());
+    let had_autostart = std::fs::remove_file(autostart_path()).is_ok();
     eprintln!("rayshot: the background daemon was removed in favour of the GNOME extension.");
-    eprintln!("rayshot: run `rayshot install-hotkey` once to finish the switch.");
+    eprintln!("rayshot: run `rayshot install-hotkey Print` once to finish the switch.");
+    if !had_autostart {
+        return Ok(());
+    }
+    let _ = Command::new("gdbus")
+        .args(update_notice_args())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
     Ok(())
+}
+
+fn update_notice_args() -> [&'static str; 16] {
+    [
+        "call",
+        "--session",
+        "--dest",
+        "org.freedesktop.Notifications",
+        "--object-path",
+        "/org/freedesktop/Notifications",
+        "--method",
+        "org.freedesktop.Notifications.Notify",
+        "rayshot",
+        "uint32 0",
+        "",
+        "rayshot was updated",
+        "Run \"rayshot install-hotkey Print\" once to finish the update.",
+        "@as []",
+        "@a{sv} {}",
+        "int32 0",
+    ]
 }
 
 pub fn install(binding: &str, daemon: bool) -> Result<()> {
