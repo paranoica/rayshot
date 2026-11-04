@@ -63,6 +63,22 @@ function noticeText(n) {
     return `${n.title} ${n.body ?? n.bannerBodyText ?? ''}`;
 }
 
+const DISPLAY_CONFIG = ['org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig'];
+
+function displayConfig(iface, method, params, done, fail) {
+    Gio.DBus.session.call(...DISPLAY_CONFIG, iface, method, params, null,
+        Gio.DBusCallFlags.NONE, -1, null, (conn, res) => {
+            let reply;
+            try {
+                reply = conn.call_finish(res);
+            } catch (e) {
+                fail(e.message);
+                return;
+            }
+            done(reply);
+        });
+}
+
 function waitFor(cond, then, fail, timeoutMs = STEP_TIMEOUT_MS) {
     const started = GLib.get_monotonic_time();
     GLib.timeout_add(GLib.PRIORITY_DEFAULT, TICK_MS, () => {
@@ -80,6 +96,11 @@ function waitFor(cond, then, fail, timeoutMs = STEP_TIMEOUT_MS) {
 
 export default class SoakDriver extends Extension {
     enable() {
+        // GNOME re-enables later extensions when an earlier one is disabled,
+        // as on lock; the run must not start over.
+        if (this._started)
+            return;
+        this._started = true;
         this._out = GLib.getenv('RAYSHOT_SOAK_OUT');
         this._warm = Number(GLib.getenv('RAYSHOT_SOAK_WARM') ?? '100');
         this._cold = Number(GLib.getenv('RAYSHOT_SOAK_COLD') ?? '20');
@@ -199,8 +220,14 @@ export default class SoakDriver extends Extension {
             next => this._copyFails(next),
             next => this._coldCopyFails(next),
             next => this._focusStolen(next),
+            next => this._heldKey(next),
             next => this._spareCrashes(next),
+            next => this._freshFrames(next),
+            next => this._layoutChanges(next),
+            next => this._screensSleep(next),
+            next => this._lockUnlock(next),
             next => this._cancelBeforeFirstFrame(next, 0, {cancels: 0, framesAfter: 0, shown: 0}),
+            next => this._oldAutostart(next),
             next => this._spareGivesUp(next),
             next => this._missingBinary(next),
         ];
@@ -391,8 +418,9 @@ export default class SoakDriver extends Extension {
         const helperWindow = () => global.get_window_actors().map(a => a.get_meta_window())
             .find(w => w?.get_title() === 'rayshot-soak-helper');
         try {
-            this._helper = Gio.Subprocess.new(['gjs', '-m', `${this.path}/helper-window.js`],
-                Gio.SubprocessFlags.NONE);
+            const launcher = new Gio.SubprocessLauncher();
+            launcher.setenv('RAYSHOT_SOAK_HELPER_LOG', this._helperLog(), true);
+            this._helper = launcher.spawnv(['gjs', '-m', `${this.path}/helper-window.js`]);
         } catch (e) {
             this._finish(`cannot start the helper window: ${e.message}`);
             return;
@@ -477,6 +505,236 @@ export default class SoakDriver extends Extension {
         }, () => this._finish(`${name}: session did not end`));
     }
 
+    // Users of the old daemon still have its autostart entry, which runs
+    // `rayshot daemon` at login; that is the one chance to tell them to finish
+    // the update.
+    _oldAutostart(next) {
+        const name = 'old daemon autostart at login';
+        const home = GLib.build_filenamev([GLib.path_get_dirname(this._out), 'old-home']);
+        const entry = GLib.build_filenamev([home, '.config', 'autostart', 'rayshot-daemon.desktop']);
+        GLib.mkdir_with_parents(GLib.path_get_dirname(entry), 0o700);
+        GLib.file_set_contents(entry, '[Desktop Entry]\nExec=rayshot daemon\n');
+        const before = new Set(Main.messageTray.getSources().flatMap(src => src.notifications ?? []));
+        const notice = () => Main.messageTray.getSources().flatMap(src => src.notifications ?? [])
+            .find(n => !before.has(n) && /install-hotkey/.test(noticeText(n)));
+        const launcher = new Gio.SubprocessLauncher();
+        launcher.setenv('HOME', home, true);
+        let proc;
+        try {
+            proc = launcher.spawnv([this._rayshot._bin(), 'daemon']);
+        } catch (e) {
+            this._finish(`${name}: ${e.message}`);
+            return;
+        }
+        proc.wait_async(null, () => {
+            waitFor(notice, () => {
+                const gone = !GLib.file_test(entry, GLib.FileTest.EXISTS);
+                this._result(name, gone, gone ? `notified: "${noticeText(notice())}"`
+                    : 'notified, but the autostart entry is still there');
+                next();
+            }, () => {
+                this._result(name, false, 'no notification about finishing the update');
+                next();
+            }, 3000);
+        });
+    }
+
+    _helperLog() {
+        return GLib.build_filenamev([GLib.path_get_dirname(this._out), 'helper-keys.log']);
+    }
+
+    // A key held down when Print is pressed has its release land on the
+    // freeze. If the capture is cancelled, the app must still learn the key
+    // is up, or it keeps repeating it.
+    _heldKey(next) {
+        const r = this._rayshot;
+        const name = 'key held through a cancelled capture';
+        const helper = global.get_window_actors().map(a => a.get_meta_window())
+            .find(w => w?.get_title() === 'rayshot-soak-helper');
+        if (!helper) {
+            this._finish(`${name}: no helper window`);
+            return;
+        }
+        const log = this._helperLog();
+        const read = () => {
+            try {
+                return new TextDecoder().decode(GLib.file_get_contents(log)[1]).trim().split('\n');
+            } catch (_) {
+                return [];
+            }
+        };
+        const key = (state, then) => {
+            this._keyboard.notify_keyval(GLib.get_monotonic_time(), Clutter.KEY_a, state);
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+                then();
+                return GLib.SOURCE_REMOVE;
+            });
+        };
+        Main.activateWindow(helper, global.display.get_current_time_roundtrip());
+        waitFor(() => global.display.focus_window === helper, () => {
+            GLib.file_set_contents(log, '');
+            key(Clutter.KeyState.PRESSED, () => {
+                if (!read().includes(`press ${Clutter.KEY_a}`)) {
+                    this._result(name, false, 'the app never saw the key go down, nothing was tested');
+                    key(Clutter.KeyState.RELEASED, next);
+                    return;
+                }
+                r._capture();
+                let atCancel = 0;
+                waitFor(() => r._frozen, () => key(Clutter.KeyState.RELEASED, () => {
+                    atCancel = read().length;
+                    r._cancelCapture();
+                    // Long enough for the app's own key repeat to show a stuck key.
+                    waitFor(() => !r._busy, () => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                        const after = read();
+                        const repeats = after.slice(atCancel).filter(l => l === `press ${Clutter.KEY_a}`).length;
+                        const up = (after.includes(`release ${Clutter.KEY_a}`) || after.includes('focus out')) &&
+                            repeats === 0;
+                        this._result(name, up, up ? `the app saw the key go up (${after.join(', ')})`
+                            : `the key is still down for the app (${after.join(', ')})`);
+                        next();
+                        return GLib.SOURCE_REMOVE;
+                    }), () => this._finish(`${name}: capture did not end`));
+                }), () => this._finish(`${name}: no freeze`));
+            });
+        }, () => this._finish(`${name}: the helper never got the focus`));
+    }
+
+    // One capture, then `check(overlay)` while it is shown; `then` once it ended.
+    _captureAndCheck(name, check, then) {
+        const r = this._rayshot;
+        r._capture();
+        waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
+            const problem = check(r._overlay);
+            this._endSession(() => then(problem));
+        }, () => this._finish(`${name}: overlay did not show`));
+    }
+
+    // The old daemon could hand out a picture from before the screens slept;
+    // every capture must show what is on screen right now.
+    _freshFrames(next) {
+        const r = this._rayshot;
+        const name = 'each capture shows the screen as it is now';
+        const square = new St.Widget({x: 60, y: 60, width: 40, height: 40, style: 'background-color: #00ff00;'});
+        Main.layoutManager.uiGroup.add_child(square);
+        const greens = [];
+        const writeFrame = r._writeFrame;
+        r._writeFrame = (pixbuf, t0) => {
+            greens.push(pixbuf.read_pixel_bytes().get_data()[80 * pixbuf.get_rowstride() + 80 * 4 + 1]);
+            return writeFrame.call(r, pixbuf, t0);
+        };
+        const done = (ok, detail) => {
+            r._writeFrame = writeFrame;
+            square.destroy();
+            this._result(name, ok, detail);
+            next();
+        };
+        // A capture takes the last painted frame, so the square must be drawn first.
+        const painted = then => {
+            const id = global.stage.connect('after-paint', () => {
+                global.stage.disconnect(id);
+                then();
+            });
+            global.stage.queue_redraw();
+        };
+        painted(() => this._captureAndCheck(name, () => null, () => {
+            square.style = 'background-color: #000000;';
+            waitFor(() => r._server?.ready, () => painted(() => this._captureAndCheck(name, () => null, () => {
+                const [first, second] = greens;
+                done(first > 200 && second < 60, `green ${first} then ${second} after the square turned black`);
+            })), () => this._finish(`${name}: no warm spare in time`));
+        }));
+    }
+
+    // A monitor that is unplugged or switched off while the spare waits must
+    // not leave the spare drawing on a layout that no longer exists.
+    _layoutChanges(next) {
+        const r = this._rayshot;
+        const name = 'monitors change while the spare waits';
+        const fail = why => this._finish(`${name}: ${why}`);
+        const apply = (serial, logical, then) => displayConfig('org.gnome.Mutter.DisplayConfig', 'ApplyMonitorsConfig',
+            new GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', [serial, 1, logical, {}]), then, fail);
+        const state = then => displayConfig('org.gnome.Mutter.DisplayConfig', 'GetCurrentState', null,
+            reply => then(reply.recursiveUnpack()), fail);
+        const shape = overlay => {
+            const monitors = [...overlay.windows.keys()].map(w => w.get_monitor()).sort().join(',');
+            return `${overlay.windows.size} windows on monitors ${monitors || 'none'}, frame ${overlay.texture.get_width()}`;
+        };
+        state(([serial, monitors, logical]) => {
+            const mode = Object.fromEntries(monitors.map(([spec, modes]) =>
+                [spec[0], modes.find(m => m[6]['is-current'])?.[0]]));
+            if (Object.values(mode).some(m => !m)) {
+                fail('a monitor has no current mode');
+                return;
+            }
+            const layout = logical.map(([x, y, scale, transform, primary, specs]) =>
+                [x, y, scale, transform, primary, specs.map(spec => [spec[0], mode[spec[0]], {}])]);
+            const primary = layout.find(l => l[4]);
+            if (layout.length < 2 || !primary) {
+                fail(`needs two monitors, got ${layout.length}`);
+                return;
+            }
+            apply(serial, [[0, 0, primary[2], primary[3], true, primary[5]]], () => {
+                waitFor(() => global.display.get_n_monitors() === 1 && r._server?.ready, () => {
+                    this._captureAndCheck(name, shape, one => {
+                        state(([serial2]) => apply(serial2, layout, () => {
+                            waitFor(() => global.display.get_n_monitors() === 2 && r._server?.ready, () => {
+                                this._captureAndCheck(name, shape, two => {
+                                    const ok = one === '1 windows on monitors 0, frame 1920' &&
+                                        two === '2 windows on monitors 0,1, frame 3840';
+                                    this._result(name, ok, `one monitor: ${one}; both again: ${two}`);
+                                    next();
+                                });
+                            }, () => fail('the second monitor did not come back'));
+                        }));
+                    });
+                }, () => fail('the second monitor did not go away'));
+            });
+        });
+    }
+
+    _screensSleep(next) {
+        const r = this._rayshot;
+        const name = 'capture after the screens slept';
+        const fail = why => this._finish(`${name}: ${why}`);
+        const powerSave = (mode, then) => displayConfig('org.freedesktop.DBus.Properties', 'Set',
+            new GLib.Variant('(ssv)', ['org.gnome.Mutter.DisplayConfig', 'PowerSaveMode', new GLib.Variant('i', mode)]),
+            then, fail);
+        powerSave(3, () => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 3000, () => {
+            powerSave(0, () => waitFor(() => r._server?.ready, () => {
+                this._captureAndCheck(name, overlay => overlay.server ? null : 'took the one-shot path', problem => {
+                    this._result(name, !problem, problem ?? 'warm capture after 3 s of power save');
+                    next();
+                });
+            }, () => fail('no warm spare after waking')));
+            return GLib.SOURCE_REMOVE;
+        }));
+    }
+
+    // GNOME disables extensions on lock, which also happens on suspend, and
+    // enables them again on unlock.
+    _lockUnlock(next) {
+        const r = this._rayshot;
+        const name = 'capture after lock and unlock';
+        const fail = why => this._finish(`${name}: ${why}`);
+        // A few failures short of giving up must not follow the user past a lock.
+        r._serverFailures = MAX_FAILURES - 1;
+        Main.sessionMode.pushMode('unlock-dialog');
+        waitFor(() => !r._settings, () => {
+            Main.sessionMode.popMode('unlock-dialog');
+            waitFor(() => r._settings && r._server?.ready, () => {
+                const spares = serveProcesses();
+                const failures = r._serverFailures;
+                this._captureAndCheck(name, overlay => overlay.server ? null : 'took the one-shot path', problem => {
+                    const ok = !problem && spares === 1 && failures === 0;
+                    this._result(name, ok, problem ??
+                        `${spares} spare(s) after unlock, ${failures} failures carried over, warm capture`);
+                    next();
+                });
+            }, () => fail('the extension did not come back after unlock'));
+        }, () => fail('locking did not disable the extension'));
+    }
+
     _restartWarm(then) {
         const r = this._rayshot;
         r._settings.set_boolean('warm-overlay', false);
@@ -494,6 +752,28 @@ export default class SoakDriver extends Extension {
         this._restartWarm(() => this._watchGiveUp(next, name, bin));
     }
 
+    // Lock and unlock re-enable the extension; a spare that gave up must stay
+    // given up and must not notify again. Calls back with a problem or null.
+    _throughLock(stopped, failures, then) {
+        const r = this._rayshot;
+        const notices = () => Main.messageTray.getSources().flatMap(src => src.notifications ?? [])
+            .filter(n => /keeps failing/.test(noticeText(n))).length;
+        const before = notices();
+        Main.sessionMode.pushMode('unlock-dialog');
+        waitFor(() => !r._settings, () => {
+            Main.sessionMode.popMode('unlock-dialog');
+            waitFor(() => r._settings, () => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                if (!stopped() || r._serverFailures < failures)
+                    then('restarted after unlock');
+                else if (notices() > before)
+                    then('notified again after unlock');
+                else
+                    then(null);
+                return GLib.SOURCE_REMOVE;
+            }), () => then('the extension did not come back after unlock'));
+        }, () => then('locking did not disable the extension'));
+    }
+
     _watchGiveUp(next, name, bin) {
         const r = this._rayshot;
         const stopped = () => !r._server && !r._respawnId;
@@ -502,16 +782,19 @@ export default class SoakDriver extends Extension {
             GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
                 const stayed = stopped() && r._serverFailures === failures;
                 const told = r._notified.has('spare-failed');
+                this._throughLock(stopped, failures, afterLock => {
                 r._bin = bin;
                 this._restartWarm(() => waitFor(() => r._server?.ready, () => {
-                    this._result(name, stayed && told, `stopped after ${failures} failures, ` +
+                    this._result(name, stayed && told && !afterLock, `stopped after ${failures} failures, ` +
                         `${stayed ? 'stayed stopped' : 'restarted again'}, ` +
-                        `${told ? 'notified' : 'no notification'}, recovers after warm off/on`);
+                        `${told ? 'notified' : 'no notification'}, ` +
+                        `${afterLock ?? 'still stopped after lock and unlock'}, recovers after warm off/on`);
                     next();
                 }, () => {
                     this._result(name, false, 'warm off/on did not bring the spare back');
                     next();
                 }));
+                });
                 return GLib.SOURCE_REMOVE;
             });
         }, () => {

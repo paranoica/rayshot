@@ -2,5 +2,6 @@
   "uuid": "rayshot-soak@paranoica",
   "name": "rayshot soak driver",
   "description": "Test-only driver that runs repeated rayshot captures and records memory. Never install outside a nested test shell.",
-  "shell-version": ["45", "46", "47", "48", "49", "50", "51"]
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "session-modes": ["user", "unlock-dialog"]
 }
