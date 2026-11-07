@@ -166,6 +166,7 @@ struct TextDraft {
     buf: String,
     color: egui::Color32,
     size: f32,
+    replaces: Option<usize>,
 }
 
 struct OverlayApp {
@@ -206,7 +207,8 @@ struct OverlayApp {
     sel_mode: Option<SelMode>,
     sel_ref: egui::Rect,
     text_edit: Option<TextDraft>,
-    move_shape: Option<(usize, crate::scene::Shape)>,
+    shape_drag: Option<(usize, Option<crate::scene::Grip>, crate::scene::Shape)>,
+    selected: Option<usize>,
     text_sel: Option<(usize, usize, usize)>,
     blurred: Option<Arc<Vec<u8>>>,
 }
@@ -252,7 +254,8 @@ impl OverlayApp {
             sel_mode: None,
             sel_ref: egui::Rect::ZERO,
             text_edit: None,
-            move_shape: None,
+            shape_drag: None,
+            selected: None,
             text_sel: None,
             blurred: None,
         }
@@ -273,6 +276,57 @@ fn hit_handle(s: egui::Rect, p: egui::Pos2, radius: f32) -> Option<usize> {
         s.left_center(),
     ];
     pts.iter().position(|&c| (c - p).length() <= radius)
+}
+
+const GRIP_REACH: f32 = 9.0;
+
+#[derive(Debug, PartialEq)]
+enum TextOutcome {
+    Added,
+    Kept,
+    Removed(usize),
+    Nothing,
+}
+
+fn apply_text(scene: &mut crate::scene::Scene, d: TextDraft) -> TextOutcome {
+    let text = (!d.buf.trim().is_empty()).then_some(crate::scene::Shape::Text {
+        pos: d.pos,
+        text: d.buf,
+        color: d.color,
+        size: d.size,
+    });
+    match (d.replaces, text) {
+        (None, Some(text)) => {
+            scene.push(text);
+            TextOutcome::Added
+        }
+        (Some(i), Some(text)) if i < scene.shapes().len() => {
+            if scene.shapes()[i] != text {
+                scene.begin_change();
+                scene.set_shape(i, text);
+            }
+            TextOutcome::Kept
+        }
+        (Some(i), None) if scene.remove(i) => TextOutcome::Removed(i),
+        _ => TextOutcome::Nothing,
+    }
+}
+
+fn shifted_after_removal(idx: usize, removed: usize) -> Option<usize> {
+    match idx.cmp(&removed) {
+        std::cmp::Ordering::Less => Some(idx),
+        std::cmp::Ordering::Equal => None,
+        std::cmp::Ordering::Greater => Some(idx - 1),
+    }
+}
+
+fn grip_cursor(grip: Option<crate::scene::Grip>, dragging: bool) -> egui::CursorIcon {
+    match grip {
+        Some(crate::scene::Grip::Box(h)) => handle_cursor(h),
+        Some(_) => egui::CursorIcon::Crosshair,
+        None if dragging => egui::CursorIcon::Grabbing,
+        None => egui::CursorIcon::Move,
+    }
 }
 
 fn handle_cursor(h: usize) -> egui::CursorIcon {
@@ -505,7 +559,44 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                         };
                         let is = |c: KeyCode| code == Some(c);
                         use crate::scene::Tool;
-                        if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
+                        let dragging = self.shape_drag.is_some();
+                        let selected = self
+                            .selected
+                            .filter(|_| self.tool == Tool::Select && !dragging);
+                        let nudge = match event.logical_key {
+                            Key::Named(NamedKey::ArrowLeft) => Some(egui::vec2(-1.0, 0.0)),
+                            Key::Named(NamedKey::ArrowRight) => Some(egui::vec2(1.0, 0.0)),
+                            Key::Named(NamedKey::ArrowUp) => Some(egui::vec2(0.0, -1.0)),
+                            Key::Named(NamedKey::ArrowDown) => Some(egui::vec2(0.0, 1.0)),
+                            _ => None,
+                        };
+                        let delete = matches!(
+                            event.logical_key,
+                            Key::Named(NamedKey::Delete | NamedKey::Backspace)
+                        );
+                        if selected.is_some()
+                            && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+                        {
+                            self.selected = None;
+                            self.scene.break_group();
+                            self.request_redraw_all();
+                        } else if let (Some(i), true, false) = (selected, delete, ctrl) {
+                            self.scene.remove(i);
+                            self.selected = None;
+                            self.request_redraw_all();
+                        } else if let (Some(i), Some(d), false) = (selected, nudge, ctrl) {
+                            let step = if shift { 10.0 } else { 1.0 };
+                            if let Some(shape) = self.scene.shapes().get(i) {
+                                let moved = crate::scene::translated(shape, d * step);
+                                self.scene.edit(i, crate::scene::Group::Nudge, moved);
+                            }
+                            self.request_redraw_all();
+                        } else if let (Some(i), true) = (selected, ctrl && is(KeyCode::KeyD)) {
+                            if let Some(copy) = self.scene.duplicate(i, DUPLICATE_OFFSET) {
+                                self.selected = Some(copy);
+                            }
+                            self.request_redraw_all();
+                        } else if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
                             eprintln!("[rayshot] exit: Escape (cancelled)");
                             self.close(event_loop);
                         } else if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
@@ -518,11 +609,17 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             } else {
                                 self.save_and_exit(event_loop);
                             }
+                        } else if dragging
+                            && ctrl
+                            && (is(KeyCode::KeyZ) || is(KeyCode::KeyY) || is(KeyCode::KeyD))
+                        {
                         } else if ctrl && is(KeyCode::KeyZ) && !shift {
                             self.scene.undo();
+                            self.selected = None;
                             self.request_redraw_all();
                         } else if ctrl && (is(KeyCode::KeyY) || (is(KeyCode::KeyZ) && shift)) {
                             self.scene.redo();
+                            self.selected = None;
                             self.request_redraw_all();
                         } else if !ctrl {
                             let new_tool = if is(KeyCode::KeyS) || is(KeyCode::KeyV) {
@@ -570,10 +667,16 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                                 .and_then(|d| palette_color(d as u32 + 1))
                             {
                                 self.color = c;
+                                if let Some(i) = selected {
+                                    self.recolor_selected(i);
+                                }
                                 self.request_redraw_all();
                             }
                             if let Some(t) = new_tool {
                                 self.tool = t;
+                                if t != Tool::Select {
+                                    self.selected = None;
+                                }
                                 self.request_redraw_all();
                             }
                         }
@@ -859,6 +962,7 @@ impl OverlayApp {
                         buf: t.to_string(),
                         color: self.color,
                         size: 24.0,
+                        replaces: None,
                     });
                 }
             }
@@ -1044,8 +1148,16 @@ impl OverlayApp {
         let mut action: Option<Action> = None;
         let mut sel_mode = self.sel_mode;
         let mut sel_ref = self.sel_ref;
-        let mut moving_shape = self.move_shape.clone();
-        let mut move_apply: Option<(usize, Shape)> = None;
+        let mut shape_drag = self.shape_drag.clone();
+        let mut drag_apply: Option<(usize, Shape)> = None;
+        let tool_at_start = self.tool;
+        let color_at_start = color;
+        let selected_at_start = self.selected.filter(|&i| i < shapes.len());
+        let mut selected = selected_at_start;
+        let mut wheel_edit: Option<(usize, Shape)> = None;
+        let mut size_toast: Option<f32> = None;
+        let mut reedit_text: Option<usize> = None;
+        let editing_index = self.text_edit.as_ref().and_then(|d| d.replaces);
         let mut start_text: Option<egui::Pos2> = None;
         let mut text_buf = self.text_edit.as_ref().map(|d| d.buf.clone());
         let text_info = self.text_edit.as_ref().map(|d| (d.pos, d.color, d.size));
@@ -1085,16 +1197,41 @@ impl OverlayApp {
                 egui::Sense::click_and_drag(),
             );
             let cursor_pos = raw_cursor.or_else(|| resp.interact_pointer_pos());
+            let hit = |fp: egui::Pos2| {
+                crate::scene::shape_hit(shapes, fp).filter(|&i| Some(i) != editing_index)
+            };
             match tool {
                 Tool::Select => {
+                    if resp.clicked()
+                        && let Some(p) = cursor_pos
+                    {
+                        selected = hit(to_frame(p));
+                    }
+                    if resp.double_clicked()
+                        && let Some(i) = selected
+                        && matches!(shapes[i], Shape::Text { .. })
+                    {
+                        reedit_text = Some(i);
+                    }
                     if resp.drag_started() {
                         if let Some(p) = cursor_pos {
                             let fp = to_frame(p);
                             drag_start = Some(fp);
-                            if let Some(i) = crate::scene::shape_hit(shapes, fp) {
-                                moving_shape = Some((i, shapes[i].clone()));
+                            let grip = selected.and_then(|i| {
+                                crate::scene::grips(&shapes[i])
+                                    .into_iter()
+                                    .find(|(_, at)| (to_screen(*at) - p).length() <= GRIP_REACH)
+                                    .map(|(g, _)| (i, g))
+                            });
+                            if let Some((i, g)) = grip {
+                                shape_drag = Some((i, Some(g), shapes[i].clone()));
+                                sel_mode = None;
+                            } else if let Some(i) = hit(fp) {
+                                selected = Some(i);
+                                shape_drag = Some((i, None, shapes[i].clone()));
                                 sel_mode = None;
                             } else if let Some(sel) = selection {
+                                selected = None;
                                 let s = egui::Rect::from_min_max(
                                     to_screen(sel.min),
                                     to_screen(sel.max),
@@ -1118,8 +1255,12 @@ impl OverlayApp {
                     if resp.dragged() {
                         if let (Some(start), Some(p)) = (drag_start, cursor_pos) {
                             let fp = to_frame(p);
-                            if let Some((i, orig)) = &moving_shape {
-                                move_apply = Some((*i, crate::scene::translated(orig, fp - start)));
+                            if let Some((i, grip, orig)) = &shape_drag {
+                                let moved = match grip {
+                                    None => crate::scene::translated(orig, fp - start),
+                                    Some(g) => reshaped(orig, *g, fp, shift, frame_rect),
+                                };
+                                drag_apply = Some((*i, moved));
                             } else {
                                 match sel_mode {
                                     Some(SelMode::New) => {
@@ -1155,9 +1296,26 @@ impl OverlayApp {
                             }
                         }
                         sel_mode = None;
-                        moving_shape = None;
+                        shape_drag = None;
                     }
-                    let icon = if let Some(sel) = selection {
+                    let hover = resp.hover_pos();
+                    let grip_under = |p: egui::Pos2| {
+                        selected.and_then(|i| {
+                            crate::scene::grips(&shapes[i])
+                                .into_iter()
+                                .find(|(_, at)| (to_screen(*at) - p).length() <= GRIP_REACH)
+                                .map(|(g, _)| g)
+                        })
+                    };
+                    let icon = if let Some((_, grip, _)) = &shape_drag {
+                        grip_cursor(*grip, true)
+                    } else if let Some(g) = hover.and_then(grip_under) {
+                        grip_cursor(Some(g), false)
+                    } else if sel_mode.is_none()
+                        && hover.is_some_and(|p| hit(to_frame(p)).is_some())
+                    {
+                        egui::CursorIcon::Move
+                    } else if let Some(sel) = selection {
                         let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
                         let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
                         match sel_mode {
@@ -1364,10 +1522,18 @@ impl OverlayApp {
                 _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair),
             }
 
-            if matches!(
-                tool,
-                Tool::Pen | Tool::Line | Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Counter
-            ) && resp.hovered()
+            let wheel_target = selected.filter(|_| tool == Tool::Select && shape_drag.is_none());
+            if (wheel_target.is_some()
+                || matches!(
+                    tool,
+                    Tool::Pen
+                        | Tool::Line
+                        | Tool::Arrow
+                        | Tool::Rect
+                        | Tool::Ellipse
+                        | Tool::Counter
+                ))
+                && resp.hovered()
             {
                 let dy: f32 = ui.input(|i| {
                     i.raw
@@ -1384,7 +1550,38 @@ impl OverlayApp {
                         .sum()
                 });
                 if dy != 0.0 {
-                    stroke_width = scrolled_width(stroke_width, &mut scroll_acc, dy);
+                    match wheel_target.map(|i| (i, &shapes[i])) {
+                        Some((i, Shape::Text { size, .. })) => {
+                            let new = scrolled_text_size(*size, &mut scroll_acc, dy);
+                            if new != *size
+                                && let Shape::Text {
+                                    pos, text, color, ..
+                                } = &shapes[i]
+                            {
+                                size_toast = Some(new);
+                                wheel_edit = Some((
+                                    i,
+                                    Shape::Text {
+                                        pos: *pos,
+                                        text: text.clone(),
+                                        color: *color,
+                                        size: new,
+                                    },
+                                ));
+                            }
+                        }
+                        Some((i, shape)) => {
+                            if let Some(w) = shape_width(shape) {
+                                stroke_width = scrolled_width(w, &mut scroll_acc, dy);
+                                if stroke_width != w {
+                                    wheel_edit = Some((i, with_width(shape, stroke_width)));
+                                }
+                            }
+                        }
+                        None => {
+                            stroke_width = scrolled_width(stroke_width, &mut scroll_acc, dy);
+                        }
+                    }
                 }
             }
 
@@ -1505,14 +1702,59 @@ impl OverlayApp {
                     frame_h,
                 ),
             };
-            for shape in shapes {
-                paint_shape(shape);
+            let shape_now = |i: usize| {
+                [&drag_apply, &wheel_edit]
+                    .into_iter()
+                    .flatten()
+                    .find(|(j, _)| *j == i)
+                    .map_or(&shapes[i], |(_, s)| s)
+            };
+            for i in 0..shapes.len() {
+                if Some(i) != editing_index {
+                    paint_shape(shape_now(i));
+                }
             }
             if let Some(d) = &draft {
                 paint_shape(d);
             }
             if let Some(c) = &committed {
                 paint_shape(c);
+            }
+            if let Some(i) = selected.filter(|&i| tool == Tool::Select && Some(i) != editing_index)
+            {
+                let shape = shape_now(i);
+                if let Some(b) = crate::scene::bounds(shape) {
+                    let r = egui::Rect::from_two_pos(to_screen(b.min), to_screen(b.max))
+                        .expand(shape_width(shape).unwrap_or(0.0) * scale / 2.0 + 5.0);
+                    let outline = [
+                        r.left_top(),
+                        r.right_top(),
+                        r.right_bottom(),
+                        r.left_bottom(),
+                        r.left_top(),
+                    ];
+                    painter.extend(egui::Shape::dashed_line(
+                        &outline,
+                        egui::Stroke::new(2.5f32, egui::Color32::from_black_alpha(110)),
+                        5.0,
+                        4.0,
+                    ));
+                    painter.extend(egui::Shape::dashed_line(
+                        &outline,
+                        egui::Stroke::new(1.0f32, egui::Color32::WHITE),
+                        5.0,
+                        4.0,
+                    ));
+                }
+                for (_, at) in crate::scene::grips(shape) {
+                    let c = to_screen(at);
+                    painter.circle_filled(c, 5.0, egui::Color32::WHITE);
+                    painter.circle_stroke(
+                        c,
+                        5.0,
+                        egui::Stroke::new(1.0f32, egui::Color32::from_gray(60)),
+                    );
+                }
             }
             if let (Some(r), Some(p)) = (brush_ring, raw_cursor) {
                 if brush_active {
@@ -1910,14 +2152,40 @@ impl OverlayApp {
         }
         self.sel_mode = sel_mode;
         self.sel_ref = sel_ref;
-        let move_just_started = self.move_shape.is_none() && moving_shape.is_some();
-        self.move_shape = moving_shape;
-        if move_just_started {
+        let drag_just_started = self.shape_drag.is_none() && shape_drag.is_some();
+        self.shape_drag = shape_drag;
+        if drag_just_started {
             self.scene.begin_change();
         }
-        if let Some((i, shape)) = move_apply {
+        if let Some((i, shape)) = drag_apply {
             self.scene.set_shape(i, shape);
         }
+        if let Some((i, shape)) = wheel_edit {
+            self.scene.edit(i, crate::scene::Group::Width, shape);
+        }
+        if let Some(size) = size_toast {
+            self.toast = Some((format!("{size:.0} px"), std::time::Instant::now()));
+        }
+        if tool != Tool::Select {
+            selected = None;
+        }
+        if selected != selected_at_start {
+            self.scene.break_group();
+            self.scroll_acc = 0.0;
+            if let Some(shape) = selected.and_then(|i| self.scene.shapes().get(i)) {
+                if let Some(c) = crate::scene::colour_of(shape) {
+                    self.color = c;
+                }
+                if let Some(w) = shape_width(shape) {
+                    self.stroke_width = w;
+                }
+            }
+        } else if self.color != color_at_start
+            && let Some(i) = selected
+        {
+            self.recolor_selected(i);
+        }
+        self.selected = selected;
 
         if let Some(d) = self.text_edit.as_mut() {
             if let Some(buf) = text_buf {
@@ -1925,25 +2193,54 @@ impl OverlayApp {
             }
             d.pos += text_pos_shift;
         }
+        let mut removed: Vec<usize> = Vec::new();
         if text_lost_focus {
-            self.commit_text();
+            removed.extend(self.commit_text());
         }
 
-        if tool != crate::scene::Tool::Text {
-            self.commit_text();
+        let reediting = self
+            .text_edit
+            .as_ref()
+            .is_some_and(|d| d.replaces.is_some());
+        if tool != Tool::Text && (!reediting || tool != tool_at_start) {
+            removed.extend(self.commit_text());
         }
         if clear_scene {
             self.text_edit = None;
+            self.selected = None;
             self.scene = crate::scene::Scene::default();
         }
         if let Some(pos) = start_text {
-            self.commit_text();
+            removed.extend(self.commit_text());
             self.text_edit = Some(TextDraft {
                 pos,
                 buf: String::new(),
                 color,
                 size: 24.0,
+                replaces: None,
             });
+        }
+        if let Some(i) = reedit_text {
+            removed.extend(self.commit_text());
+            if let Some(i) = removed
+                .iter()
+                .try_fold(i, |i, &gone| shifted_after_removal(i, gone))
+                && let Some(Shape::Text {
+                    pos,
+                    text,
+                    color,
+                    size,
+                }) = self.scene.shapes().get(i).cloned()
+            {
+                self.text_edit = Some(TextDraft {
+                    pos,
+                    buf: text,
+                    color,
+                    size,
+                    replaces: Some(i),
+                });
+                self.selected = None;
+            }
         }
         if let Some(s) = committed {
             if !matches!(s, Shape::Pixelate { .. } | Shape::Blur { .. }) {
@@ -2297,16 +2594,27 @@ impl OverlayApp {
         }
     }
 
-    fn commit_text(&mut self) {
-        if let Some(d) = self.text_edit.take() {
-            if !d.buf.trim().is_empty() {
-                crate::prefs::push_recent(&mut self.recent, d.color, &PALETTE);
-                self.scene.push(crate::scene::Shape::Text {
-                    pos: d.pos,
-                    text: d.buf,
-                    color: d.color,
-                    size: d.size,
-                });
+    fn commit_text(&mut self) -> Option<usize> {
+        let d = self.text_edit.take()?;
+        let color = d.color;
+        match apply_text(&mut self.scene, d) {
+            TextOutcome::Added => {
+                crate::prefs::push_recent(&mut self.recent, color, &PALETTE);
+                None
+            }
+            TextOutcome::Removed(i) => {
+                self.selected = self.selected.and_then(|s| shifted_after_removal(s, i));
+                Some(i)
+            }
+            TextOutcome::Kept | TextOutcome::Nothing => None,
+        }
+    }
+
+    fn recolor_selected(&mut self, i: usize) {
+        if let Some(shape) = self.scene.shapes().get(i) {
+            let new = crate::scene::recolored(shape, self.color);
+            if &new != shape {
+                self.scene.edit(i, crate::scene::Group::Colour, new);
             }
         }
     }
@@ -2546,6 +2854,92 @@ fn palette_color(digit: u32) -> Option<egui::Color32> {
 
 fn counter_radius(width: f32) -> f32 {
     10.0 + width * 2.0
+}
+
+const TEXT_SIZE_RANGE: (f32, f32) = (10.0, 120.0);
+const TEXT_SIZE_STEP: f32 = 2.0;
+const DUPLICATE_OFFSET: egui::Vec2 = egui::vec2(16.0, 16.0);
+
+fn scrolled_text_size(size: f32, acc: &mut f32, delta: f32) -> f32 {
+    *acc += delta;
+    let steps = (*acc / SCROLL_STEP).trunc();
+    *acc -= steps * SCROLL_STEP;
+    (size + steps * TEXT_SIZE_STEP).clamp(TEXT_SIZE_RANGE.0, TEXT_SIZE_RANGE.1)
+}
+
+fn is_marker(shape: &crate::scene::Shape) -> bool {
+    matches!(shape, crate::scene::Shape::Pen { color, .. } if color.a() < 255)
+}
+
+fn shape_width(shape: &crate::scene::Shape) -> Option<f32> {
+    use crate::scene::Shape;
+    match shape {
+        _ if is_marker(shape) => None,
+        Shape::Rect { width, .. }
+        | Shape::Ellipse { width, .. }
+        | Shape::Line { width, .. }
+        | Shape::Arrow { width, .. }
+        | Shape::Pen { width, .. } => Some(*width),
+        Shape::Counter { radius, .. } => Some((radius - counter_radius(0.0)) / 2.0),
+        _ => None,
+    }
+}
+
+fn with_width(shape: &crate::scene::Shape, new: f32) -> crate::scene::Shape {
+    use crate::scene::Shape;
+    let mut out = shape.clone();
+    if is_marker(shape) {
+        return out;
+    }
+    match &mut out {
+        Shape::Rect { width, .. }
+        | Shape::Ellipse { width, .. }
+        | Shape::Line { width, .. }
+        | Shape::Arrow { width, .. }
+        | Shape::Pen { width, .. } => *width = new,
+        Shape::Counter { radius, .. } => *radius = counter_radius(new),
+        _ => {}
+    }
+    out
+}
+
+fn reshaped(
+    shape: &crate::scene::Shape,
+    grip: crate::scene::Grip,
+    to: egui::Pos2,
+    shift: bool,
+    bounds: egui::Rect,
+) -> crate::scene::Shape {
+    use crate::scene::{Grip, Shape, Tool};
+    let mut out = shape.clone();
+    match (&mut out, grip) {
+        (Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. }, Grip::Box(h)) => {
+            let corner = [
+                rect.left_top(),
+                rect.right_top(),
+                rect.right_bottom(),
+                rect.left_bottom(),
+            ];
+            *rect = match h {
+                0 | 2 | 4 | 6 if shift => {
+                    let anchor = corner[(h / 2 + 2) % 4];
+                    egui::Rect::from_two_pos(
+                        anchor,
+                        constrain(Tool::Rect, anchor, to, true, bounds),
+                    )
+                }
+                _ => resize_rect(*rect, h, to),
+            };
+        }
+        (Shape::Line { from, to: end, .. } | Shape::Arrow { from, to: end, .. }, Grip::From) => {
+            *from = constrain(Tool::Line, *end, to, shift, bounds);
+        }
+        (Shape::Line { from, to: end, .. } | Shape::Arrow { from, to: end, .. }, Grip::To) => {
+            *end = constrain(Tool::Line, *from, to, shift, bounds);
+        }
+        _ => {}
+    }
+    out
 }
 
 fn constrain(
@@ -3144,6 +3538,320 @@ mod tests {
         );
         let mut acc = 0.0;
         assert_eq!(scrolled_width(3.0, &mut acc, 0.0), 3.0);
+    }
+
+    fn frame_bounds() -> egui::Rect {
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0))
+    }
+
+    fn boxed(rect: egui::Rect) -> crate::scene::Shape {
+        crate::scene::Shape::Rect {
+            rect,
+            color: egui::Color32::RED,
+            width: 3.0,
+        }
+    }
+
+    #[test]
+    fn a_corner_grip_resizes_from_the_opposite_corner() {
+        use crate::scene::Grip;
+        let base = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(200.0, 150.0));
+        let r = super::reshaped(
+            &boxed(base),
+            Grip::Box(4),
+            egui::pos2(260.0, 180.0),
+            false,
+            frame_bounds(),
+        );
+        assert_eq!(
+            r,
+            boxed(egui::Rect::from_min_max(
+                egui::pos2(100.0, 100.0),
+                egui::pos2(260.0, 180.0)
+            ))
+        );
+        let r = super::reshaped(
+            &boxed(base),
+            Grip::Box(1),
+            egui::pos2(500.0, 60.0),
+            false,
+            frame_bounds(),
+        );
+        assert_eq!(
+            r,
+            boxed(egui::Rect::from_min_max(
+                egui::pos2(100.0, 60.0),
+                egui::pos2(200.0, 150.0)
+            )),
+            "an edge grip moves one side only"
+        );
+        let r = super::reshaped(
+            &boxed(base),
+            Grip::Box(0),
+            egui::pos2(300.0, 300.0),
+            false,
+            frame_bounds(),
+        );
+        assert_eq!(
+            r,
+            boxed(egui::Rect::from_min_max(
+                egui::pos2(200.0, 150.0),
+                egui::pos2(300.0, 300.0)
+            )),
+            "dragging past the far corner flips"
+        );
+    }
+
+    #[test]
+    fn shift_on_a_corner_grip_keeps_the_box_square() {
+        use crate::scene::Grip;
+        let base = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(200.0, 150.0));
+        let r = super::reshaped(
+            &boxed(base),
+            Grip::Box(4),
+            egui::pos2(260.0, 180.0),
+            true,
+            frame_bounds(),
+        );
+        assert_eq!(
+            r,
+            boxed(egui::Rect::from_min_max(
+                egui::pos2(100.0, 100.0),
+                egui::pos2(260.0, 260.0)
+            ))
+        );
+        let e = crate::scene::Shape::Ellipse {
+            rect: base,
+            color: egui::Color32::RED,
+            width: 3.0,
+        };
+        match super::reshaped(
+            &e,
+            Grip::Box(0),
+            egui::pos2(20.0, 90.0),
+            true,
+            frame_bounds(),
+        ) {
+            crate::scene::Shape::Ellipse { rect, .. } => {
+                assert_eq!(rect.max, egui::pos2(200.0, 150.0));
+                assert_eq!(rect.width(), rect.height());
+            }
+            _ => panic!("not an ellipse"),
+        }
+    }
+
+    #[test]
+    fn line_grips_move_one_end_and_snap_with_shift() {
+        use crate::scene::{Grip, Shape};
+        let line = Shape::Arrow {
+            from: egui::pos2(100.0, 100.0),
+            to: egui::pos2(200.0, 100.0),
+            color: egui::Color32::RED,
+            width: 3.0,
+        };
+        match super::reshaped(
+            &line,
+            Grip::To,
+            egui::pos2(300.0, 140.0),
+            false,
+            frame_bounds(),
+        ) {
+            Shape::Arrow { from, to, .. } => {
+                assert_eq!(from, egui::pos2(100.0, 100.0));
+                assert_eq!(to, egui::pos2(300.0, 140.0));
+            }
+            _ => panic!("not an arrow"),
+        }
+        match super::reshaped(
+            &line,
+            Grip::From,
+            egui::pos2(195.0, 20.0),
+            true,
+            frame_bounds(),
+        ) {
+            Shape::Arrow { from, to, .. } => {
+                assert_eq!(to, egui::pos2(200.0, 100.0));
+                assert!((from.x - 200.0).abs() < 0.01, "{from:?}");
+                assert!(from.y < 100.0);
+            }
+            _ => panic!("not an arrow"),
+        }
+        let pen = Shape::Pen {
+            points: vec![egui::pos2(1.0, 1.0), egui::pos2(5.0, 5.0)],
+            color: egui::Color32::RED,
+            width: 3.0,
+        };
+        assert_eq!(
+            super::reshaped(
+                &pen,
+                Grip::To,
+                egui::pos2(50.0, 50.0),
+                false,
+                frame_bounds()
+            ),
+            pen
+        );
+    }
+
+    #[test]
+    fn width_goes_where_each_shape_keeps_it() {
+        use crate::scene::Shape;
+        let base = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0));
+        assert_eq!(super::shape_width(&boxed(base)), Some(3.0));
+        match super::with_width(&boxed(base), 9.0) {
+            Shape::Rect { width, .. } => assert_eq!(width, 9.0),
+            _ => panic!("not a rect"),
+        }
+        let c = Shape::Counter {
+            center: egui::pos2(0.0, 0.0),
+            number: 1,
+            color: egui::Color32::RED,
+            radius: super::counter_radius(4.0),
+        };
+        assert_eq!(super::shape_width(&c), Some(4.0));
+        match super::with_width(&c, 7.0) {
+            Shape::Counter { radius, .. } => assert_eq!(radius, super::counter_radius(7.0)),
+            _ => panic!("not a counter"),
+        }
+        let marker = Shape::Pen {
+            points: vec![egui::pos2(0.0, 0.0)],
+            color: super::marker_color(egui::Color32::RED),
+            width: 16.0,
+        };
+        assert_eq!(super::shape_width(&marker), None);
+        assert_eq!(super::with_width(&marker, 3.0), marker);
+        let text = Shape::Text {
+            pos: egui::pos2(0.0, 0.0),
+            text: "hi".into(),
+            color: egui::Color32::RED,
+            size: 24.0,
+        };
+        assert_eq!(super::shape_width(&text), None);
+        assert_eq!(super::with_width(&text, 3.0), text);
+    }
+
+    #[test]
+    fn the_wheel_steps_text_size_within_range() {
+        let mut acc = 0.0;
+        assert_eq!(
+            super::scrolled_text_size(24.0, &mut acc, super::SCROLL_STEP),
+            26.0
+        );
+        let mut acc = 0.0;
+        assert_eq!(
+            super::scrolled_text_size(24.0, &mut acc, -super::SCROLL_STEP),
+            22.0
+        );
+        let mut acc = 0.0;
+        assert_eq!(
+            super::scrolled_text_size(24.0, &mut acc, super::SCROLL_STEP / 2.0),
+            24.0
+        );
+        assert_eq!(
+            super::scrolled_text_size(24.0, &mut acc, super::SCROLL_STEP / 2.0),
+            26.0,
+            "small scrolls add up"
+        );
+        let mut acc = 0.0;
+        assert_eq!(
+            super::scrolled_text_size(super::TEXT_SIZE_RANGE.1, &mut acc, 500.0),
+            super::TEXT_SIZE_RANGE.1
+        );
+        let mut acc = 0.0;
+        assert_eq!(
+            super::scrolled_text_size(super::TEXT_SIZE_RANGE.0, &mut acc, -500.0),
+            super::TEXT_SIZE_RANGE.0
+        );
+    }
+
+    fn text_shape(text: &str) -> crate::scene::Shape {
+        crate::scene::Shape::Text {
+            pos: egui::pos2(10.0, 10.0),
+            text: text.into(),
+            color: egui::Color32::RED,
+            size: 24.0,
+        }
+    }
+
+    fn draft(text: &str, replaces: Option<usize>) -> super::TextDraft {
+        super::TextDraft {
+            pos: egui::pos2(10.0, 10.0),
+            buf: text.into(),
+            color: egui::Color32::RED,
+            size: 24.0,
+            replaces,
+        }
+    }
+
+    #[test]
+    fn indices_after_a_removal_shift_down() {
+        assert_eq!(super::shifted_after_removal(0, 1), Some(0));
+        assert_eq!(super::shifted_after_removal(1, 1), None);
+        assert_eq!(super::shifted_after_removal(2, 1), Some(1));
+        assert_eq!(super::shifted_after_removal(0, 0), None);
+    }
+
+    #[test]
+    fn a_new_text_is_added_and_a_blank_one_is_dropped() {
+        use super::TextOutcome;
+        let mut scene = crate::scene::Scene::default();
+        assert_eq!(
+            super::apply_text(&mut scene, draft("hi", None)),
+            TextOutcome::Added
+        );
+        assert_eq!(scene.shapes(), &[text_shape("hi")]);
+        assert_eq!(
+            super::apply_text(&mut scene, draft("   ", None)),
+            TextOutcome::Nothing
+        );
+        assert_eq!(scene.shapes().len(), 1);
+    }
+
+    #[test]
+    fn a_reedited_text_is_replaced_in_place_in_one_step() {
+        use super::TextOutcome;
+        let mut scene = crate::scene::Scene::default();
+        scene.push(text_shape("one"));
+        scene.push(text_shape("two"));
+        assert_eq!(
+            super::apply_text(&mut scene, draft("uno", Some(0))),
+            TextOutcome::Kept
+        );
+        assert_eq!(scene.shapes(), &[text_shape("uno"), text_shape("two")]);
+        scene.undo();
+        assert_eq!(scene.shapes(), &[text_shape("one"), text_shape("two")]);
+    }
+
+    #[test]
+    fn an_unchanged_reedit_adds_no_undo_step() {
+        use super::TextOutcome;
+        let mut scene = crate::scene::Scene::default();
+        scene.push(text_shape("one"));
+        assert_eq!(
+            super::apply_text(&mut scene, draft("one", Some(0))),
+            TextOutcome::Kept
+        );
+        scene.undo();
+        assert!(scene.shapes().is_empty());
+    }
+
+    #[test]
+    fn emptying_a_reedited_text_removes_it() {
+        use super::TextOutcome;
+        let mut scene = crate::scene::Scene::default();
+        scene.push(text_shape("one"));
+        scene.push(text_shape("two"));
+        assert_eq!(
+            super::apply_text(&mut scene, draft("", Some(0))),
+            TextOutcome::Removed(0)
+        );
+        assert_eq!(scene.shapes(), &[text_shape("two")]);
+        scene.undo();
+        assert_eq!(scene.shapes().len(), 2);
+        assert_eq!(
+            super::apply_text(&mut scene, draft("", Some(7))),
+            TextOutcome::Nothing
+        );
     }
 
     #[test]

@@ -108,7 +108,7 @@ impl Tool {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     Rect {
         rect: egui::Rect,
@@ -290,11 +290,19 @@ pub fn add_brush_cells(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Group {
+    Colour,
+    Width,
+    Nudge,
+}
+
 #[derive(Default)]
 pub struct Scene {
     shapes: Vec<Shape>,
     undo: Vec<Vec<Shape>>,
     redo: Vec<Vec<Shape>>,
+    group: Option<(Group, usize)>,
 }
 
 const MAX_HISTORY: usize = 200;
@@ -306,6 +314,7 @@ impl Scene {
             self.undo.remove(0);
         }
         self.redo.clear();
+        self.group = None;
     }
 
     pub fn push(&mut self, shape: Shape) {
@@ -314,12 +323,14 @@ impl Scene {
     }
 
     pub fn undo(&mut self) {
+        self.group = None;
         if let Some(prev) = self.undo.pop() {
             self.redo.push(std::mem::replace(&mut self.shapes, prev));
         }
     }
 
     pub fn redo(&mut self) {
+        self.group = None;
         if let Some(next) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.shapes, next));
         }
@@ -333,6 +344,130 @@ impl Scene {
         if let Some(s) = self.shapes.get_mut(idx) {
             *s = shape;
         }
+    }
+
+    pub fn edit(&mut self, idx: usize, group: Group, shape: Shape) {
+        if idx >= self.shapes.len() {
+            return;
+        }
+        if self.group != Some((group, idx)) {
+            self.begin_change();
+            self.group = Some((group, idx));
+        }
+        self.shapes[idx] = shape;
+    }
+
+    pub fn break_group(&mut self) {
+        self.group = None;
+    }
+
+    pub fn remove(&mut self, idx: usize) -> bool {
+        if idx >= self.shapes.len() {
+            return false;
+        }
+        self.begin_change();
+        self.shapes.remove(idx);
+        true
+    }
+
+    pub fn duplicate(&mut self, idx: usize, offset: egui::Vec2) -> Option<usize> {
+        let mut copy = translated(self.shapes.get(idx)?, offset);
+        if let Shape::Counter { number, .. } = &mut copy {
+            *number = next_counter(&self.shapes);
+        }
+        self.push(copy);
+        Some(self.shapes.len() - 1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Grip {
+    Box(usize),
+    From,
+    To,
+}
+
+pub fn bounds(shape: &Shape) -> Option<egui::Rect> {
+    match shape {
+        Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. } => Some(*rect),
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            Some(egui::Rect::from_two_pos(*from, *to))
+        }
+        Shape::Pen { points, .. } => {
+            let first = *points.first()?;
+            Some(
+                points
+                    .iter()
+                    .fold(egui::Rect::from_min_max(first, first), |r, p| {
+                        r.union(egui::Rect::from_min_max(*p, *p))
+                    }),
+            )
+        }
+        Shape::Text {
+            pos, text, size, ..
+        } => Some(text_box(*pos, text, *size)),
+        Shape::Counter { center, radius, .. } => Some(egui::Rect::from_center_size(
+            *center,
+            egui::Vec2::splat(radius * 2.0),
+        )),
+        Shape::Pixelate { .. } | Shape::Blur { .. } => None,
+    }
+}
+
+pub fn grips(shape: &Shape) -> Vec<(Grip, egui::Pos2)> {
+    match shape {
+        Shape::Rect { rect, .. } | Shape::Ellipse { rect, .. } => [
+            rect.left_top(),
+            rect.center_top(),
+            rect.right_top(),
+            rect.right_center(),
+            rect.right_bottom(),
+            rect.center_bottom(),
+            rect.left_bottom(),
+            rect.left_center(),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| (Grip::Box(i), p))
+        .collect(),
+        Shape::Line { from, to, .. } | Shape::Arrow { from, to, .. } => {
+            vec![(Grip::From, *from), (Grip::To, *to)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+pub fn recolored(shape: &Shape, new: egui::Color32) -> Shape {
+    let mut out = shape.clone();
+    match &mut out {
+        Shape::Rect { color, .. }
+        | Shape::Ellipse { color, .. }
+        | Shape::Line { color, .. }
+        | Shape::Arrow { color, .. }
+        | Shape::Text { color, .. }
+        | Shape::Counter { color, .. } => *color = new,
+        Shape::Pen { color, .. } => {
+            let alpha = color.a();
+            *color = egui::Color32::from_rgba_unmultiplied(new.r(), new.g(), new.b(), alpha);
+        }
+        Shape::Pixelate { .. } | Shape::Blur { .. } => {}
+    }
+    out
+}
+
+pub fn colour_of(shape: &Shape) -> Option<egui::Color32> {
+    match shape {
+        Shape::Rect { color, .. }
+        | Shape::Ellipse { color, .. }
+        | Shape::Line { color, .. }
+        | Shape::Arrow { color, .. }
+        | Shape::Text { color, .. }
+        | Shape::Counter { color, .. }
+        | Shape::Pen { color, .. } => {
+            let [r, g, b, _] = color.to_srgba_unmultiplied();
+            Some(egui::Color32::from_rgb(r, g, b))
+        }
+        Shape::Pixelate { .. } | Shape::Blur { .. } => None,
     }
 }
 
@@ -706,6 +841,219 @@ mod tests {
             color: Color32::RED,
             radius: 12.0,
         }
+    }
+
+    fn rect(color: Color32) -> Shape {
+        Shape::Rect {
+            rect: egui::Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 70.0)),
+            color,
+            width: 3.0,
+        }
+    }
+
+    fn marker_pen() -> Shape {
+        Shape::Pen {
+            points: vec![pos2(0.0, 0.0), pos2(40.0, 10.0)],
+            color: Color32::from_rgba_unmultiplied(255, 0, 0, 110),
+            width: 16.0,
+        }
+    }
+
+    #[test]
+    fn bounds_cover_what_can_be_selected() {
+        let r = egui::Rect::from_min_max(pos2(10.0, 20.0), pos2(110.0, 70.0));
+        assert_eq!(bounds(&rect(Color32::RED)), Some(r));
+        let line = Shape::Line {
+            from: pos2(50.0, 5.0),
+            to: pos2(10.0, 40.0),
+            color: Color32::RED,
+            width: 3.0,
+        };
+        assert_eq!(
+            bounds(&line),
+            Some(egui::Rect::from_min_max(pos2(10.0, 5.0), pos2(50.0, 40.0)))
+        );
+        let c = Shape::Counter {
+            center: pos2(100.0, 100.0),
+            number: 1,
+            color: Color32::RED,
+            radius: 12.0,
+        };
+        assert_eq!(
+            bounds(&c),
+            Some(egui::Rect::from_center_size(
+                pos2(100.0, 100.0),
+                egui::vec2(24.0, 24.0)
+            ))
+        );
+        assert_eq!(
+            bounds(&Shape::Blur {
+                points: vec![pos2(1.0, 1.0)],
+                radius: 16.0
+            }),
+            None
+        );
+        assert_eq!(
+            bounds(&Shape::Pixelate {
+                cell: 16.0,
+                cells: vec![]
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn boxes_have_eight_grips_and_lines_two() {
+        let g = grips(&rect(Color32::RED));
+        assert_eq!(g.len(), 8);
+        assert_eq!(g[0], (Grip::Box(0), pos2(10.0, 20.0)));
+        assert_eq!(g[4], (Grip::Box(4), pos2(110.0, 70.0)));
+        assert_eq!(g[7], (Grip::Box(7), pos2(10.0, 45.0)));
+        let arrow = Shape::Arrow {
+            from: pos2(1.0, 2.0),
+            to: pos2(30.0, 40.0),
+            color: Color32::RED,
+            width: 3.0,
+        };
+        assert_eq!(
+            grips(&arrow),
+            vec![(Grip::From, pos2(1.0, 2.0)), (Grip::To, pos2(30.0, 40.0))]
+        );
+        assert!(grips(&marker_pen()).is_empty());
+        assert!(grips(&counter(1)).is_empty());
+    }
+
+    #[test]
+    fn recolouring_keeps_geometry_and_marker_transparency() {
+        match recolored(&rect(Color32::RED), Color32::BLUE) {
+            Shape::Rect { color, width, rect } => {
+                assert_eq!(color, Color32::BLUE);
+                assert_eq!(width, 3.0);
+                assert_eq!(rect.min, pos2(10.0, 20.0));
+            }
+            _ => panic!("not a rect"),
+        }
+        match recolored(&marker_pen(), Color32::from_rgb(0, 0, 255)) {
+            Shape::Pen { color, width, .. } => {
+                assert_eq!(color, Color32::from_rgba_unmultiplied(0, 0, 255, 110));
+                assert_eq!(width, 16.0);
+            }
+            _ => panic!("not a pen"),
+        }
+        let blur = Shape::Blur {
+            points: vec![pos2(1.0, 1.0)],
+            radius: 16.0,
+        };
+        assert_eq!(recolored(&blur, Color32::BLUE), blur);
+    }
+
+    #[test]
+    fn the_colour_of_a_marker_reads_back_opaque() {
+        assert_eq!(colour_of(&marker_pen()), Some(Color32::from_rgb(255, 0, 0)));
+        assert_eq!(colour_of(&rect(Color32::GREEN)), Some(Color32::GREEN));
+        assert_eq!(
+            colour_of(&Shape::Pixelate {
+                cell: 16.0,
+                cells: vec![]
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_of_the_same_edit_is_one_undo_step() {
+        let mut scene = Scene::default();
+        scene.push(rect(Color32::RED));
+        scene.edit(0, Group::Width, rect(Color32::GREEN));
+        scene.edit(0, Group::Width, rect(Color32::BLUE));
+        assert_eq!(scene.shapes()[0], rect(Color32::BLUE));
+        scene.undo();
+        assert_eq!(scene.shapes()[0], rect(Color32::RED));
+        scene.undo();
+        assert!(scene.shapes().is_empty());
+    }
+
+    #[test]
+    fn a_different_edit_starts_a_new_undo_step() {
+        let mut scene = Scene::default();
+        scene.push(rect(Color32::RED));
+        scene.push(rect(Color32::WHITE));
+        scene.edit(0, Group::Colour, rect(Color32::GREEN));
+        scene.edit(0, Group::Width, rect(Color32::BLUE));
+        scene.edit(1, Group::Width, rect(Color32::BLACK));
+        scene.undo();
+        assert_eq!(scene.shapes()[1], rect(Color32::WHITE));
+        assert_eq!(scene.shapes()[0], rect(Color32::BLUE));
+        scene.undo();
+        assert_eq!(scene.shapes()[0], rect(Color32::GREEN));
+        scene.undo();
+        assert_eq!(scene.shapes()[0], rect(Color32::RED));
+    }
+
+    #[test]
+    fn undo_or_a_new_shape_ends_a_run_of_edits() {
+        let mut scene = Scene::default();
+        scene.push(rect(Color32::RED));
+        scene.edit(0, Group::Nudge, rect(Color32::GREEN));
+        scene.undo();
+        scene.edit(0, Group::Nudge, rect(Color32::BLUE));
+        scene.undo();
+        assert_eq!(scene.shapes()[0], rect(Color32::RED));
+
+        scene.edit(0, Group::Nudge, rect(Color32::GREEN));
+        scene.push(counter(1));
+        scene.edit(0, Group::Nudge, rect(Color32::BLUE));
+        scene.undo();
+        assert_eq!(scene.shapes()[0], rect(Color32::GREEN));
+        assert_eq!(scene.shapes().len(), 2);
+
+        scene.edit(0, Group::Nudge, rect(Color32::WHITE));
+        scene.break_group();
+        scene.edit(0, Group::Nudge, rect(Color32::BLACK));
+        scene.undo();
+        assert_eq!(scene.shapes()[0], rect(Color32::WHITE));
+    }
+
+    #[test]
+    fn removing_a_shape_can_be_undone() {
+        let mut scene = Scene::default();
+        scene.push(rect(Color32::RED));
+        scene.push(counter(1));
+        assert!(scene.remove(0));
+        assert_eq!(scene.shapes(), &[counter(1)]);
+        scene.undo();
+        assert_eq!(scene.shapes(), &[rect(Color32::RED), counter(1)]);
+        assert!(!scene.remove(2));
+        scene.undo();
+        assert_eq!(
+            scene.shapes(),
+            &[rect(Color32::RED)],
+            "a miss adds no undo step"
+        );
+    }
+
+    #[test]
+    fn duplicating_offsets_the_copy_on_top() {
+        let mut scene = Scene::default();
+        scene.push(rect(Color32::RED));
+        scene.push(counter(1));
+        assert_eq!(scene.duplicate(0, egui::vec2(16.0, 16.0)), Some(2));
+        assert_eq!(
+            scene.shapes()[2],
+            translated(&rect(Color32::RED), egui::vec2(16.0, 16.0))
+        );
+        assert_eq!(scene.duplicate(1, egui::vec2(16.0, 16.0)), Some(3));
+        match &scene.shapes()[3] {
+            Shape::Counter { number, center, .. } => {
+                assert_eq!(*number, 2);
+                assert_eq!(*center, pos2(16.0, 16.0));
+            }
+            _ => panic!("not a counter"),
+        }
+        assert_eq!(scene.duplicate(9, egui::vec2(16.0, 16.0)), None);
+        scene.undo();
+        scene.undo();
+        assert_eq!(scene.shapes().len(), 2);
     }
 
     #[test]
