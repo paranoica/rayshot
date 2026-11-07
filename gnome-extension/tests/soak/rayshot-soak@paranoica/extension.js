@@ -183,7 +183,8 @@ export default class SoakDriver extends Extension {
         waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
             const o = r._overlay;
             if (phase === 'warm' && !o.server) {
-                const crashed = GLib.get_monotonic_time() - this._lastSegv < 5 * GLib.USEC_PER_SEC;
+                const crashed = sessionServer && this._lastSegvServer === sessionServer &&
+                    this._lastSegv >= capturedAt;
                 if (!crashed) {
                     this._finish(`warm ${i}: session took the one-shot path`);
                     return;
