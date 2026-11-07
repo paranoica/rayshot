@@ -24,6 +24,8 @@ no flash, no screen-sharing prompt.
 - **What you see is what you get:** the picture is the frame on screen at the keypress.
 - **Lightshot flow:** select, annotate, Enter copies, the floppy saves.
 - **Tools:** pen, line, arrow, rectangle, ellipse, numbered markers, marker, text, pixelate, a real blur and a colour picker.
+- **Edit what you drew:** pick a shape up again to move, resize, recolour, duplicate or delete it; double-click text to change it.
+- **Copy text:** `Ctrl+Shift+C` reads the selection with Tesseract, on your machine, and puts the text on the clipboard.
 - **Multi-monitor:** select across monitors; the last selection is remembered.
 
 <div align="center">
@@ -40,7 +42,6 @@ no flash, no screen-sharing prompt.
 - [How it is tested](#how-it-is-tested)
 - [Usage](#usage)
 - [Troubleshooting](#troubleshooting)
-- [Ideas for later](#ideas-for-later)
 
 ## Install
 
@@ -70,7 +71,11 @@ gnome-extension/install.sh      # copies the extension to ~/.local/share
 ```
 
 At runtime rayshot needs `wl-clipboard` and a Vulkan driver, plus
-`xdg-desktop-portal` for the portal mode on other desktops.
+`xdg-desktop-portal` for the portal mode on other desktops. Copying text is
+optional and needs Tesseract with its language data: `tesseract`,
+`tesseract-data-eng` and `tesseract-data-rus` on Arch, `tesseract-ocr` and
+`tesseract-ocr-rus` on Debian and Ubuntu, `tesseract` and
+`tesseract-langpack-rus` on Fedora.
 
 ### From source
 
@@ -196,7 +201,7 @@ directions, and the tables say where.
 | Still picture to select on | at the keypress, ≈2 ms | at the keypress | after a portal call | after a portal call | not documented on GNOME | GNOME's own UI | n/a |
 | Arrows, text, shapes | yes | no | yes | yes | yes | yes | yes |
 | Blur / pixelate | both | no | pixelate | yes | yes | censor tool | Satty both, Swappy blur |
-| Upload, OCR | no | no | Imgur | Imgur, OCR plugin | OCR | upload, OCR | no |
+| Upload, OCR | OCR on your machine, never uploads | no | Imgur | Imgur, OCR plugin | OCR | upload, OCR | no |
 | Key to selection | ≈40 ms, measured | freezes at once, not measured | long delays reported on GNOME | not found | 1.5–2 s reported | not found | n/a |
 | Memory | 24 MB own, 146 MB resident | part of the shell | 36 MB on a Raspberry Pi | not found | 67 MB on a Raspberry Pi | not found | not found |
 
@@ -224,7 +229,7 @@ directions, and the tables say where.
 | Draw before copying | yes | yes | yes | afterwards, in a window | in a thumbnail editor | yes | yes |
 | Blur / pixelate | both | no | both | redact | no | redact | not found |
 | Upload | never | public prnt.sc links | many services | no | no | cloud | S3 |
-| OCR, scrolling capture | no | no | yes | OCR | no | yes | yes |
+| OCR, scrolling capture | OCR | no | yes | OCR | no | yes | yes |
 | Published speed | ≈40 ms, measured | not found | not found | not found | not found | not found | 17 ms to grab, 165 ms to show (vendor) |
 
 <details>
@@ -240,18 +245,19 @@ directions, and the tables say where.
 
 </details>
 
-**What rayshot does not do:** no upload, no OCR, no scrolling or window
-capture, no screen recording, and the fast path is GNOME only.
+**What rayshot does not do:** no upload, no scrolling or window capture, no
+screen recording, and the fast path is GNOME only.
 
 ## How it is tested
 
-- **Unit tests:** 68 in Rust and 5 suites for the extension (geometry, frame
+- **Unit tests:** 142 in Rust and 5 suites for the extension (geometry, frame
   format, respawn backoff, GNOME version shims, the memory metric).
 - **Soak test:** a headless GNOME Shell, a real rayshot and a driver extension
-  run 100 warm and 20 cold captures and then 15 scenarios, and fail on a leak
+  run 100 warm and 20 cold captures and then 16 scenarios, and fail on a leak
   in the editor process, in video memory or in GNOME Shell itself. The
   scenarios include:
   - Enter copies a PNG on both paths; a `wl-copy` that hangs closes the editor and leaves a notice
+  - `Ctrl+Shift+C` puts the recognised text on the clipboard, or says what to install when Tesseract is missing
   - an app taking the focus from the open editor; a key held through a cancelled capture
   - the warm process crashing while it opens its windows (replaced in under 300 ms) or failing again and again (it stops, says so, recovers)
   - a monitor unplugged and plugged back while the warm process waits, screens going to sleep, lock and unlock
@@ -280,14 +286,14 @@ Press the hotkey, drag a region, annotate, press Enter.
 | Key | Tool | | Key | Action |
 |---|---|---|---|---|
 | `S` / `V` | select, move, resize | | `Enter` / `Ctrl+C` | copy |
-| `P` | pen | | `Ctrl+S` | save to your pictures folder |
-| `L` | line | | `Ctrl+Shift+S` | save as… (choose folder and name) |
-| `A` | arrow | | `Ctrl+Z` | undo |
-| `R` | rectangle | | `Ctrl+Y` / `Ctrl+Shift+Z` | redo |
-| `E` | ellipse | | `Esc` | cancel |
-| `N` | numbered marker: click for 1, 2, 3… | | mouse wheel | line width |
-| `M` | marker | | `1`–`9` | colours |
-| `T` | text | | | |
+| `P` | pen | | `Ctrl+Shift+C` | copy the text (OCR) |
+| `L` | line | | `Ctrl+S` | save to your pictures folder |
+| `A` | arrow | | `Ctrl+Shift+S` | save as… (choose folder and name) |
+| `R` | rectangle | | `Ctrl+Z` | undo |
+| `E` | ellipse | | `Ctrl+Y` / `Ctrl+Shift+Z` | redo |
+| `N` | numbered marker: click for 1, 2, 3… | | `Esc` | cancel |
+| `M` | marker | | mouse wheel | line width |
+| `T` | text | | `1`–`9` | colours |
 | `X` | pixelate | | | |
 | `B` | blur | | | |
 | `I` | colour picker: copies `#RRGGBB` | | | |
@@ -296,8 +302,27 @@ Hold **Shift** while drawing for straight work, as in Paint: lines, arrows,
 the pen and the marker snap to 45° steps, rectangles become squares and
 ellipses become circles.
 
-The gear on the toolbar chooses which tools are shown; hidden tools keep their
-keys. Your colour, width and toolbar choice are remembered between captures.
+**Editing what you drew.** With the select tool (`S`), click a shape to pick
+it up: drag it from anywhere inside its dashed frame, or drag a round handle to
+resize a box or move the end of a line (Shift keeps squares, circles and 45°).
+While it is selected, the colours, the mouse wheel and the palette change that
+shape, `Delete` removes it, the arrow keys nudge it by 1 px (10 px with Shift),
+`Ctrl+D` duplicates it and `Esc` lets go. Double-click text to edit it.
+Blur and pixelate stay where they are, since they are cut from the picture
+underneath.
+
+**Colours.** The colour circle on the toolbar opens a colour square with a hue
+bar, a hex field, the nine palette colours and the ones you used recently.
+
+**Copying text.** `Ctrl+Shift+C` closes the editor at once and reads the
+selection with Tesseract in the background; a notice shows the first line when
+the text is on the clipboard, usually within a second. Your drawings are left
+out, but blur and pixelate are applied first, so hidden text stays hidden.
+Nothing leaves your machine.
+
+The gear on the toolbar chooses which tools and buttons are shown; hidden ones
+keep their keys. Your colour, width and toolbar choice are remembered between
+captures.
 
 **Where screenshots go.** Copying puts the image on the clipboard and keeps a
 temporary copy in `$XDG_RUNTIME_DIR/rayshot/`, which lives in RAM, is cleared
@@ -318,8 +343,11 @@ the file goes to `~/Pictures` if it exists, and only as a last resort to `/tmp`.
 | `rayshot` | portal mode: capture through the screenshot portal |
 | `rayshot shot [path]` | capture the whole desktop to a PNG through the portal |
 | `rayshot monitors` | list the detected monitors |
+| `rayshot ocr --print <png>` | print the text Tesseract reads in a PNG |
 
-`rayshot serve` and `rayshot overlay --live` are started by the extension.
+`rayshot serve`, `rayshot overlay --live`, `rayshot save-as` and
+`rayshot ocr <png>` without `--print` are started by the editor and the
+extension.
 
 | Variable | |
 |---|---|
@@ -338,6 +366,8 @@ the file goes to `~/Pictures` if it exists, and only as a last resort to `/tmp`.
 | "rayshot keeps failing to prepare its overlay" | the warm process failed five times in a row, so captures take the slower path. Look at `journalctl --user -b \| grep rayshot`, then run `rayshot warm off` and `rayshot warm on`. |
 | The screen freezes but no editor appears | the GPU may be out of video memory; a screen recorder with a replay buffer is a common cause. Check `nvidia-smi` or your driver's tool. |
 | The clipboard is empty after Enter | `wl-copy` did not get the focus in time; a notice says where the temporary copy is. |
+| "Install tesseract to copy text" | install Tesseract and its language data (see [Install](#any-other-distribution)). |
+| Copied text has mistakes | very small or low-contrast text reads worse; select a little more around it, or zoom in on the page first. Leading indentation in code is not kept. |
 | `Print` does nothing after removing the package | `gsettings reset org.gnome.shell.keybindings show-screenshot-ui` |
 | "rayshot was updated. Log out and back in…" | the package was upgraded while the old extension is still loaded: log out and back in. |
 | "rayshot was updated. Run rayshot install-hotkey Print…" | you came from the 0.1 daemon: run `rayshot install-hotkey Print` once. |
