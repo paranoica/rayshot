@@ -190,6 +190,7 @@ struct OverlayApp {
     stroke_width: f32,
     draft: Option<crate::scene::Shape>,
     draft_start: Option<egui::Pos2>,
+    straight_from: Option<usize>,
     pending: Option<Action>,
     sel_mode: Option<SelMode>,
     sel_ref: egui::Rect,
@@ -224,6 +225,7 @@ impl OverlayApp {
             stroke_width: 3.0,
             draft: None,
             draft_start: None,
+            straight_from: None,
             pending: None,
             sel_mode: None,
             sel_ref: egui::Rect::ZERO,
@@ -432,6 +434,8 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                // Shift reshapes a drawing on whichever monitor holds the drag.
+                self.request_redraw_all();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = self.windows[idx].window.scale_factor();
@@ -932,6 +936,10 @@ impl OverlayApp {
         let mut drag_start = self.drag_start;
         let mut draft = self.draft.clone();
         let mut draft_start = self.draft_start;
+        let mut straight_from = self.straight_from;
+        let shift = self.modifiers.shift_key();
+        let frame_rect =
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(frame_w, frame_h));
         let mut tool = self.tool;
         let mut color = self.color;
         let stroke_width = self.stroke_width;
@@ -1085,6 +1093,7 @@ impl OverlayApp {
                         if let Some(p) = cursor_pos {
                             let fp = to_frame(p);
                             draft_start = Some(fp);
+                            straight_from = None;
                             match tool {
                                 Tool::Pen => {
                                     draft = Some(Shape::Pen {
@@ -1136,7 +1145,10 @@ impl OverlayApp {
                                 Tool::Rect => {
                                     if let Some(st) = draft_start {
                                         draft = Some(Shape::Rect {
-                                            rect: egui::Rect::from_two_pos(st, fp),
+                                            rect: egui::Rect::from_two_pos(
+                                                st,
+                                                constrain(tool, st, fp, shift, frame_rect),
+                                            ),
                                             color,
                                             width: stroke_width,
                                         });
@@ -1146,7 +1158,7 @@ impl OverlayApp {
                                     if let Some(st) = draft_start {
                                         draft = Some(Shape::Line {
                                             from: st,
-                                            to: fp,
+                                            to: constrain(tool, st, fp, shift, frame_rect),
                                             color,
                                             width: stroke_width,
                                         });
@@ -1156,7 +1168,7 @@ impl OverlayApp {
                                     if let Some(st) = draft_start {
                                         draft = Some(Shape::Arrow {
                                             from: st,
-                                            to: fp,
+                                            to: constrain(tool, st, fp, shift, frame_rect),
                                             color,
                                             width: stroke_width,
                                         });
@@ -1164,7 +1176,14 @@ impl OverlayApp {
                                 }
                                 Tool::Pen | Tool::Marker => {
                                     if let Some(Shape::Pen { points, .. }) = &mut draft {
-                                        points.push(fp);
+                                        extend_stroke(
+                                            tool,
+                                            points,
+                                            &mut straight_from,
+                                            fp,
+                                            shift,
+                                            frame_rect,
+                                        );
                                     }
                                 }
                                 Tool::Pixelate => {
@@ -1196,6 +1215,7 @@ impl OverlayApp {
                     if resp.drag_stopped() {
                         committed = draft.take();
                         draft_start = None;
+                        straight_from = None;
                     }
                 }
             }
@@ -1637,6 +1657,7 @@ impl OverlayApp {
         self.drag_start = drag_start;
         self.draft = draft;
         self.draft_start = draft_start;
+        self.straight_from = straight_from;
         self.tool = tool;
         self.color = color;
         self.sel_mode = sel_mode;
@@ -2147,6 +2168,107 @@ impl OverlayApp {
     }
 }
 
+// Shift held while drawing: lines snap to 45 degree steps, rectangles turn
+// into squares, as in most paint programs.
+fn constrain(
+    tool: crate::scene::Tool,
+    from: egui::Pos2,
+    to: egui::Pos2,
+    shift: bool,
+    bounds: egui::Rect,
+) -> egui::Pos2 {
+    use crate::scene::Tool;
+    if !shift {
+        return to;
+    }
+    let d = to - from;
+    match tool {
+        Tool::Rect => {
+            // A drag straight along an axis grows the square toward the larger room.
+            let sign = |d: f32, from: f32, min: f32, max: f32| match d {
+                d if d > 0.0 => 1.0,
+                d if d < 0.0 => -1.0,
+                _ if max - from >= from - min => 1.0,
+                _ => -1.0,
+            };
+            let sx = sign(d.x, from.x, bounds.min.x, bounds.max.x);
+            let sy = sign(d.y, from.y, bounds.min.y, bounds.max.y);
+            let room_x = if sx > 0.0 {
+                bounds.max.x - from.x
+            } else {
+                from.x - bounds.min.x
+            };
+            let room_y = if sy > 0.0 {
+                bounds.max.y - from.y
+            } else {
+                from.y - bounds.min.y
+            };
+            let side = d.x.abs().max(d.y.abs()).min(room_x).min(room_y).max(0.0);
+            from + egui::vec2(sx * side, sy * side)
+        }
+        Tool::Line | Tool::Arrow | Tool::Pen | Tool::Marker => {
+            let len = d.length();
+            if len == 0.0 {
+                return to;
+            }
+            let step = (d.y.atan2(d.x) / std::f32::consts::FRAC_PI_4).round() as i32;
+            let (x, y) = match step.rem_euclid(8) {
+                0 => (1.0, 0.0),
+                1 => (1.0, 1.0),
+                2 => (0.0, 1.0),
+                3 => (-1.0, 1.0),
+                4 => (-1.0, 0.0),
+                5 => (-1.0, -1.0),
+                6 => (0.0, -1.0),
+                _ => (1.0, -1.0),
+            };
+            let dir = egui::vec2(x, y).normalized();
+            // Shorten rather than leave the frame, keeping the direction.
+            let room = |dir: f32, from: f32, min: f32, max: f32| match dir {
+                d if d > 0.0 => (max - from) / d,
+                d if d < 0.0 => (min - from) / d,
+                _ => f32::INFINITY,
+            };
+            let len = len
+                .min(room(dir.x, from.x, bounds.min.x, bounds.max.x))
+                .min(room(dir.y, from.y, bounds.min.y, bounds.max.y))
+                .max(0.0);
+            (from + dir * len).clamp(bounds.min, bounds.max)
+        }
+        _ => to,
+    }
+}
+
+fn extend_stroke(
+    tool: crate::scene::Tool,
+    points: &mut Vec<egui::Pos2>,
+    anchor: &mut Option<usize>,
+    to: egui::Pos2,
+    shift: bool,
+    bounds: egui::Rect,
+) {
+    if !shift {
+        *anchor = None;
+        points.push(to);
+        return;
+    }
+    // Shift pressed mid-stroke draws straight on from the last point and keeps
+    // what was drawn freehand before it.
+    let at = match *anchor {
+        Some(at) if at < points.len() => at,
+        _ => {
+            let Some(last) = points.len().checked_sub(1) else {
+                points.push(to);
+                return;
+            };
+            *anchor = Some(last);
+            last
+        }
+    };
+    points.truncate(at + 1);
+    points.push(constrain(tool, points[at], to, true, bounds));
+}
+
 /// The selection a drag made over the freeze before the overlay appeared.
 fn forwarded_selection(
     from: (f32, f32),
@@ -2232,7 +2354,224 @@ mod tests {
     use super::see_through_alpha;
     use super::surface_needs_configure;
 
+    use super::constrain;
+    use super::extend_stroke;
     use super::forwarded_selection;
+    use crate::scene::Tool;
+    use egui::pos2;
+
+    const ANY: egui::Rect = egui::Rect::EVERYTHING;
+
+    fn close(a: egui::Pos2, b: egui::Pos2) -> bool {
+        (a - b).length() < 1e-3
+    }
+
+    #[test]
+    fn shift_snaps_lines_and_arrows_to_the_nearest_45_degrees() {
+        let o = pos2(100.0, 100.0);
+        for tool in [Tool::Line, Tool::Arrow, Tool::Pen, Tool::Marker] {
+            let east = constrain(tool, o, pos2(150.0, 104.0), true, ANY);
+            assert_eq!(east.y, 100.0, "horizontal stays on the row");
+            assert!(east.x > 100.0);
+            let south = constrain(tool, o, pos2(97.0, 160.0), true, ANY);
+            assert_eq!(south.x, 100.0, "vertical stays on the column");
+            assert!(south.y > 100.0);
+            let west = constrain(tool, o, pos2(40.0, 98.0), true, ANY);
+            assert_eq!(west.y, 100.0);
+            assert!(west.x < 100.0);
+            let north = constrain(tool, o, pos2(102.0, 30.0), true, ANY);
+            assert_eq!(north.x, 100.0);
+            assert!(north.y < 100.0);
+            let diagonal = constrain(tool, o, pos2(140.0, 64.0), true, ANY);
+            assert!(
+                ((diagonal.x - 100.0) - (100.0 - diagonal.y)).abs() < 1e-3,
+                "45 degrees up and right"
+            );
+        }
+    }
+
+    #[test]
+    fn snapping_keeps_the_length_of_the_drag() {
+        let o = pos2(0.0, 0.0);
+        let to = pos2(30.0, 40.0);
+        assert!(((constrain(Tool::Line, o, to, true, ANY) - o).length() - 50.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn the_split_between_directions_is_at_22_5_degrees() {
+        let o = pos2(0.0, 0.0);
+        let below = 21.0_f32.to_radians();
+        let above = 24.0_f32.to_radians();
+        let flat = constrain(
+            Tool::Line,
+            o,
+            pos2(below.cos() * 100.0, below.sin() * 100.0),
+            true,
+            ANY,
+        );
+        assert_eq!(flat.y, 0.0);
+        let tilted = constrain(
+            Tool::Line,
+            o,
+            pos2(above.cos() * 100.0, above.sin() * 100.0),
+            true,
+            ANY,
+        );
+        assert!((tilted.x - tilted.y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn shift_makes_a_rectangle_square_in_the_drag_direction() {
+        let o = pos2(10.0, 10.0);
+        assert!(close(
+            constrain(Tool::Rect, o, pos2(30.0, 14.0), true, ANY),
+            pos2(30.0, 30.0)
+        ));
+        assert!(close(
+            constrain(Tool::Rect, o, pos2(4.0, 40.0), true, ANY),
+            pos2(-20.0, 40.0)
+        ));
+        assert!(close(
+            constrain(Tool::Rect, o, pos2(-10.0, -2.0), true, ANY),
+            pos2(-10.0, -10.0)
+        ));
+        assert!(close(
+            constrain(Tool::Rect, o, pos2(10.0, 25.0), true, ANY),
+            pos2(25.0, 25.0)
+        ));
+    }
+
+    #[test]
+    fn a_zero_length_drag_stays_put() {
+        let o = pos2(5.0, 5.0);
+        for tool in [Tool::Line, Tool::Arrow, Tool::Rect, Tool::Pen, Tool::Marker] {
+            assert_eq!(constrain(tool, o, o, true, ANY), o);
+        }
+    }
+
+    #[test]
+    fn a_snapped_end_stays_inside_the_frame() {
+        let frame = egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1920.0, 1080.0));
+        let square = constrain(
+            Tool::Rect,
+            pos2(100.0, 1000.0),
+            pos2(600.0, 1080.0),
+            true,
+            frame,
+        );
+        assert!(close(square, pos2(180.0, 1080.0)), "{square:?}");
+        let end = constrain(
+            Tool::Line,
+            pos2(1900.0, 500.0),
+            pos2(1920.0, 540.0),
+            true,
+            frame,
+        );
+        assert!(end.x <= 1920.0 && end.y <= 1080.0, "{end:?}");
+        assert!(
+            ((end.x - 1900.0) - (end.y - 500.0)).abs() < 1e-3,
+            "still on the diagonal: {end:?}"
+        );
+        assert!(end.x > 1910.0, "shortened only as far as the edge: {end:?}");
+        let along_edge = constrain(
+            Tool::Rect,
+            pos2(100.0, 1080.0),
+            pos2(300.0, 1080.0),
+            true,
+            frame,
+        );
+        assert!(
+            close(along_edge, pos2(300.0, 880.0)),
+            "grows into the frame: {along_edge:?}"
+        );
+    }
+
+    #[test]
+    fn shift_mid_stroke_keeps_what_was_drawn() {
+        let frame = ANY;
+        let mut points = vec![pos2(0.0, 0.0), pos2(5.0, 3.0), pos2(9.0, 8.0)];
+        let mut anchor = None;
+        extend_stroke(
+            Tool::Pen,
+            &mut points,
+            &mut anchor,
+            pos2(60.0, 10.0),
+            true,
+            frame,
+        );
+        assert_eq!(
+            &points[..3],
+            &[pos2(0.0, 0.0), pos2(5.0, 3.0), pos2(9.0, 8.0)]
+        );
+        assert_eq!(points.len(), 4);
+        assert_eq!(points[3].y, 8.0, "straight from the last point");
+        extend_stroke(
+            Tool::Pen,
+            &mut points,
+            &mut anchor,
+            pos2(9.0, 70.0),
+            true,
+            frame,
+        );
+        assert_eq!(points.len(), 4, "the straight part follows the cursor");
+        assert_eq!(points[3].x, 9.0);
+        extend_stroke(
+            Tool::Pen,
+            &mut points,
+            &mut anchor,
+            pos2(20.0, 75.0),
+            false,
+            frame,
+        );
+        assert_eq!(points.len(), 5, "freehand again after Shift");
+        assert_eq!(points[4], pos2(20.0, 75.0));
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn shift_from_the_start_draws_one_straight_stroke() {
+        let mut points = vec![pos2(10.0, 10.0)];
+        let mut anchor = None;
+        extend_stroke(
+            Tool::Marker,
+            &mut points,
+            &mut anchor,
+            pos2(200.0, 14.0),
+            true,
+            ANY,
+        );
+        extend_stroke(
+            Tool::Marker,
+            &mut points,
+            &mut anchor,
+            pos2(300.0, 6.0),
+            true,
+            ANY,
+        );
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0], pos2(10.0, 10.0));
+        assert_eq!(points[1].y, 10.0);
+    }
+
+    #[test]
+    fn without_shift_or_for_other_tools_nothing_changes() {
+        let o = pos2(100.0, 100.0);
+        let to = pos2(137.0, 121.0);
+        for tool in [
+            Tool::Line,
+            Tool::Arrow,
+            Tool::Rect,
+            Tool::Pen,
+            Tool::Marker,
+            Tool::Blur,
+            Tool::Pixelate,
+        ] {
+            assert_eq!(constrain(tool, o, to, false, ANY), to);
+        }
+        for tool in [Tool::Blur, Tool::Pixelate, Tool::Select, Tool::Text] {
+            assert_eq!(constrain(tool, o, to, true, ANY), to);
+        }
+    }
     use wgpu::CompositeAlphaMode::{Auto, Inherit, Opaque, PostMultiplied, PreMultiplied};
 
     fn rect(x0: f32, y0: f32, x1: f32, y1: f32) -> Option<egui::Rect> {
