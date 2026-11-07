@@ -342,7 +342,7 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
-fn wait_bounded(
+pub fn wait_bounded(
     child: &mut std::process::Child,
     timeout: std::time::Duration,
 ) -> Result<std::process::ExitStatus> {

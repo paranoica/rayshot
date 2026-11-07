@@ -220,6 +220,7 @@ export default class SoakDriver extends Extension {
             next => this._coldCopies(next),
             next => this._copyFails(next),
             next => this._coldCopyFails(next),
+            next => this._copiesText(next),
             next => this._focusStolen(next),
             next => this._heldKey(next),
             next => this._spareCrashes(next),
@@ -340,6 +341,95 @@ export default class SoakDriver extends Extension {
             disarm();
             this._finish(`${name}: overlay did not show`);
         });
+    }
+
+    _copiesText(next) {
+        const r = this._rayshot;
+        const name = 'ctrl shift c copies the text';
+        const tesseract = GLib.find_program_in_path('tesseract') !== null;
+        const scratch = GLib.build_filenamev([GLib.get_user_runtime_dir(), 'rayshot']);
+        const pngs = () => {
+            const [, out] = GLib.spawn_command_line_sync(`find ${GLib.shell_quote(scratch)} -maxdepth 1 -name '*.png'`);
+            return new TextDecoder().decode(out).split('\n').filter(Boolean);
+        };
+        const kept = new Set(pngs());
+        const label = new St.Label({
+            text: 'RAYSHOT 4217', x: 120, y: 120,
+            style: 'background-color: #ffffff; color: #000000; font-size: 40px; padding: 20px;',
+        });
+        Main.layoutManager.uiGroup.add_child(label);
+        const clipboard = St.Clipboard.get_default();
+        clipboard.set_text(St.ClipboardType.CLIPBOARD, 'rayshot-soak-marker');
+        const before = new Set(Main.messageTray.getSources().flatMap(src => src.notifications ?? []));
+        const notice = () => Main.messageTray.getSources()
+            .flatMap(src => src.notifications ?? [])
+            .find(n => !before.has(n) && /tesseract/i.test(noticeText(n)));
+        let copied = '';
+        const poll = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 200, () => {
+            clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c, text) => {
+                copied = text ?? '';
+            });
+            return GLib.SOURCE_CONTINUE;
+        });
+        const cleanup = () => {
+            GLib.source_remove(poll);
+            label.destroy();
+        };
+        const done = (ok, detail) => {
+            cleanup();
+            const left = pngs().filter(f => !kept.has(f));
+            if (ok && left.length)
+                this._result(name, false, `${detail}; left behind: ${left.join(', ')}`);
+            else
+                this._result(name, ok, detail);
+            next();
+        };
+        const press = () => {
+            const k = this._keyboard;
+            const t = GLib.get_monotonic_time();
+            const keys = [Clutter.KEY_Control_L, Clutter.KEY_Shift_L, Clutter.KEY_c];
+            keys.forEach((key, i) => k.notify_keyval(t + i * 1000, key, Clutter.KeyState.PRESSED));
+            [...keys].reverse().forEach((key, i) =>
+                k.notify_keyval(t + (keys.length + i) * 1000, key, Clutter.KeyState.RELEASED));
+        };
+        const id = global.stage.connect('after-paint', () => {
+            global.stage.disconnect(id);
+            r._capture();
+            waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
+                const o = r._overlay;
+                try {
+                    o.proc.get_stdin_pipe().write_all(
+                        new TextEncoder().encode(`select ${o.session} 100 100 600 300\n`), null);
+                } catch (e) {
+                    cleanup();
+                    this._finish(`${name}: cannot select: ${e.message}`);
+                    return;
+                }
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+                    press();
+                    waitFor(() => !r._busy, () => {
+                        if (tesseract) {
+                            waitFor(() => copied.includes('4217'),
+                                () => done(true, `clipboard holds "${copied.trim()}"`),
+                                () => done(false, `clipboard holds "${copied}"`), 20000);
+                        } else {
+                            waitFor(() => notice(),
+                                () => done(true, `no tesseract, notified: "${noticeText(notice())}"`),
+                                () => done(false, 'no tesseract and no notice'), 20000);
+                        }
+                    }, () => {
+                        cleanup();
+                        this._result(name, false, 'overlay did not close after ctrl shift c');
+                        this._endSession(next);
+                    });
+                    return GLib.SOURCE_REMOVE;
+                });
+            }, () => {
+                cleanup();
+                this._finish(`${name}: overlay did not show`);
+            });
+        });
+        global.stage.queue_redraw();
     }
 
     _copies(next, name = 'enter copies the selection', cold = false) {

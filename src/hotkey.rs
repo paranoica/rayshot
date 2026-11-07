@@ -203,6 +203,23 @@ pub fn retire_daemon() -> Result<()> {
     Ok(())
 }
 
+pub fn gvariant_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn desktop_notice(summary: &str, body: &str) {
     let _ = Command::new("gdbus")
         .args([
@@ -214,14 +231,17 @@ pub fn desktop_notice(summary: &str, body: &str) {
             "/org/freedesktop/Notifications",
             "--method",
             "org.freedesktop.Notifications.Notify",
-            "rayshot",
-            "uint32 0",
-            "",
-            summary,
-            body,
-            "@as []",
-            "@a{sv} {}",
-            "int32 0",
+            "--",
+        ])
+        .args([
+            gvariant_string("rayshot"),
+            "uint32 0".to_string(),
+            gvariant_string(""),
+            gvariant_string(summary),
+            gvariant_string(body),
+            "@as []".to_string(),
+            "@a{sv} {}".to_string(),
+            "int32 0".to_string(),
         ])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -339,6 +359,16 @@ pub fn uninstall() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notice_text_goes_to_gdbus_as_a_plain_string() {
+        assert_eq!(gvariant_string("hello"), "\"hello\"");
+        assert_eq!(gvariant_string("- item"), "\"- item\"");
+        assert_eq!(gvariant_string("'quoted'"), "\"'quoted'\"");
+        assert_eq!(gvariant_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(gvariant_string("one\ntwo\tx"), "\"one\\ntwo\\tx\"");
+        assert_eq!(gvariant_string(""), "\"\"");
+    }
 
     const OTHER: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom0/";
 

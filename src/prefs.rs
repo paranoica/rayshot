@@ -5,16 +5,18 @@ use crate::scene::Tool;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     Copy,
+    CopyText,
     Save,
     SaveAs,
 }
 
 impl Button {
-    pub const ALL: [Button; 3] = [Button::Copy, Button::Save, Button::SaveAs];
+    pub const ALL: [Button; 4] = [Button::Copy, Button::CopyText, Button::Save, Button::SaveAs];
 
     pub fn name(self) -> &'static str {
         match self {
             Button::Copy => "copy",
+            Button::CopyText => "copy-text",
             Button::Save => "save",
             Button::SaveAs => "save-as",
         }

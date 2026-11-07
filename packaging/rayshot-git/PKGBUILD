@@ -8,7 +8,10 @@ arch=('x86_64')
 url="https://github.com/paranoica/rayshot"
 license=('MIT')
 depends=('wl-clipboard' 'xdg-desktop-portal' 'vulkan-icd-loader')
-optdepends=('gnome-shell: instant capture and the Print hotkey through the bundled extension')
+optdepends=('gnome-shell: instant capture and the Print hotkey through the bundled extension'
+            'tesseract: copy the text in a selection (Ctrl+Shift+C)'
+            'tesseract-data-eng: English text recognition'
+            'tesseract-data-rus: Russian text recognition')
 makedepends=('cargo' 'glib2' 'git')
 provides=('rayshot')
 conflicts=('rayshot')

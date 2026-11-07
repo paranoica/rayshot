@@ -149,6 +149,7 @@ enum SessionEnd {
 #[derive(Clone, Copy)]
 enum Action {
     Copy,
+    CopyText,
     Save,
     SaveAs,
     Close,
@@ -324,6 +325,32 @@ fn apply_text(scene: &mut crate::scene::Scene, d: TextDraft) -> TextOutcome {
     }
 }
 
+fn launch_path(
+    current: Option<std::path::PathBuf>,
+    exists: &dyn Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    current
+        .filter(|p| exists(p))
+        .unwrap_or_else(|| std::path::PathBuf::from("/proc/self/exe"))
+}
+
+fn spawn_detached(command: &str, file: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::process::CommandExt;
+    let exe = launch_path(std::env::current_exe().ok(), &|p| p.exists());
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg(command)
+        .arg(file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn().map(drop)
+}
+
 fn shifted_after_removal(idx: usize, removed: usize) -> Option<usize> {
     match idx.cmp(&removed) {
         std::cmp::Ordering::Less => Some(idx),
@@ -497,6 +524,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                         Some(Action::Copy) => self.finish_and_exit(event_loop),
                         Some(Action::Save) => self.save_and_exit(event_loop),
                         Some(Action::SaveAs) => self.save_as_and_exit(event_loop),
+                        Some(Action::CopyText) => self.copy_text_and_exit(event_loop),
                         _ => {}
                     }
                 } else {
@@ -613,6 +641,8 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             self.close(event_loop);
                         } else if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
                             self.finish_and_exit(event_loop);
+                        } else if ctrl && shift && is(KeyCode::KeyC) {
+                            self.copy_text_and_exit(event_loop);
                         } else if ctrl && is(KeyCode::KeyC) {
                             self.finish_and_exit(event_loop);
                         } else if ctrl && is(KeyCode::KeyS) {
@@ -720,6 +750,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                     Some(Action::Copy) => self.finish_and_exit(event_loop),
                     Some(Action::Save) => self.save_and_exit(event_loop),
                     Some(Action::SaveAs) => self.save_as_and_exit(event_loop),
+                    Some(Action::CopyText) => self.copy_text_and_exit(event_loop),
                     Some(Action::Close) => {
                         eprintln!("[rayshot] exit: toolbar close");
                         self.close(event_loop);
@@ -2034,6 +2065,7 @@ impl OverlayApp {
                                     use egui_phosphor::regular as p;
                                     for (button, act) in [
                                         (Button::Copy, Action::Copy),
+                                        (Button::CopyText, Action::CopyText),
                                         (Button::Save, Action::Save),
                                         (Button::SaveAs, Action::SaveAs),
                                     ] {
@@ -2399,7 +2431,7 @@ impl OverlayApp {
         Some(image::imageops::crop_imm(&full, x, y, x2 - x, y2 - y).to_image())
     }
 
-    fn render_selection_to_image(&self) -> Result<Option<image::RgbaImage>> {
+    fn render_selection_to_image(&self, redactions_only: bool) -> Result<Option<image::RgbaImage>> {
         let shared = self.shared.as_ref().context("gpu not initialized")?;
         let frame = self.frame.as_ref().context("frame not captured")?;
         let Some(sel) = self.selection else {
@@ -2471,7 +2503,13 @@ impl OverlayApp {
             ui.painter()
                 .image(frame_tex_id, rect, uv, egui::Color32::WHITE);
             let to_screen = |p: egui::Pos2| egui::pos2(p.x - sel_min.x, p.y - sel_min.y);
-            for s in shapes {
+            let redaction = |s: &&crate::scene::Shape| {
+                matches!(
+                    s,
+                    crate::scene::Shape::Blur { .. } | crate::scene::Shape::Pixelate { .. }
+                )
+            };
+            for s in shapes.iter().filter(|s| !redactions_only || redaction(s)) {
                 crate::scene::paint(
                     ui.painter(),
                     s,
@@ -2578,7 +2616,7 @@ impl OverlayApp {
 
     fn finish(&self) -> Result<Option<std::path::PathBuf>> {
         let render_started = std::time::Instant::now();
-        let img = match self.render_selection_to_image() {
+        let img = match self.render_selection_to_image(false) {
             Ok(Some(img)) => img,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -2763,12 +2801,10 @@ impl OverlayApp {
     }
 
     fn save_as_and_exit(&mut self, event_loop: &ActiveEventLoop) {
-        use std::os::unix::process::CommandExt;
-
         if self.defer_until_frame(Action::SaveAs) {
             return;
         }
-        let png = match self.render_selection_to_image() {
+        let png = match self.render_selection_to_image(false) {
             Ok(Some(img)) => crate::export::to_png_bytes(&img),
             Ok(None) => {
                 eprintln!("[rayshot] nothing to save (no selection)");
@@ -2786,22 +2822,8 @@ impl OverlayApp {
                 return;
             }
         };
-        let spawned = std::env::current_exe().and_then(|exe| {
-            let mut cmd = std::process::Command::new(exe);
-            cmd.arg("save-as")
-                .arg(&path)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null());
-            unsafe {
-                cmd.pre_exec(|| {
-                    libc::setsid();
-                    Ok(())
-                });
-            }
-            cmd.spawn()
-        });
-        match spawned {
-            Ok(_) => {
+        match spawn_detached("save-as", &path) {
+            Ok(()) => {
                 eprintln!(
                     "[rayshot] kept a copy at {}, asking where to save",
                     path.display()
@@ -2812,11 +2834,47 @@ impl OverlayApp {
         }
     }
 
+    fn copy_text_and_exit(&mut self, event_loop: &ActiveEventLoop) {
+        if self.defer_until_frame(Action::CopyText) {
+            return;
+        }
+        let img = match self.render_selection_to_image(true) {
+            Ok(Some(img)) => img,
+            Ok(None) => {
+                eprintln!("[rayshot] nothing to read (no selection)");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[rayshot] copy text render failed: {e:#}");
+                return;
+            }
+        };
+        let path = match crate::export::to_png_bytes(&img)
+            .and_then(|png| crate::export::save_to_scratch(&png))
+        {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("[rayshot] copy text failed: {e:#}");
+                return;
+            }
+        };
+        match spawn_detached("ocr", &path) {
+            Ok(()) => {
+                eprintln!("[rayshot] reading text from {}", path.display());
+                self.close(event_loop);
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&path);
+                eprintln!("[rayshot] copy text failed to start: {e}");
+            }
+        }
+    }
+
     fn save_and_exit(&mut self, event_loop: &ActiveEventLoop) {
         if self.defer_until_frame(Action::Save) {
             return;
         }
-        let img = match self.render_selection_to_image() {
+        let img = match self.render_selection_to_image(false) {
             Ok(Some(img)) => img,
             Ok(None) => {
                 eprintln!("[rayshot] nothing to save (no selection)");
@@ -3122,6 +3180,7 @@ fn button_meta(button: Button) -> (&'static str, &'static str, &'static str) {
     use egui_phosphor::regular as p;
     match button {
         Button::Copy => (p::COPY, "Copy", "Enter"),
+        Button::CopyText => (p::TEXT_AA, "Copy text", "Ctrl Shift C"),
         Button::Save => (p::FLOPPY_DISK, "Save", "Ctrl S"),
         Button::SaveAs => (p::FOLDER_OPEN, "Save as…", "Ctrl Shift S"),
     }
@@ -3137,7 +3196,7 @@ fn colour_button(ui: &mut egui::Ui, color: egui::Color32, open: bool) -> egui::R
     painter.circle_stroke(
         rect.center(),
         9.0,
-        egui::Stroke::new(1.5, egui::Color32::from_white_alpha(210)),
+        egui::Stroke::new(1.5f32, egui::Color32::from_white_alpha(210)),
     );
     resp
 }
@@ -3237,7 +3296,7 @@ fn swatch_row(
             painter.circle_stroke(
                 r.center(),
                 radius + 3.0,
-                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                egui::Stroke::new(2.0f32, egui::Color32::WHITE),
             );
         }
         painter.circle_filled(
@@ -3248,7 +3307,7 @@ fn swatch_row(
         painter.circle_stroke(
             r.center(),
             radius,
-            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40)),
+            egui::Stroke::new(1.0f32, egui::Color32::from_white_alpha(40)),
         );
         if resp.clicked() {
             chosen = Some(*c);
@@ -3267,7 +3326,7 @@ fn colour_panel(
     const WIDTH: f32 = 198.0;
     sync_hsv(hsv, *color);
     ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
-    let edge = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30));
+    let edge = egui::Stroke::new(1.0f32, egui::Color32::from_white_alpha(30));
     let hex_id = egui::Id::new("rayshot-hex");
 
     let (sv_rect, sv) =
@@ -3292,11 +3351,11 @@ fn colour_panel(
     );
     ui.painter().circle_filled(knob, 6.0, *color);
     ui.painter()
-        .circle_stroke(knob, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+        .circle_stroke(knob, 7.0, egui::Stroke::new(2.0f32, egui::Color32::WHITE));
     ui.painter().circle_stroke(
         knob,
         8.5,
-        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(90)),
+        egui::Stroke::new(1.0f32, egui::Color32::from_black_alpha(90)),
     );
 
     let (hue_rect, hue) =
@@ -3324,7 +3383,7 @@ fn colour_panel(
     ui.painter().rect_stroke(
         handle,
         3,
-        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(120)),
+        egui::Stroke::new(1.0f32, egui::Color32::from_black_alpha(120)),
         egui::StrokeKind::Outside,
     );
 
@@ -3402,7 +3461,7 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
 
 fn keycap(ui: &mut egui::Ui, key: &str) {
     egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0, ui.visuals().weak_text_color()))
+        .stroke(egui::Stroke::new(1.0f32, ui.visuals().weak_text_color()))
         .corner_radius(4)
         .inner_margin(egui::Margin::symmetric(5, 1))
         .show(ui, |ui| {
@@ -3828,6 +3887,23 @@ mod tests {
             radius: 16.0,
         };
         assert_eq!(super::selection_outline(&blur, &to_screen, 2.0), None);
+    }
+
+    #[test]
+    fn helpers_start_from_the_installed_binary_unless_it_was_replaced() {
+        let exists = |p: &std::path::Path| p == std::path::Path::new("/usr/bin/rayshot");
+        assert_eq!(
+            super::launch_path(Some("/usr/bin/rayshot".into()), &exists),
+            std::path::PathBuf::from("/usr/bin/rayshot")
+        );
+        assert_eq!(
+            super::launch_path(Some("/usr/bin/rayshot (deleted)".into()), &exists),
+            std::path::PathBuf::from("/proc/self/exe")
+        );
+        assert_eq!(
+            super::launch_path(None, &exists),
+            std::path::PathBuf::from("/proc/self/exe")
+        );
     }
 
     #[test]

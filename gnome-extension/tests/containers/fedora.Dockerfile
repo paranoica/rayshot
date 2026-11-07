@@ -9,5 +9,5 @@ RUN if [ -n "$ARCHIVED" ]; then sed -i -e 's|^metalink=|#metalink=|' \
 RUN dnf -y install --setopt=install_weak_deps=False \
         gnome-shell gjs gtk4 mesa-vulkan-drivers mesa-dri-drivers vulkan-loader \
         dbus-daemon dbus-tools wl-clipboard glib2 procps-ng findutils gawk \
-        xorg-x11-server-Xwayland abattis-cantarell-fonts \
+        xorg-x11-server-Xwayland abattis-cantarell-fonts tesseract tesseract-langpack-eng \
     && dnf clean all

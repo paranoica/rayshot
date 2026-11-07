@@ -3,6 +3,7 @@ mod capture;
 mod export;
 mod hotkey;
 mod live;
+mod ocr;
 mod overlay;
 mod prefs;
 mod scene;
@@ -75,6 +76,18 @@ fn main() -> Result<()> {
                     };
                     hotkey::desktop_notice("rayshot could not save the screenshot", &body);
                 }
+            }
+            return Ok(());
+        }
+        Some("ocr") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            let print = args.iter().any(|a| a == "--print");
+            let png = args
+                .iter()
+                .find(|a| !a.starts_with("--"))
+                .context("ocr needs the PNG to read")?;
+            if !ocr::run(std::path::Path::new(png), print) {
+                std::process::exit(1);
             }
             return Ok(());
         }
