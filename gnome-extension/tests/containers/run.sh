@@ -20,6 +20,7 @@ build() {
 build -q >/dev/null || build --progress=plain
 docker run --rm ${RAYSHOT_CONTAINER_CPUS:+--cpus "$RAYSHOT_CONTAINER_CPUS"} -v "$REPO:/src:ro" -v "$BIN:/opt/rayshot:ro" \
     -e RAYSHOT_SOAK_BIN=/opt/rayshot -e SHELL_RSS_LIMIT_KB=262144 \
+    -e RAYSHOT_SOAK_DEBUG -e RAYSHOT_SOAK_CASES -e RAYSHOT_SOAK_MONITORS \
     "$IMAGE" sh -c '
         version=$(gnome-shell --version)
         echo "$version"
@@ -30,9 +31,11 @@ docker run --rm ${RAYSHOT_CONTAINER_CPUS:+--cpus "$RAYSHOT_CONTAINER_CPUS"} -v "
         mkdir -p /tmp/.X11-unix /run/dbus && chmod 1777 /tmp/.X11-unix
         dbus-daemon --system --fork
         rm -rf /run/systemd/seats
-        if [ "$4" = displays ]; then
+        if [ "$4" = displays ] && [ -n "${RAYSHOT_SOAK_CASES:-}" ]; then
+            RAYSHOT_SOAK_SUITE=displays /src/gnome-extension/tests/soak.sh 0 0 && exit 0
+        elif [ "$4" = displays ]; then
             /src/gnome-extension/tests/displays.sh && exit 0
         else
             /src/gnome-extension/tests/soak.sh "$1" "$2" && exit 0
         fi
-        tail -n 80 /tmp/rayshot-soak.*/shell.log; exit 1' sh "$WARM" "$COLD" "$SHELL_MAJOR" "$SUITE"
+        tail -n 200 /tmp/rayshot-soak.*/shell.log; exit 1' sh "$WARM" "$COLD" "$SHELL_MAJOR" "$SUITE"

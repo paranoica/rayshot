@@ -258,7 +258,11 @@ export class Displays {
             }
             waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
                 r._frameMonitors = original;
-                then(r._overlay);
+                this._point({x: at.x + 1, y: at.y});
+                later(STEP_MS, () => {
+                    this._point(at);
+                    later(STEP_MS, () => then(r._overlay));
+                });
             }, () => {
                 r._frameMonitors = original;
                 fail('the overlay did not show');
