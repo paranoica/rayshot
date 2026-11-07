@@ -197,7 +197,7 @@ struct OverlayApp {
     recent: Vec<egui::Color32>,
     show_settings: bool,
     show_colours: bool,
-    custom_colour: bool,
+    picker_hsv: Hsv,
     hex_text: String,
     scroll_acc: f32,
     toast: Option<(String, std::time::Instant)>,
@@ -240,7 +240,7 @@ impl OverlayApp {
             recent: prefs.recent,
             show_settings: false,
             show_colours: false,
-            custom_colour: false,
+            picker_hsv: Hsv::of(egui::Color32::RED),
             hex_text: String::new(),
             draft: None,
             draft_start: None,
@@ -1028,7 +1028,7 @@ impl OverlayApp {
         let mut hidden_buttons = self.hidden_buttons.clone();
         let mut show_settings = self.show_settings;
         let mut show_colours = self.show_colours;
-        let mut custom_colour = self.custom_colour;
+        let mut picker_hsv = self.picker_hsv;
         let mut hex_text = self.hex_text.clone();
         let recent = self.recent.clone();
         let mut picked: Option<egui::Color32> = None;
@@ -1810,7 +1810,7 @@ impl OverlayApp {
 
                     if show_colours {
                         let colours_id = egui::Id::new("rayshot-colours");
-                        let w = side_width(colours_id, 170.0);
+                        let w = side_width(colours_id, 215.0);
                         egui::Area::new(colours_id)
                             .fixed_pos(egui::pos2(beside(w), colour_button_y))
                             .constrain(true)
@@ -1821,7 +1821,7 @@ impl OverlayApp {
                                         &mut color,
                                         &recent,
                                         &mut hex_text,
-                                        &mut custom_colour,
+                                        &mut picker_hsv,
                                     ) {
                                         show_colours = false;
                                     }
@@ -1893,7 +1893,7 @@ impl OverlayApp {
         self.hidden_buttons = hidden_buttons;
         self.show_settings = show_settings;
         self.show_colours = show_colours;
-        self.custom_colour = custom_colour;
+        self.picker_hsv = picker_hsv;
         self.hex_text = hex_text;
         if stroke_width != width_before {
             self.toast = Some((format!("{stroke_width:.0} px"), std::time::Instant::now()));
@@ -2720,26 +2720,119 @@ fn colour_button(ui: &mut egui::Ui, color: egui::Color32, open: bool) -> egui::R
     resp
 }
 
-fn swatch(ui: &mut egui::Ui, color: egui::Color32, selected: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
-    let painter = ui.painter();
-    let c = rect.center();
-    if selected {
-        painter.circle_stroke(c, 11.5, egui::Stroke::new(2.0, egui::Color32::WHITE));
-    }
-    painter.circle_filled(c, if resp.hovered() { 9.5 } else { 8.5 }, color);
-    painter.circle_stroke(
-        c,
-        8.5,
-        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(110)),
-    );
-    resp
-}
-
 fn hex_input(text: &str) -> Option<egui::Color32> {
     let digits = text.trim();
     let digits = digits.strip_prefix('#').unwrap_or(digits);
     crate::prefs::parse_color(&format!("#{digits}"))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Hsv {
+    h: f32,
+    s: f32,
+    v: f32,
+}
+
+impl Hsv {
+    fn of(color: egui::Color32) -> Self {
+        let unit = |c: u8| c as f32 / 255.0;
+        let (h, s, v) =
+            egui::ecolor::hsv_from_rgb([unit(color.r()), unit(color.g()), unit(color.b())]);
+        Self { h, s, v }
+    }
+
+    fn color(self) -> egui::Color32 {
+        let [r, g, b] = egui::ecolor::rgb_from_hsv((self.h, self.s, self.v));
+        let byte = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+        egui::Color32::from_rgb(byte(r), byte(g), byte(b))
+    }
+}
+
+fn hsv_color(h: f32, s: f32, v: f32) -> egui::Color32 {
+    Hsv { h, s, v }.color()
+}
+
+fn sync_hsv(hsv: &mut Hsv, color: egui::Color32) {
+    if hsv.color() != color {
+        let hue = hsv.h;
+        *hsv = Hsv::of(color);
+        if hsv.s <= f32::EPSILON || hsv.v <= f32::EPSILON {
+            hsv.h = hue;
+        }
+    }
+}
+
+fn paint_grid(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    cols: usize,
+    rows: usize,
+    color_at: impl Fn(f32, f32) -> egui::Color32,
+) {
+    let mut mesh = egui::Mesh::default();
+    for j in 0..=rows {
+        for i in 0..=cols {
+            let (u, v) = (i as f32 / cols as f32, j as f32 / rows as f32);
+            mesh.colored_vertex(
+                egui::pos2(egui::lerp(rect.x_range(), u), egui::lerp(rect.y_range(), v)),
+                color_at(u, v),
+            );
+        }
+    }
+    let w = cols as u32 + 1;
+    for j in 0..rows as u32 {
+        for i in 0..cols as u32 {
+            let a = j * w + i;
+            mesh.add_triangle(a, a + 1, a + w);
+            mesh.add_triangle(a + 1, a + w + 1, a + w);
+        }
+    }
+    painter.add(egui::Shape::mesh(mesh));
+}
+
+fn swatch_row(
+    ui: &mut egui::Ui,
+    width: f32,
+    colors: &[egui::Color32],
+    current: egui::Color32,
+    hint: impl Fn(usize) -> String,
+    id: &str,
+) -> Option<egui::Color32> {
+    let cell = width / PALETTE.len() as f32;
+    let (row, _) = ui.allocate_exact_size(egui::vec2(width, cell), egui::Sense::hover());
+    let mut chosen = None;
+    for (i, c) in colors.iter().enumerate() {
+        let r = egui::Rect::from_min_size(
+            egui::pos2(row.left() + cell * i as f32, row.top()),
+            egui::vec2(cell, cell),
+        );
+        let resp = ui
+            .interact(r, ui.id().with((id, i)), egui::Sense::click())
+            .on_hover_text(hint(i));
+        let painter = ui.painter();
+        let radius = cell * 0.32;
+        if *c == current {
+            painter.circle_stroke(
+                r.center(),
+                radius + 3.0,
+                egui::Stroke::new(2.0, egui::Color32::WHITE),
+            );
+        }
+        painter.circle_filled(
+            r.center(),
+            if resp.hovered() { radius + 1.0 } else { radius },
+            *c,
+        );
+        painter.circle_stroke(
+            r.center(),
+            radius,
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40)),
+        );
+        if resp.clicked() {
+            chosen = Some(*c);
+        }
+    }
+    chosen
 }
 
 fn colour_panel(
@@ -2747,57 +2840,86 @@ fn colour_panel(
     color: &mut egui::Color32,
     recent: &[egui::Color32],
     hex_text: &mut String,
-    custom: &mut bool,
+    hsv: &mut Hsv,
 ) -> bool {
-    let mut chosen = false;
-    egui::Grid::new("rayshot-palette")
-        .spacing([4.0, 2.0])
-        .show(ui, |ui| {
-            for (i, c) in PALETTE.iter().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 2.0;
-                    if swatch(ui, *c, *color == *c)
-                        .on_hover_text(PALETTE_NAMES[i])
-                        .clicked()
-                    {
-                        *color = *c;
-                        chosen = true;
-                    }
-                    ui.label(egui::RichText::new((i + 1).to_string()).small().weak());
-                });
-                if i % 3 == 2 {
-                    ui.end_row();
-                }
-            }
-        });
-    if !recent.is_empty() {
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new("Recent").small().weak());
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 2.0;
-            for c in recent {
-                if swatch(ui, *c, *color == *c)
-                    .on_hover_text(hex(*c))
-                    .clicked()
-                {
-                    *color = *c;
-                    chosen = true;
-                }
-            }
-        });
-    }
-    ui.separator();
+    const WIDTH: f32 = 198.0;
+    sync_hsv(hsv, *color);
+    ui.spacing_mut().item_spacing = egui::vec2(8.0, 10.0);
+    let edge = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(30));
     let hex_id = egui::Id::new("rayshot-hex");
-    if !ui.memory(|m| m.has_focus(hex_id)) {
-        *hex_text = hex(*color).trim_start_matches('#').to_owned();
+
+    let (sv_rect, sv) =
+        ui.allocate_exact_size(egui::vec2(WIDTH, 128.0), egui::Sense::click_and_drag());
+    if sv.is_pointer_button_down_on()
+        && let Some(p) = sv.interact_pointer_pos()
+    {
+        ui.memory_mut(|m| m.surrender_focus(hex_id));
+        hsv.s = ((p.x - sv_rect.left()) / sv_rect.width()).clamp(0.0, 1.0);
+        hsv.v = 1.0 - ((p.y - sv_rect.top()) / sv_rect.height()).clamp(0.0, 1.0);
+        *color = hsv.color();
     }
+    let h = hsv.h;
+    paint_grid(ui.painter(), sv_rect, 24, 12, |s, t| {
+        hsv_color(h, s, 1.0 - t)
+    });
+    ui.painter()
+        .rect_stroke(sv_rect, 0, edge, egui::StrokeKind::Inside);
+    let knob = egui::pos2(
+        egui::lerp(sv_rect.x_range(), hsv.s),
+        egui::lerp(sv_rect.y_range(), 1.0 - hsv.v),
+    );
+    ui.painter().circle_filled(knob, 6.0, *color);
+    ui.painter()
+        .circle_stroke(knob, 7.0, egui::Stroke::new(2.0, egui::Color32::WHITE));
+    ui.painter().circle_stroke(
+        knob,
+        8.5,
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(90)),
+    );
+
+    let (hue_rect, hue) =
+        ui.allocate_exact_size(egui::vec2(WIDTH, 12.0), egui::Sense::click_and_drag());
+    if hue.is_pointer_button_down_on()
+        && let Some(p) = hue.interact_pointer_pos()
+    {
+        ui.memory_mut(|m| m.surrender_focus(hex_id));
+        hsv.h = ((p.x - hue_rect.left()) / hue_rect.width()).clamp(0.0, 1.0);
+        if hsv.s <= f32::EPSILON {
+            hsv.s = 1.0;
+        }
+        if hsv.v <= f32::EPSILON {
+            hsv.v = 1.0;
+        }
+        *color = hsv.color();
+    }
+    paint_grid(ui.painter(), hue_rect, 36, 1, |u, _| hsv_color(u, 1.0, 1.0));
+    ui.painter()
+        .rect_stroke(hue_rect, 0, edge, egui::StrokeKind::Inside);
+    let hx = egui::lerp(hue_rect.x_range(), hsv.h);
+    let handle =
+        egui::Rect::from_center_size(egui::pos2(hx, hue_rect.center().y), egui::vec2(6.0, 18.0));
+    ui.painter().rect_filled(handle, 3, egui::Color32::WHITE);
+    ui.painter().rect_stroke(
+        handle,
+        3,
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(120)),
+        egui::StrokeKind::Outside,
+    );
+
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("#").monospace().weak());
+        let (chip, _) = ui.allocate_exact_size(egui::vec2(28.0, 28.0), egui::Sense::hover());
+        ui.painter().rect_filled(chip, 6, *color);
+        ui.painter()
+            .rect_stroke(chip, 6, edge, egui::StrokeKind::Inside);
+        if !ui.memory(|m| m.has_focus(hex_id)) {
+            *hex_text = hex(*color);
+        }
         let resp = ui.add(
             egui::TextEdit::singleline(hex_text)
                 .id(hex_id)
-                .desired_width(58.0)
+                .desired_width(WIDTH - 28.0 - 8.0)
                 .char_limit(7)
+                .margin(egui::Margin::symmetric(8, 6))
                 .font(egui::TextStyle::Monospace),
         );
         if resp.changed()
@@ -2805,12 +2927,22 @@ fn colour_panel(
         {
             *color = c;
         }
-        if ui.selectable_label(*custom, "Custom…").clicked() {
-            *custom = !*custom;
-        }
     });
-    if *custom {
-        egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::Opaque);
+
+    let mut chosen = false;
+    let names = |i: usize| format!("{}  {}", i + 1, PALETTE_NAMES[i]);
+    if let Some(c) = swatch_row(ui, WIDTH, &PALETTE, *color, names, "palette") {
+        *color = c;
+        chosen = true;
+    }
+    if !recent.is_empty() {
+        ui.add_space(-4.0);
+        ui.label(egui::RichText::new("Recent").small().weak());
+        ui.add_space(-6.0);
+        if let Some(c) = swatch_row(ui, WIDTH, recent, *color, |i| hex(recent[i]), "recent") {
+            *color = c;
+            chosen = true;
+        }
     }
     chosen
 }
@@ -3012,6 +3144,92 @@ mod tests {
         );
         let mut acc = 0.0;
         assert_eq!(scrolled_width(3.0, &mut acc, 0.0), 3.0);
+    }
+
+    #[test]
+    fn dragging_the_square_takes_the_focus_from_the_hex_field() {
+        let ctx = egui::Context::default();
+        let hex_id = egui::Id::new("rayshot-hex");
+        let mut color = egui::Color32::RED;
+        let mut hex_text = super::hex(color);
+        let mut hsv = super::Hsv::of(color);
+        let mut frame = |events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(400.0, 400.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                egui::Area::new(egui::Id::new("panel"))
+                    .fixed_pos(egui::Pos2::ZERO)
+                    .show(ui.ctx(), |ui| {
+                        super::colour_panel(ui, &mut color, &[], &mut hex_text, &mut hsv);
+                    });
+            });
+        };
+        frame(vec![]);
+        ctx.memory_mut(|m| m.request_focus(hex_id));
+        frame(vec![]);
+        assert!(ctx.memory(|m| m.has_focus(hex_id)));
+        let press = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let at = egui::pos2(20.0, 100.0);
+        frame(vec![egui::Event::PointerMoved(at), press(at, true)]);
+        let to = egui::pos2(60.0, 110.0);
+        frame(vec![egui::Event::PointerMoved(to)]);
+        frame(vec![press(to, false)]);
+        frame(vec![]);
+        assert_ne!(color, egui::Color32::RED);
+        assert!(!ctx.memory(|m| m.has_focus(hex_id)));
+        assert_eq!(hex_text, super::hex(color));
+    }
+
+    #[test]
+    fn the_picker_square_is_plain_srgb_hsv() {
+        let grey = super::hsv_color(0.0, 0.0, 0.5);
+        assert!((127..=128).contains(&grey.r()), "{grey:?}");
+        assert_eq!(grey.r(), grey.g());
+        assert_eq!(
+            super::hsv_color(1.0 / 6.0, 1.0, 1.0),
+            egui::Color32::from_rgb(255, 255, 0)
+        );
+        assert_eq!(
+            super::hsv_color(0.0, 0.5, 1.0),
+            egui::Color32::from_rgb(255, 128, 128)
+        );
+    }
+
+    #[test]
+    fn the_picker_keeps_every_colour_it_is_given() {
+        let mut hsv = super::Hsv::of(egui::Color32::RED);
+        for r in (0..=255).step_by(15) {
+            for g in (0..=255).step_by(15) {
+                for b in (0..=255).step_by(15) {
+                    let c = egui::Color32::from_rgb(r, g, b);
+                    super::sync_hsv(&mut hsv, c);
+                    assert_eq!(hsv.color(), c);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_picker_keeps_its_hue_through_grey_and_black() {
+        let mut hsv = super::Hsv::of(egui::Color32::from_rgb(0, 0, 255));
+        let hue = hsv.h;
+        super::sync_hsv(&mut hsv, egui::Color32::from_rgb(90, 90, 90));
+        assert_eq!(hsv.h, hue);
+        super::sync_hsv(&mut hsv, egui::Color32::BLACK);
+        assert_eq!(hsv.h, hue);
+        super::sync_hsv(&mut hsv, egui::Color32::from_rgb(255, 0, 0));
+        assert_ne!(hsv.h, hue);
     }
 
     #[test]
