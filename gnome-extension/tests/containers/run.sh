@@ -18,7 +18,7 @@ build() {
     docker build "$@" -t "$IMAGE" ${BASE:+--build-arg BASE=$BASE} $EXTRA -f "$HERE/$FILE.Dockerfile" "$HERE"
 }
 build -q >/dev/null || build --progress=plain
-docker run --rm -v "$REPO:/src:ro" -v "$BIN:/opt/rayshot:ro" \
+docker run --rm ${RAYSHOT_CONTAINER_CPUS:+--cpus "$RAYSHOT_CONTAINER_CPUS"} -v "$REPO:/src:ro" -v "$BIN:/opt/rayshot:ro" \
     -e RAYSHOT_SOAK_BIN=/opt/rayshot -e SHELL_RSS_LIMIT_KB=262144 \
     "$IMAGE" sh -c '
         version=$(gnome-shell --version)

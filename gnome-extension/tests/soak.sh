@@ -111,6 +111,7 @@ RAYSHOT_NESTED_TAG="$TAG" dbus-run-session -- sh -c "
     gsettings set org.gnome.shell welcome-dialog-last-shown-version '999'
     gsettings set org.gnome.shell disable-extension-version-validation $ANY_SHELL
     gsettings set org.gnome.mutter experimental-features \"$MUTTER_FEATURES\"
+    gsettings --schemadir \"$EXT/rayshot@paranoica/schemas\" set org.gnome.shell.extensions.rayshot debug-log ${RAYSHOT_SOAK_DEBUG:-false}
     gsettings set org.gnome.desktop.input-sources sources \"[('xkb', 'us'), ('xkb', 'ru')]\"
     exec gnome-shell --headless --wayland $MONITORS
 " >"$WORK/shell.log" 2>&1 &
