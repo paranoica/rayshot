@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tool {
     Select,
     Pen,
@@ -9,9 +9,48 @@ pub enum Tool {
     Text,
     Pixelate,
     Blur,
+    Ellipse,
+    Counter,
+    Picker,
 }
 
 impl Tool {
+    pub const ALL: [Tool; 12] = [
+        Tool::Pen,
+        Tool::Line,
+        Tool::Arrow,
+        Tool::Rect,
+        Tool::Ellipse,
+        Tool::Counter,
+        Tool::Marker,
+        Tool::Text,
+        Tool::Pixelate,
+        Tool::Blur,
+        Tool::Picker,
+        Tool::Select,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tool::Select => "select",
+            Tool::Pen => "pen",
+            Tool::Line => "line",
+            Tool::Arrow => "arrow",
+            Tool::Rect => "rectangle",
+            Tool::Marker => "marker",
+            Tool::Text => "text",
+            Tool::Pixelate => "pixelate",
+            Tool::Blur => "blur",
+            Tool::Ellipse => "ellipse",
+            Tool::Counter => "marker-number",
+            Tool::Picker => "picker",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Tool> {
+        Tool::ALL.into_iter().find(|t| t.name() == name)
+    }
+
     pub fn icon(self) -> &'static str {
         use egui_phosphor::regular as p;
         match self {
@@ -24,6 +63,9 @@ impl Tool {
             Tool::Text => p::TEXT_T,
             Tool::Pixelate => p::SQUARES_FOUR,
             Tool::Blur => p::DROP,
+            Tool::Ellipse => p::CIRCLE,
+            Tool::Counter => p::NUMBER_CIRCLE_ONE,
+            Tool::Picker => p::EYEDROPPER,
         }
     }
 
@@ -38,6 +80,9 @@ impl Tool {
             Tool::Text => "Text (T)",
             Tool::Pixelate => "Pixelate (X)",
             Tool::Blur => "Blur (B)",
+            Tool::Ellipse => "Ellipse (E)",
+            Tool::Counter => "Numbered marker (N)",
+            Tool::Picker => "Pick a colour (I)",
         }
     }
 }
@@ -78,6 +123,17 @@ pub enum Shape {
     },
     Blur {
         points: Vec<egui::Pos2>,
+        radius: f32,
+    },
+    Ellipse {
+        rect: egui::Rect,
+        color: egui::Color32,
+        width: f32,
+    },
+    Counter {
+        center: egui::Pos2,
+        number: u32,
+        color: egui::Color32,
         radius: f32,
     },
 }
@@ -274,6 +330,27 @@ fn text_box(pos: egui::Pos2, text: &str, size: f32) -> egui::Rect {
     egui::Rect::from_min_size(pos, egui::vec2(w, size * 1.3))
 }
 
+pub fn next_counter(shapes: &[Shape]) -> u32 {
+    shapes
+        .iter()
+        .filter_map(|s| match s {
+            Shape::Counter { number, .. } => Some(*number),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+        + 1
+}
+
+pub fn text_on(fill: egui::Color32) -> egui::Color32 {
+    let luma = 0.299 * fill.r() as f32 + 0.587 * fill.g() as f32 + 0.114 * fill.b() as f32;
+    if luma > 150.0 {
+        egui::Color32::BLACK
+    } else {
+        egui::Color32::WHITE
+    }
+}
+
 pub fn shape_hit(shapes: &[Shape], p: egui::Pos2) -> Option<usize> {
     for (i, s) in shapes.iter().enumerate().rev() {
         let hit = match s {
@@ -295,6 +372,18 @@ pub fn shape_hit(shapes: &[Shape], p: egui::Pos2) -> Option<usize> {
             } => text_box(*pos, text, *size).contains(p),
             Shape::Pixelate { .. } => false,
             Shape::Blur { .. } => false,
+            Shape::Ellipse { rect, width, .. } => {
+                let (c, r) = (rect.center(), rect.size() / 2.0);
+                if r.x <= f32::EPSILON || r.y <= f32::EPSILON {
+                    false
+                } else {
+                    let q = p - c;
+                    let k = ((q.x / r.x).powi(2) + (q.y / r.y).powi(2)).sqrt();
+                    let on_curve = if k > 0.0 { q / k } else { egui::vec2(r.x, 0.0) };
+                    (q - on_curve).length() <= width.max(6.0) + 4.0
+                }
+            }
+            Shape::Counter { center, radius, .. } => (p - *center).length() <= radius + 4.0,
         };
         if hit {
             return Some(i);
@@ -360,6 +449,22 @@ pub fn translated(shape: &Shape, d: egui::Vec2) -> Shape {
             points: points.iter().map(|p| *p + d).collect(),
             radius: *radius,
         },
+        Shape::Ellipse { rect, color, width } => Shape::Ellipse {
+            rect: rect.translate(d),
+            color: *color,
+            width: *width,
+        },
+        Shape::Counter {
+            center,
+            number,
+            color,
+            radius,
+        } => Shape::Counter {
+            center: *center + d,
+            number: *number,
+            color: *color,
+            radius: *radius,
+        },
     }
 }
 
@@ -373,6 +478,31 @@ pub fn paint(
     frame_h: f32,
 ) {
     match shape {
+        Shape::Ellipse { rect, color, width } => {
+            let r = egui::Rect::from_two_pos(to_screen(rect.min), to_screen(rect.max));
+            painter.add(egui::Shape::ellipse_stroke(
+                r.center(),
+                r.size() / 2.0,
+                egui::Stroke::new(width * scale, *color),
+            ));
+        }
+        Shape::Counter {
+            center,
+            number,
+            color,
+            radius,
+        } => {
+            let c = to_screen(*center);
+            let r = radius * scale;
+            painter.circle_filled(c, r, *color);
+            painter.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                number.to_string(),
+                egui::FontId::proportional(r * 1.15),
+                text_on(*color),
+            );
+        }
         Shape::Rect { rect, color, width } => {
             let r = egui::Rect::from_two_pos(to_screen(rect.min), to_screen(rect.max));
             painter.rect_stroke(
@@ -512,6 +642,94 @@ pub fn paint(
                 ]);
             }
             painter.add(egui::Shape::mesh(mesh));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{Color32, pos2};
+
+    fn counter(number: u32) -> Shape {
+        Shape::Counter {
+            center: pos2(0.0, 0.0),
+            number,
+            color: Color32::RED,
+            radius: 12.0,
+        }
+    }
+
+    #[test]
+    fn markers_count_up_from_one() {
+        assert_eq!(next_counter(&[]), 1);
+        assert_eq!(next_counter(&[counter(1), counter(2)]), 3);
+    }
+
+    #[test]
+    fn marker_numbers_follow_the_highest_left() {
+        let line = Shape::Line {
+            from: pos2(0.0, 0.0),
+            to: pos2(5.0, 5.0),
+            color: Color32::RED,
+            width: 3.0,
+        };
+        assert_eq!(next_counter(&[counter(3), line.clone(), counter(1)]), 4);
+        assert_eq!(next_counter(&[line]), 1);
+    }
+
+    #[test]
+    fn marker_digits_contrast_with_their_fill() {
+        assert_eq!(text_on(Color32::from_rgb(255, 230, 0)), Color32::BLACK);
+        assert_eq!(text_on(Color32::WHITE), Color32::BLACK);
+        assert_eq!(text_on(Color32::from_rgb(230, 30, 30)), Color32::WHITE);
+        assert_eq!(text_on(Color32::from_rgb(20, 60, 200)), Color32::WHITE);
+        assert_eq!(text_on(Color32::BLACK), Color32::WHITE);
+    }
+
+    #[test]
+    fn an_ellipse_is_hit_on_its_outline_only() {
+        let e = Shape::Ellipse {
+            rect: egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(200.0, 100.0)),
+            color: Color32::RED,
+            width: 3.0,
+        };
+        let shapes = [e];
+        assert_eq!(shape_hit(&shapes, pos2(200.0, 50.0)), Some(0), "right edge");
+        assert_eq!(shape_hit(&shapes, pos2(100.0, 1.0)), Some(0), "top edge");
+        assert_eq!(shape_hit(&shapes, pos2(100.0, 50.0)), None, "middle");
+        assert_eq!(
+            shape_hit(&shapes, pos2(5.0, 5.0)),
+            None,
+            "corner outside the curve"
+        );
+    }
+
+    #[test]
+    fn a_marker_is_hit_anywhere_on_its_disc() {
+        let shapes = [counter(1)];
+        assert_eq!(shape_hit(&shapes, pos2(3.0, 4.0)), Some(0));
+        assert_eq!(shape_hit(&shapes, pos2(40.0, 0.0)), None);
+    }
+
+    #[test]
+    fn new_shapes_move_with_a_drag() {
+        let d = egui::vec2(10.0, -5.0);
+        match translated(&counter(2), d) {
+            Shape::Counter { center, number, .. } => {
+                assert_eq!(center, pos2(10.0, -5.0));
+                assert_eq!(number, 2);
+            }
+            _ => panic!("still a marker"),
+        }
+        let e = Shape::Ellipse {
+            rect: egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(20.0, 10.0)),
+            color: Color32::RED,
+            width: 3.0,
+        };
+        match translated(&e, d) {
+            Shape::Ellipse { rect, .. } => assert_eq!(rect.min, pos2(10.0, -5.0)),
+            _ => panic!("still an ellipse"),
         }
     }
 }

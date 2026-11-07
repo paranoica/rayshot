@@ -8,7 +8,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0.102"
-ashpd = { version = "0.13.11", features = ["screenshot", "tokio"] }
+ashpd = { version = "0.13.11", features = ["file_chooser", "screenshot", "tokio"] }
 egui = "0.34.3"
 egui-phosphor = "0.12.0"
 egui-wgpu = "0.34.3"

@@ -196,33 +196,36 @@ pub fn retire_daemon() -> Result<()> {
     if !had_autostart {
         return Ok(());
     }
-    let _ = Command::new("gdbus")
-        .args(update_notice_args())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    desktop_notice(
+        "rayshot was updated",
+        "Run \"rayshot install-hotkey Print\" once to finish the update.",
+    );
     Ok(())
 }
 
-fn update_notice_args() -> [&'static str; 16] {
-    [
-        "call",
-        "--session",
-        "--dest",
-        "org.freedesktop.Notifications",
-        "--object-path",
-        "/org/freedesktop/Notifications",
-        "--method",
-        "org.freedesktop.Notifications.Notify",
-        "rayshot",
-        "uint32 0",
-        "",
-        "rayshot was updated",
-        "Run \"rayshot install-hotkey Print\" once to finish the update.",
-        "@as []",
-        "@a{sv} {}",
-        "int32 0",
-    ]
+pub fn desktop_notice(summary: &str, body: &str) {
+    let _ = Command::new("gdbus")
+        .args([
+            "call",
+            "--session",
+            "--dest",
+            "org.freedesktop.Notifications",
+            "--object-path",
+            "/org/freedesktop/Notifications",
+            "--method",
+            "org.freedesktop.Notifications.Notify",
+            "rayshot",
+            "uint32 0",
+            "",
+            summary,
+            body,
+            "@as []",
+            "@a{sv} {}",
+            "int32 0",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 pub fn install(binding: &str, daemon: bool) -> Result<()> {

@@ -4,6 +4,7 @@ mod export;
 mod hotkey;
 mod live;
 mod overlay;
+mod prefs;
 mod scene;
 mod warm;
 
@@ -49,6 +50,34 @@ fn main() -> Result<()> {
         Some("warm") => return warm::run(std::env::args().nth(2).as_deref()),
         Some("monitors") => return overlay::list_monitors(),
         Some("daemon") => return hotkey::retire_daemon(),
+        Some("save-as") => {
+            let png = std::env::args()
+                .nth(2)
+                .context("save-as needs the PNG to save")?;
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .context("failed to build tokio runtime")?;
+            match rt.block_on(export::save_as(std::path::Path::new(&png))) {
+                Ok(Some(dest)) => eprintln!("[rayshot] saved {}", dest.display()),
+                Ok(None) => eprintln!("[rayshot] save as: cancelled"),
+                Err(e) => {
+                    eprintln!("[rayshot] save as failed: {e:#}");
+                    let body = match std::fs::read(&png)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|data| export::save_to_pictures(&data))
+                    {
+                        Ok(dest) => format!(
+                            "The save dialog failed, so it was saved to {}.",
+                            dest.display()
+                        ),
+                        Err(_) => format!("The save dialog failed. A temporary copy is at {png}."),
+                    };
+                    hotkey::desktop_notice("rayshot could not save the screenshot", &body);
+                }
+            }
+            return Ok(());
+        }
         Some("serve") => {
             live::skip_core_dumps();
             export::cleanup_old(&export::scratch_dir(), export::SCRATCH_MAX_AGE);

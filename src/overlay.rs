@@ -150,6 +150,7 @@ enum SessionEnd {
 enum Action {
     Copy,
     Save,
+    SaveAs,
     Close,
 }
 
@@ -191,6 +192,11 @@ struct OverlayApp {
     draft: Option<crate::scene::Shape>,
     draft_start: Option<egui::Pos2>,
     straight_from: Option<usize>,
+    hidden: Vec<crate::scene::Tool>,
+    show_settings: bool,
+    scroll_acc: f32,
+    toast: Option<(String, std::time::Instant)>,
+    colour_copy: Option<std::thread::JoinHandle<()>>,
     pending: Option<Action>,
     sel_mode: Option<SelMode>,
     sel_ref: egui::Rect,
@@ -202,6 +208,7 @@ struct OverlayApp {
 
 impl OverlayApp {
     fn new(rt: Handle) -> Self {
+        let prefs = crate::prefs::load();
         Self {
             forwarded: false,
             serve: false,
@@ -221,11 +228,16 @@ impl OverlayApp {
             modifiers: winit::keyboard::ModifiersState::empty(),
             scene: crate::scene::Scene::default(),
             tool: crate::scene::Tool::Select,
-            color: egui::Color32::from_rgb(255, 60, 60),
-            stroke_width: 3.0,
+            color: prefs.color.unwrap_or(egui::Color32::from_rgb(255, 60, 60)),
+            stroke_width: prefs.width.unwrap_or(3.0),
+            hidden: prefs.hidden,
+            show_settings: false,
             draft: None,
             draft_start: None,
             straight_from: None,
+            scroll_acc: 0.0,
+            toast: None,
+            colour_copy: None,
             pending: None,
             sel_mode: None,
             sel_ref: egui::Rect::ZERO,
@@ -346,6 +358,21 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
         }
     }
 
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        use winit::event_loop::ControlFlow;
+        match self.toast.as_ref().map(|(_, at)| *at + TOAST_FOR) {
+            Some(end) if end > std::time::Instant::now() => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(end));
+            }
+            Some(_) => {
+                self.toast = None;
+                self.request_redraw_all();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            None => event_loop.set_control_flow(ControlFlow::Wait),
+        }
+    }
+
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Show { id, width, height } => {
@@ -393,6 +420,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                     match self.pending_export.take() {
                         Some(Action::Copy) => self.finish_and_exit(event_loop),
                         Some(Action::Save) => self.save_and_exit(event_loop),
+                        Some(Action::SaveAs) => self.save_as_and_exit(event_loop),
                         _ => {}
                     }
                 } else {
@@ -434,8 +462,11 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
-                // Shift reshapes a drawing on whichever monitor holds the drag.
                 self.request_redraw_all();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.windows[idx].cursor = None;
+                self.windows[idx].window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let sf = self.windows[idx].window.scale_factor();
@@ -465,6 +496,12 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             self.finish_and_exit(event_loop);
                         } else if ctrl && is(KeyCode::KeyC) {
                             self.finish_and_exit(event_loop);
+                        } else if ctrl && is(KeyCode::KeyS) {
+                            if shift {
+                                self.save_as_and_exit(event_loop);
+                            } else {
+                                self.save_and_exit(event_loop);
+                            }
                         } else if ctrl && is(KeyCode::KeyZ) && !shift {
                             self.scene.undo();
                             self.request_redraw_all();
@@ -490,9 +527,35 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                                 Some(Tool::Pixelate)
                             } else if is(KeyCode::KeyB) {
                                 Some(Tool::Blur)
+                            } else if is(KeyCode::KeyE) {
+                                Some(Tool::Ellipse)
+                            } else if is(KeyCode::KeyN) {
+                                Some(Tool::Counter)
+                            } else if is(KeyCode::KeyI) {
+                                Some(Tool::Picker)
                             } else {
                                 None
                             };
+                            let digit = [
+                                KeyCode::Digit1,
+                                KeyCode::Digit2,
+                                KeyCode::Digit3,
+                                KeyCode::Digit4,
+                                KeyCode::Digit5,
+                                KeyCode::Digit6,
+                                KeyCode::Digit7,
+                                KeyCode::Digit8,
+                                KeyCode::Digit9,
+                            ]
+                            .iter()
+                            .position(|&k| is(k));
+                            if let Some(c) = digit
+                                .filter(|_| !shift)
+                                .and_then(|d| palette_color(d as u32 + 1))
+                            {
+                                self.color = c;
+                                self.request_redraw_all();
+                            }
                             if let Some(t) = new_tool {
                                 self.tool = t;
                                 self.request_redraw_all();
@@ -525,6 +588,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 match self.pending.take() {
                     Some(Action::Copy) => self.finish_and_exit(event_loop),
                     Some(Action::Save) => self.save_and_exit(event_loop),
+                    Some(Action::SaveAs) => self.save_as_and_exit(event_loop),
                     Some(Action::Close) => {
                         eprintln!("[rayshot] exit: toolbar close");
                         self.close(event_loop);
@@ -942,7 +1006,17 @@ impl OverlayApp {
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(frame_w, frame_h));
         let mut tool = self.tool;
         let mut color = self.color;
-        let stroke_width = self.stroke_width;
+        let mut stroke_width = self.stroke_width;
+        let mut scroll_acc = self.scroll_acc;
+        let mut hidden = self.hidden.clone();
+        let mut show_settings = self.show_settings;
+        let mut picked: Option<egui::Color32> = None;
+        let toast = self
+            .toast
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < TOAST_FOR)
+            .map(|(text, _)| text.clone());
+        let width_before = stroke_width;
         let shapes = self.scene.shapes();
         let mut committed: Option<Shape> = None;
         let mut clear_scene = false;
@@ -1081,6 +1155,27 @@ impl OverlayApp {
                     };
                     ui.ctx().set_cursor_icon(icon);
                 }
+                Tool::Counter => {
+                    if (resp.clicked() || resp.drag_stopped())
+                        && let Some(p) = cursor_pos
+                    {
+                        committed = Some(Shape::Counter {
+                            center: to_frame(p),
+                            number: crate::scene::next_counter(shapes),
+                            color,
+                            radius: counter_radius(stroke_width),
+                        });
+                    }
+                }
+                Tool::Picker => {
+                    if (resp.clicked() || resp.drag_stopped())
+                        && let (Some(p), Some(frame)) = (cursor_pos, frame_px.as_deref())
+                        && let Some(c) = pixel_color(frame, to_frame(p))
+                    {
+                        color = c;
+                        picked = Some(c);
+                    }
+                }
                 Tool::Text => {
                     if resp.clicked() {
                         if let Some(p) = cursor_pos {
@@ -1145,6 +1240,18 @@ impl OverlayApp {
                                 Tool::Rect => {
                                     if let Some(st) = draft_start {
                                         draft = Some(Shape::Rect {
+                                            rect: egui::Rect::from_two_pos(
+                                                st,
+                                                constrain(tool, st, fp, shift, frame_rect),
+                                            ),
+                                            color,
+                                            width: stroke_width,
+                                        });
+                                    }
+                                }
+                                Tool::Ellipse => {
+                                    if let Some(st) = draft_start {
+                                        draft = Some(Shape::Ellipse {
                                             rect: egui::Rect::from_two_pos(
                                                 st,
                                                 constrain(tool, st, fp, shift, frame_rect),
@@ -1235,6 +1342,30 @@ impl OverlayApp {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::None);
                 }
                 _ => ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair),
+            }
+
+            if matches!(
+                tool,
+                Tool::Pen | Tool::Line | Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Counter
+            ) && resp.hovered()
+            {
+                let dy: f32 = ui.input(|i| {
+                    i.raw
+                        .events
+                        .iter()
+                        .map(|e| match e {
+                            egui::Event::MouseWheel { unit, delta, .. } => match unit {
+                                egui::MouseWheelUnit::Point => delta.y,
+                                egui::MouseWheelUnit::Line => delta.y * SCROLL_STEP,
+                                egui::MouseWheelUnit::Page => delta.y * SCROLL_STEP * 3.0,
+                            },
+                            _ => 0.0,
+                        })
+                        .sum()
+                });
+                if dy != 0.0 {
+                    stroke_width = scrolled_width(stroke_width, &mut scroll_acc, dy);
+                }
             }
 
             let painter = ui.painter();
@@ -1581,17 +1712,7 @@ impl OverlayApp {
                             egui::Frame::popup(ui.style()).show(ui, |ui| {
                                 ui.spacing_mut().item_spacing.y = 3.0;
                                 ui.vertical(|ui| {
-                                    for t in [
-                                        Tool::Pen,
-                                        Tool::Line,
-                                        Tool::Arrow,
-                                        Tool::Rect,
-                                        Tool::Marker,
-                                        Tool::Text,
-                                        Tool::Pixelate,
-                                        Tool::Blur,
-                                        Tool::Select,
-                                    ] {
+                                    for t in Tool::ALL.into_iter().filter(|t| !hidden.contains(t)) {
                                         if tool_button(ui, t.icon(), tool == t)
                                             .on_hover_text(t.tooltip())
                                             .clicked()
@@ -1625,10 +1746,22 @@ impl OverlayApp {
                                         action = Some(Action::Copy);
                                     }
                                     if tool_button(ui, p::FLOPPY_DISK, false)
-                                        .on_hover_text("Save to Pictures")
+                                        .on_hover_text("Save to Pictures (Ctrl+S)")
                                         .clicked()
                                     {
                                         action = Some(Action::Save);
+                                    }
+                                    if tool_button(ui, p::FOLDER_OPEN, false)
+                                        .on_hover_text("Save as… (Ctrl+Shift+S)")
+                                        .clicked()
+                                    {
+                                        action = Some(Action::SaveAs);
+                                    }
+                                    if tool_button(ui, p::GEAR_SIX, show_settings)
+                                        .on_hover_text("Choose the tools on the toolbar")
+                                        .clicked()
+                                    {
+                                        show_settings = !show_settings;
                                     }
                                     if tool_button(ui, p::X, false)
                                         .on_hover_text("Cancel (Esc)")
@@ -1639,6 +1772,66 @@ impl OverlayApp {
                                 });
                             });
                         });
+
+                    if show_settings {
+                        let settings_id = egui::Id::new("rayshot-settings");
+                        let settings_w = egui::AreaState::load(ui.ctx(), settings_id)
+                            .and_then(|st| st.size)
+                            .map_or(230.0, |sz| sz.x);
+                        let mut sx = x + width + gap;
+                        if sx + settings_w > avail.right() - pad {
+                            sx = x - gap - settings_w;
+                        }
+                        egui::Area::new(settings_id)
+                            .fixed_pos(egui::pos2(sx.max(avail.left() + pad), top))
+                            .constrain(true)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.label(egui::RichText::new("Toolbar").strong());
+                                    for t in Tool::ALL {
+                                        let mut shown = !hidden.contains(&t);
+                                        let text = format!("{}  {}", t.icon(), t.tooltip());
+                                        if ui.checkbox(&mut shown, text).changed() {
+                                            if shown {
+                                                hidden.retain(|h| *h != t);
+                                            } else {
+                                                hidden.push(t);
+                                            }
+                                        }
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("Hidden tools keep their keys.")
+                                            .small()
+                                            .weak(),
+                                    );
+                                });
+                            });
+                    }
+                }
+            }
+
+            let label = |painter: &egui::Painter, at: egui::Pos2, text: &str, swatch: Option<egui::Color32>| {
+                let font = egui::FontId::proportional(14.0);
+                let galley = painter.layout_no_wrap(text.to_owned(), font, egui::Color32::WHITE);
+                let pad = egui::vec2(8.0, 5.0);
+                let sw = if swatch.is_some() { 18.0 } else { 0.0 };
+                let size = galley.size() + pad * 2.0 + egui::vec2(sw, 0.0);
+                let rect = egui::Rect::from_min_size(at, size);
+                painter.rect_filled(rect, 6, egui::Color32::from_black_alpha(200));
+                if let Some(c) = swatch {
+                    let r = egui::Rect::from_min_size(rect.min + pad, egui::vec2(12.0, galley.size().y));
+                    painter.rect_filled(r, 2, c);
+                }
+                painter.galley(rect.min + pad + egui::vec2(sw, 0.0), galley, egui::Color32::WHITE);
+            };
+            if let Some(p) = raw_cursor {
+                let at = p + egui::vec2(18.0, 18.0);
+                if let Some(text) = &toast {
+                    label(painter, at, text, None);
+                } else if tool == Tool::Picker
+                    && let Some(c) = frame_px.as_deref().and_then(|f| pixel_color(f, to_frame(p)))
+                {
+                    label(painter, at, &hex(c), Some(c));
                 }
             }
 
@@ -1646,7 +1839,7 @@ impl OverlayApp {
                 painter.text(
                     image_rect.center_top() + egui::vec2(0.0, 18.0),
                     egui::Align2::CENTER_TOP,
-                    "drag to select · tools: P L A R M S · Enter/Ctrl+C copy · Esc cancel",
+                    "drag to select · Shift draws straight · wheel sets width · 1-9 colours · Enter copies · Esc cancels",
                     egui::FontId::proportional(15.0),
                     egui::Color32::WHITE,
                 );
@@ -1660,6 +1853,23 @@ impl OverlayApp {
         self.straight_from = straight_from;
         self.tool = tool;
         self.color = color;
+        self.stroke_width = stroke_width;
+        self.scroll_acc = scroll_acc;
+        self.hidden = hidden;
+        self.show_settings = show_settings;
+        if stroke_width != width_before {
+            self.toast = Some((format!("{stroke_width:.0} px"), std::time::Instant::now()));
+        }
+        if let Some(c) = picked {
+            let text = hex(c);
+            self.toast = Some((format!("Copied {text}"), std::time::Instant::now()));
+            self.wait_colour_copy();
+            self.colour_copy = Some(std::thread::spawn(move || {
+                if let Err(e) = crate::export::copy_text_to_clipboard(&text) {
+                    eprintln!("[rayshot] colour copy failed: {e:#}");
+                }
+            }));
+        }
         self.sel_mode = sel_mode;
         self.sel_ref = sel_ref;
         let move_just_started = self.move_shape.is_none() && moving_shape.is_some();
@@ -2060,6 +2270,14 @@ impl OverlayApp {
     }
 
     fn close(&mut self, _event_loop: &ActiveEventLoop) {
+        self.wait_colour_copy();
+        if !self.serve || self.session.is_some() {
+            crate::prefs::save(&crate::prefs::Prefs {
+                hidden: self.hidden.clone(),
+                color: Some(self.color),
+                width: Some(self.stroke_width),
+            });
+        }
         if let Some(sel) = self.selection {
             if sel.width() > 1.0 && sel.height() > 1.0 {
                 crate::export::save_last_selection(sel.min.x, sel.min.y, sel.width(), sel.height());
@@ -2070,6 +2288,25 @@ impl OverlayApp {
         }
         crate::anim::restore_detached();
         unsafe { libc::_exit(0) }
+    }
+
+    fn apply_prefs(&mut self, prefs: crate::prefs::Prefs) {
+        if let Some(c) = prefs.color {
+            self.color = c;
+        }
+        if let Some(w) = prefs.width {
+            self.stroke_width = w;
+        }
+        self.hidden = prefs.hidden;
+    }
+
+    fn wait_colour_copy(&mut self) {
+        if let Some(copy) = self.colour_copy.take() {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while !copy.is_finished() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
     }
 
     fn start_session(&mut self, event_loop: &ActiveEventLoop, id: u64, width: u32, height: u32) {
@@ -2083,6 +2320,7 @@ impl OverlayApp {
         }
         let started = std::time::Instant::now();
         self.session = Some(id);
+        self.apply_prefs(crate::prefs::load());
         self.live = true;
         self.frame_size = Some((width, height));
         if let Err(e) = self.create_windows(event_loop) {
@@ -2131,6 +2369,7 @@ impl OverlayApp {
         if self.defer_until_frame(Action::Copy) {
             return;
         }
+        self.wait_colour_copy();
         match self.finish() {
             Ok(Some(path)) => {
                 eprintln!("[rayshot] kept a copy at {}", path.display());
@@ -2138,6 +2377,56 @@ impl OverlayApp {
             }
             Ok(None) => eprintln!("[rayshot] nothing to copy (no selection)"),
             Err(e) => eprintln!("[rayshot] finish failed: {e:?}"),
+        }
+    }
+
+    fn save_as_and_exit(&mut self, event_loop: &ActiveEventLoop) {
+        use std::os::unix::process::CommandExt;
+
+        if self.defer_until_frame(Action::SaveAs) {
+            return;
+        }
+        let png = match self.render_selection_to_image() {
+            Ok(Some(img)) => crate::export::to_png_bytes(&img),
+            Ok(None) => {
+                eprintln!("[rayshot] nothing to save (no selection)");
+                return;
+            }
+            Err(e) => {
+                eprintln!("[rayshot] save render failed: {e:#}");
+                return;
+            }
+        };
+        let path = match png.and_then(|png| crate::export::save_to_scratch(&png)) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("[rayshot] save as failed: {e:#}");
+                return;
+            }
+        };
+        let spawned = std::env::current_exe().and_then(|exe| {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.arg("save-as")
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null());
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                });
+            }
+            cmd.spawn()
+        });
+        match spawned {
+            Ok(_) => {
+                eprintln!(
+                    "[rayshot] kept a copy at {}, asking where to save",
+                    path.display()
+                );
+                self.close(event_loop);
+            }
+            Err(e) => eprintln!("[rayshot] save as failed to start: {e}"),
         }
     }
 
@@ -2168,8 +2457,55 @@ impl OverlayApp {
     }
 }
 
-// Shift held while drawing: lines snap to 45 degree steps, rectangles turn
-// into squares, as in most paint programs.
+fn pixel_color(frame: &Frame, p: egui::Pos2) -> Option<egui::Color32> {
+    if p.x < 0.0 || p.y < 0.0 {
+        return None;
+    }
+    let (x, y) = (p.x as usize, p.y as usize);
+    if x >= frame.width as usize || y >= frame.height as usize {
+        return None;
+    }
+    let i = (y * frame.width as usize + x) * 4;
+    let px = frame.rgba.get(i..i + 3)?;
+    Some(egui::Color32::from_rgb(px[0], px[1], px[2]))
+}
+
+fn hex(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+use crate::prefs::WIDTH_RANGE;
+const TOAST_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
+
+const SCROLL_STEP: f32 = 30.0;
+
+fn scrolled_width(width: f32, acc: &mut f32, delta: f32) -> f32 {
+    *acc += delta;
+    let steps = (*acc / SCROLL_STEP).trunc();
+    *acc -= steps * SCROLL_STEP;
+    (width + steps).clamp(WIDTH_RANGE.0, WIDTH_RANGE.1)
+}
+
+const PALETTE: [egui::Color32; 9] = [
+    egui::Color32::from_rgb(235, 59, 59),
+    egui::Color32::from_rgb(245, 140, 30),
+    egui::Color32::from_rgb(245, 210, 30),
+    egui::Color32::from_rgb(60, 190, 80),
+    egui::Color32::from_rgb(40, 200, 220),
+    egui::Color32::from_rgb(45, 110, 235),
+    egui::Color32::from_rgb(150, 70, 220),
+    egui::Color32::WHITE,
+    egui::Color32::BLACK,
+];
+
+fn palette_color(digit: u32) -> Option<egui::Color32> {
+    PALETTE.get((digit as usize).checked_sub(1)?).copied()
+}
+
+fn counter_radius(width: f32) -> f32 {
+    10.0 + width * 2.0
+}
+
 fn constrain(
     tool: crate::scene::Tool,
     from: egui::Pos2,
@@ -2183,8 +2519,7 @@ fn constrain(
     }
     let d = to - from;
     match tool {
-        Tool::Rect => {
-            // A drag straight along an axis grows the square toward the larger room.
+        Tool::Rect | Tool::Ellipse => {
             let sign = |d: f32, from: f32, min: f32, max: f32| match d {
                 d if d > 0.0 => 1.0,
                 d if d < 0.0 => -1.0,
@@ -2223,7 +2558,6 @@ fn constrain(
                 _ => (1.0, -1.0),
             };
             let dir = egui::vec2(x, y).normalized();
-            // Shorten rather than leave the frame, keeping the direction.
             let room = |dir: f32, from: f32, min: f32, max: f32| match dir {
                 d if d > 0.0 => (max - from) / d,
                 d if d < 0.0 => (min - from) / d,
@@ -2252,8 +2586,6 @@ fn extend_stroke(
         points.push(to);
         return;
     }
-    // Shift pressed mid-stroke draws straight on from the last point and keeps
-    // what was drawn freehand before it.
     let at = match *anchor {
         Some(at) if at < points.len() => at,
         _ => {
@@ -2353,6 +2685,105 @@ mod tests {
     use super::reconfigure_after_suboptimal;
     use super::see_through_alpha;
     use super::surface_needs_configure;
+
+    use super::{
+        Frame, PALETTE, WIDTH_RANGE, counter_radius, hex, palette_color, pixel_color,
+        scrolled_width,
+    };
+
+    #[test]
+    fn the_picker_reads_the_frame_pixel_under_the_cursor() {
+        let mut rgba = vec![0u8; 3 * 2 * 4];
+        rgba[(1 * 3 + 2) * 4..(1 * 3 + 2) * 4 + 4].copy_from_slice(&[18, 52, 86, 255]);
+        let frame = Frame {
+            width: 3,
+            height: 2,
+            rgba,
+        };
+        assert_eq!(
+            pixel_color(&frame, pos2(2.6, 1.2)),
+            Some(egui::Color32::from_rgb(18, 52, 86))
+        );
+        assert_eq!(
+            pixel_color(&frame, pos2(0.0, 0.0)),
+            Some(egui::Color32::from_rgb(0, 0, 0))
+        );
+        assert_eq!(
+            pixel_color(&frame, pos2(3.0, 0.0)),
+            None,
+            "right of the frame"
+        );
+        assert_eq!(pixel_color(&frame, pos2(0.0, 2.0)), None, "below the frame");
+        assert_eq!(
+            pixel_color(&frame, pos2(-0.5, 0.0)),
+            None,
+            "left of the frame"
+        );
+    }
+
+    #[test]
+    fn colours_are_written_as_hex() {
+        assert_eq!(hex(egui::Color32::from_rgb(18, 52, 86)), "#123456");
+        assert_eq!(hex(egui::Color32::from_rgb(255, 0, 171)), "#FF00AB");
+        assert_eq!(hex(egui::Color32::BLACK), "#000000");
+    }
+
+    #[test]
+    fn the_wheel_changes_width_one_step_per_notch() {
+        let mut acc = 0.0;
+        assert_eq!(scrolled_width(3.0, &mut acc, 50.0), 4.0, "up thickens");
+        assert_eq!(scrolled_width(4.0, &mut acc, -50.0), 3.0, "down thins");
+        assert_eq!(
+            scrolled_width(3.0, &mut acc, 10.0),
+            3.0,
+            "a small touchpad move waits"
+        );
+        assert_eq!(scrolled_width(3.0, &mut acc, 10.0), 3.0);
+        assert_eq!(scrolled_width(3.0, &mut acc, 15.0), 4.0, "until it adds up");
+    }
+
+    #[test]
+    fn width_stays_in_range() {
+        let mut acc = 0.0;
+        assert_eq!(
+            scrolled_width(WIDTH_RANGE.1, &mut acc, 500.0),
+            WIDTH_RANGE.1
+        );
+        let mut acc = 0.0;
+        assert_eq!(
+            scrolled_width(WIDTH_RANGE.0, &mut acc, -500.0),
+            WIDTH_RANGE.0
+        );
+        let mut acc = 0.0;
+        assert_eq!(scrolled_width(3.0, &mut acc, 0.0), 3.0);
+    }
+
+    #[test]
+    fn digits_pick_the_palette() {
+        assert_eq!(palette_color(1), Some(PALETTE[0]));
+        assert_eq!(palette_color(9), Some(PALETTE[8]));
+        assert_eq!(palette_color(0), None);
+        assert_eq!(palette_color(10), None);
+    }
+
+    #[test]
+    fn markers_grow_with_the_width() {
+        assert!(
+            counter_radius(1.0) >= 10.0,
+            "readable at the thinnest width"
+        );
+        assert!(counter_radius(3.0) < counter_radius(10.0));
+        assert!(counter_radius(20.0) <= 60.0);
+    }
+
+    #[test]
+    fn shift_makes_an_ellipse_a_circle() {
+        let o = pos2(10.0, 10.0);
+        assert!(close(
+            constrain(Tool::Ellipse, o, pos2(30.0, 14.0), true, ANY),
+            pos2(30.0, 30.0)
+        ));
+    }
 
     use super::constrain;
     use super::extend_stroke;
