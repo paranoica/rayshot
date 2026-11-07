@@ -45,10 +45,11 @@ then `./rayshot install-hotkey Print`.
 over a packaged one, so run `gnome-extension/uninstall.sh` before switching to
 the package.
 
-rayshot needs `wl-clipboard` and a Vulkan driver. Copying text is optional and
-needs Tesseract with its language data: `tesseract-data-eng` and
-`tesseract-data-rus` on Arch, `tesseract-ocr-rus` on Debian and Ubuntu,
-`tesseract-langpack-rus` on Fedora.
+rayshot needs `wl-clipboard` and a Vulkan driver, plus `xdg-desktop-portal`
+for the portal mode on other desktops. Copying text is optional and needs
+Tesseract with its language data: `tesseract`, `tesseract-data-eng` and
+`tesseract-data-rus` on Arch, `tesseract-ocr` and `tesseract-ocr-rus` on Debian
+and Ubuntu, `tesseract` and `tesseract-langpack-rus` on Fedora.
 
 ## Usage
 
@@ -109,7 +110,7 @@ On a GTX 1060, GNOME 51 and two 1080p monitors, from the keypress:
 |---|---|
 | Screen frozen | 1.7 ms |
 | Editor on screen | 38 ms (144 ms with `rayshot warm off`) |
-| Text copied (`Ctrl+Shift+C`, a paragraph) | about 0.5 s |
+| Text copied (`Ctrl+Shift+C`, a paragraph) | usually under a second |
 
 While idle the warm editor costs about 0.2 % of one core, 24 MB of its own
 memory and 196 MB of video memory; `rayshot warm off` frees all of it.
@@ -136,7 +137,8 @@ freeze; that path is not tested. Real hardware testing is on NVIDIA.
 
 GNOME's own screenshot UI freezes the screen the same way but cannot draw.
 Flameshot and Ksnip can draw, but on GNOME Wayland they capture through the
-portal, and users report permission prompts and delays. Lightshot, ShareX and CleanShot X are the closest in spirit, on
+portal; Flameshot users report permission prompts and delays, and Ksnip's
+global hotkeys do not work there. Lightshot, ShareX and CleanShot X are the closest in spirit, on
 Windows and macOS. rayshot never uploads anything. The full tables, with
 sources, are in [docs/comparison.md](docs/comparison.md).
 
@@ -162,7 +164,9 @@ gnome-extension/tests/soak.sh 100 20
 | The clipboard is empty after Enter | `wl-copy` did not get the focus in time; a notice says where the temporary copy is. |
 | "Install tesseract to copy text" | install Tesseract and its language data, see [Install](#install). |
 | `Print` does nothing after removing the package | `gsettings reset org.gnome.shell.keybindings show-screenshot-ui` |
-| "rayshot was updated…" or "…do not match" | log out and back in, so the program and the extension come from the same release. |
+| "rayshot was updated. Log out and back in…" | the package was upgraded while the old extension is still loaded: log out and back in. |
+| "rayshot was updated. Run rayshot install-hotkey Print…" | you came from the 0.1 daemon: run `rayshot install-hotkey Print` once. |
+| "…do not match" or "…is older than its GNOME extension" | update rayshot, then log out and back in, so both come from the same release. |
 | "The rayshot program was not found" | install rayshot, or point the extension at it with `RAYSHOT_BIN`. |
 
 ## License

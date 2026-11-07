@@ -46,10 +46,12 @@ rayshot — небольшая программа для скриншотов с
 установленную из пакета, поэтому перед переходом на пакет выполните
 `gnome-extension/uninstall.sh`.
 
-Для работы нужны `wl-clipboard` и драйвер Vulkan. Копирование текста
-необязательно, для него нужен Tesseract с языковыми данными:
-`tesseract-data-eng` и `tesseract-data-rus` в Arch, `tesseract-ocr-rus` в Debian
-и Ubuntu, `tesseract-langpack-rus` в Fedora.
+Для работы нужны `wl-clipboard` и драйвер Vulkan, а для режима через портал на
+других рабочих столах ещё `xdg-desktop-portal`. Копирование текста
+необязательно, для него нужен Tesseract с языковыми данными: `tesseract`,
+`tesseract-data-eng` и `tesseract-data-rus` в Arch, `tesseract-ocr` и
+`tesseract-ocr-rus` в Debian и Ubuntu, `tesseract` и `tesseract-langpack-rus` в
+Fedora.
 
 ## Использование
 
@@ -113,7 +115,7 @@ rayshot — небольшая программа для скриншотов с
 |---|---|
 | Экран замер | 1.7 мс |
 | Редактор на экране | 38 мс (144 мс с `rayshot warm off`) |
-| Текст скопирован (`Ctrl+Shift+C`, абзац) | около 0.5 с |
+| Текст скопирован (`Ctrl+Shift+C`, абзац) | обычно меньше секунды |
 
 В простое тёплый редактор занимает около 0.2 % одного ядра, 24 МБ собственной
 памяти и 196 МБ видеопамяти; `rayshot warm off` освобождает всё это.
@@ -140,8 +142,9 @@ Arch. GNOME 44 и более ранние версии расширение за
 ## Сравнение с другими
 
 Штатный скриншотер GNOME замораживает экран так же, но рисовать не умеет.
-Flameshot и Ksnip рисуют, но в GNOME на Wayland снимают через портал, и
-пользователи жалуются на окна разрешений и задержки. Ближе всего по духу
+Flameshot и Ksnip рисуют, но в GNOME на Wayland снимают через портал;
+пользователи Flameshot жалуются на окна разрешений и задержки, а глобальные
+клавиши Ksnip там не работают. Ближе всего по духу
 Lightshot, ShareX и CleanShot X на Windows и macOS. rayshot никуда ничего не
 загружает. Полные таблицы с источниками — в [docs/comparison.ru.md](docs/comparison.ru.md).
 
@@ -168,7 +171,9 @@ gnome-extension/tests/soak.sh 100 20
 | После Enter в буфере обмена пусто | `wl-copy` не успел получить фокус; уведомление подскажет, где временная копия. |
 | «Install tesseract to copy text» | установите Tesseract и языковые данные, см. [Установку](#установка). |
 | После удаления пакета `Print` ничего не делает | `gsettings reset org.gnome.shell.keybindings show-screenshot-ui` |
-| «rayshot was updated…» или «…do not match» | перезайдите в сессию, чтобы программа и расширение были из одного релиза. |
+| «rayshot was updated. Log out and back in…» | пакет обновился, а старое расширение ещё загружено: выйдите из сессии и войдите снова. |
+| «rayshot was updated. Run rayshot install-hotkey Print…» | вы обновились со старого демона 0.1: один раз выполните `rayshot install-hotkey Print`. |
+| «…do not match» или «…is older than its GNOME extension» | обновите rayshot, затем перезайдите в сессию, чтобы программа и расширение были из одного релиза. |
 | «The rayshot program was not found» | установите rayshot или укажите путь к нему через `RAYSHOT_BIN`. |
 
 ## Лицензия
