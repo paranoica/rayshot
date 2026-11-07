@@ -206,7 +206,16 @@ export default class SoakDriver extends Extension {
                 else
                     this._run(phase, total, i + 1);
             }, () => this._finish(`${phase} ${i}: session did not end`));
-        }, () => this._finish(`${phase} ${i}: overlay did not show`));
+        }, () => {
+            if (GLib.get_monotonic_time() - this._lastSegv > 10 * GLib.USEC_PER_SEC) {
+                this._finish(`${phase} ${i}: overlay did not show`);
+                return;
+            }
+            this._driverCrashes++;
+            this._lastSegv = 0;
+            waitFor(() => !r._busy, () => this._run(phase, total, i + 1),
+                () => this._finish(`${phase} ${i}: session did not end after a driver crash`));
+        });
     }
 
     _scenarios() {

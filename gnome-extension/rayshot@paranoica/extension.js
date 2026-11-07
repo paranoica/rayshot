@@ -38,11 +38,6 @@ const POPUP_TYPES = [
 const ACTION_MODES = Shell.ActionMode.ALL &
     ~(Shell.ActionMode.LOGIN_SCREEN | Shell.ActionMode.LOCK_SCREEN | Shell.ActionMode.UNLOCK_SCREEN);
 
-function trace(t0, what) {
-    const ms = (GLib.get_monotonic_time() - t0) / 1000;
-    console.log(`rayshot: +${ms.toFixed(1)}ms ${what}`);
-}
-
 function frameDir() {
     return GLib.build_filenamev([GLib.get_user_runtime_dir(), 'rayshot']);
 }
@@ -107,18 +102,19 @@ function surfaceOf(windowActor) {
         windowActor.get_last_child();
 }
 
-// GNOME disables extensions on every lock, so on every resume too; a spare
-// that gave up stays given up, and quiet, until warm is turned off and on.
-const givenUp = {failures: 0, notified: false};
-
 export default class RayshotExtension extends Extension {
     enable() {
         this._epoch = (this._epoch ?? 0) + 1;
+        this._givenUp ??= {failures: 0, notified: false};
         sweepFrames();
         this._settings = this.getSettings();
+        this._debug = this._settings.get_boolean('debug-log');
+        this._debugId = this._settings.connect('changed::debug-log', () => {
+            this._debug = this._settings.get_boolean('debug-log');
+        });
         this._notified = new Set();
         this._copyNotice = null;
-        console.log(`rayshot: using ${this._bin() ?? 'no rayshot binary'}`);
+        this._log(`using ${this._bin() ?? 'no rayshot binary'}`);
         this._watchOwnFiles();
         this._busy = false;
         this._overlay = null;
@@ -129,10 +125,11 @@ export default class RayshotExtension extends Extension {
         this._paintWait = null;
         this._session = 0;
         this._server = null;
-        this._serverFailures = givenUp.failures;
-        if (givenUp.notified)
+        this._serverFailures = this._givenUp.failures;
+        if (this._givenUp.notified)
             this._notified.add('spare-failed');
         this._binMisses = 0;
+        this._dying = new Set();
         this._respawnId = 0;
         this._gcId = 0;
         this._warmId = this._settings.connect('changed::warm-overlay', () => this._syncServer());
@@ -153,10 +150,11 @@ export default class RayshotExtension extends Extension {
     }
 
     disable() {
-        // Only a lock keeps it; turning the extension off and on starts over.
         const keep = Main.sessionMode.isLocked && !shouldRespawn(this._serverFailures);
-        givenUp.failures = keep ? this._serverFailures : 0;
-        givenUp.notified = keep && this._notified.has('spare-failed');
+        this._givenUp = {
+            failures: keep ? this._serverFailures : 0,
+            notified: keep && this._notified.has('spare-failed'),
+        };
         this._epoch++;
         Main.wm.removeKeybinding('capture');
         global.display.disconnect(this._winCreatedId);
@@ -171,19 +169,37 @@ export default class RayshotExtension extends Extension {
         }
         try {
             this._overlay?.proc.send_signal(SIGTERM);
+            this._overlay?.proc.force_exit();
         } catch (e) {
             logError(e, 'rayshot: cannot stop overlay');
         }
+        if (this._overlay?.framePath)
+            deleteQuietly(this._overlay.framePath);
         this._overlay = null;
         this._unfreeze();
         this._stopServer();
+        for (const server of this._dying) {
+            server.killId = removeSource(server.killId);
+            server.proc.force_exit();
+        }
+        this._dying.clear();
         this._gcId = removeSource(this._gcId);
         this._settings.disconnect(this._warmId);
+        this._settings.disconnect(this._debugId);
         this._selfMonitor?.cancel();
         this._selfMonitor = null;
         this._copyNotice?.destroy();
         this._copyNotice = null;
         this._settings = null;
+    }
+
+    _log(what) {
+        if (this._debug)
+            console.log(`rayshot: ${what}`);
+    }
+
+    _trace(t0, what) {
+        this._log(`+${((GLib.get_monotonic_time() - t0) / 1000).toFixed(1)}ms ${what}`);
     }
 
     _bin() {
@@ -217,7 +233,7 @@ export default class RayshotExtension extends Extension {
     _syncServer(fresh = true) {
         if (!this._settings.get_boolean('warm-overlay')) {
             this._stopServer();
-            console.log('rayshot: warm overlay off');
+            this._log('warm overlay off');
         } else if (!this._server && !this._respawnId) {
             if (fresh) {
                 this._serverFailures = 0;
@@ -300,8 +316,10 @@ export default class RayshotExtension extends Extension {
         } catch (e) {
             logError(e, 'rayshot: cannot stop the overlay server');
         }
+        this._dying.add(server);
         server.killId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, KILL_GRACE_MS, () => {
             server.killId = 0;
+            this._dying.delete(server);
             server.proc.force_exit();
             return GLib.SOURCE_REMOVE;
         });
@@ -320,7 +338,10 @@ export default class RayshotExtension extends Extension {
                 return;
             }
         }
-        console.log(`rayshot: overlay server restarts in ${delay}ms`);
+        if (served)
+            this._log('overlay server restarts');
+        else
+            console.log(`rayshot: overlay server restarts in ${delay}ms`);
         this._respawnId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
             this._startServer();
             return GLib.SOURCE_REMOVE;
@@ -398,7 +419,7 @@ export default class RayshotExtension extends Extension {
                 return;
             }
             server.ready = true;
-            console.log('rayshot: overlay server ready');
+            this._log('overlay server ready');
             return;
         }
         const reply = /^(closed|failed) (\d+)$/.exec(line);
@@ -437,6 +458,7 @@ export default class RayshotExtension extends Extension {
     _onServerExit(server, epoch) {
         server.readyId = removeSource(server.readyId);
         server.killId = removeSource(server.killId);
+        this._dying?.delete(server);
         if (server.ready && GLib.get_monotonic_time() - server.startedAt > STABLE_SERVER_MS * 1000)
             this._serverFailures = 0;
         // The reader runs on to EOF so a late `copy-failed` still lands, but a
@@ -518,7 +540,7 @@ export default class RayshotExtension extends Extension {
             this._gcId = 0;
             const started = GLib.get_monotonic_time();
             System.gc();
-            trace(started, 'garbage collected');
+            this._trace(started, 'garbage collected');
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -540,9 +562,9 @@ export default class RayshotExtension extends Extension {
             const windows = [...this._overlay?.windows.keys() ?? []];
             if (this._overlay?.shown && windows.length > 0) {
                 windows.forEach(w => Main.activateWindow(w));
-                console.log('rayshot: capture already open, brought it to the front');
+                this._log('capture already open, brought it to the front');
             } else {
-                console.log('rayshot: capture already in progress, ignored');
+                this._log('capture already in progress, ignored');
             }
             return;
         }
@@ -579,12 +601,12 @@ export default class RayshotExtension extends Extension {
     _onStageContent(shooter, res, t0) {
         const [content] = shooter.screenshot_stage_to_content_finish(res);
         if (this._frozen) {
-            console.log('rayshot: screen already frozen, capture dropped');
+            this._log('screen already frozen, capture dropped');
             return;
         }
         const texture = content.get_texture();
         this._freezeScreen(content, texture);
-        trace(t0, `screen frozen ${texture.get_width()}x${texture.get_height()}`);
+        this._trace(t0, `screen frozen ${texture.get_width()}x${texture.get_height()}`);
         this._closeShellChrome();
         global.stage.set_key_focus(this._frozen.actor);
         if (this._server?.ready)
@@ -619,7 +641,7 @@ export default class RayshotExtension extends Extension {
         }
         server.ready = false;
         server.showSent = true;
-        trace(t0, `session ${overlay.session} sent to the server`);
+        this._trace(t0, `session ${overlay.session} sent to the server`);
         this._overlay = overlay;
         this._arm(t0);
     }
@@ -746,7 +768,7 @@ export default class RayshotExtension extends Extension {
     _cancelCapture() {
         const overlay = this._overlay;
         if (!overlay) {
-            console.log('rayshot: capture cancelled before the overlay started');
+            this._log('capture cancelled before the overlay started');
             this._cancelPaintWait();
             this._abort();
             return;
@@ -755,7 +777,7 @@ export default class RayshotExtension extends Extension {
         const line = overlay.server ? `cancel ${overlay.session}\n` : 'quit\n';
         try {
             overlay.proc.get_stdin_pipe().write_all(new TextEncoder().encode(line), null);
-            console.log('rayshot: capture cancelled before the overlay showed');
+            this._log('capture cancelled before the overlay showed');
         } catch (e) {
             logError(e, 'rayshot: cannot cancel the overlay');
             this._terminate(overlay);
@@ -833,7 +855,7 @@ export default class RayshotExtension extends Extension {
             this._abort();
             return;
         }
-        trace(t0, 'one-shot overlay spawned');
+        this._trace(t0, 'one-shot overlay spawned');
         this._readOneShot(new Gio.DataInputStream({base_stream: proc.get_stdout_pipe()}));
         const overlay = {
             proc,
@@ -897,7 +919,7 @@ export default class RayshotExtension extends Extension {
                 overlay.framePath = this._writeFrame(pixbuf, t0);
                 overlay.proc.get_stdin_pipe().write_all(
                     new TextEncoder().encode(`frame ${overlay.session} ${overlay.framePath}\n`), null);
-                trace(t0, 'pixels sent');
+                this._trace(t0, 'pixels sent');
             } catch (e) {
                 logError(e, 'rayshot: cannot hand pixels to the overlay');
                 if (overlay.framePath)
@@ -934,7 +956,7 @@ export default class RayshotExtension extends Extension {
             if (!written)
                 deleteQuietly(file.get_path());
         }
-        trace(started, `frame file written ${pixbuf.get_width()}x${pixbuf.get_height()}`);
+        this._trace(started, `frame file written ${pixbuf.get_width()}x${pixbuf.get_height()}`);
         return file.get_path();
     }
 
@@ -951,10 +973,10 @@ export default class RayshotExtension extends Extension {
             this._armed = null;
             const overlay = this._overlay;
             if (overlay && !overlay.shown) {
-                trace(t0, 'overlay showed no frame in time, terminating it');
+                this._trace(t0, 'overlay showed no frame in time, terminating it');
                 this._terminate(overlay);
             } else {
-                trace(t0, 'no overlay first frame in time, grab left alone');
+                this._trace(t0, 'no overlay first frame in time, grab left alone');
             }
             return GLib.SOURCE_REMOVE;
         });
@@ -1000,7 +1022,7 @@ export default class RayshotExtension extends Extension {
         const overlay = this._overlay;
         this._trackWindow(overlay, win);
         if (this._armed)
-            trace(this._armed.t0, `overlay window on monitor ${win.get_monitor()}`);
+            this._trace(this._armed.t0, `overlay window on monitor ${win.get_monitor()}`);
         const actor = win.get_compositor_private();
         if (!actor) {
             console.log('rayshot: overlay window has no actor, cannot show it over the freeze');
@@ -1051,7 +1073,7 @@ export default class RayshotExtension extends Extension {
             const monitor = global.display.get_current_monitor();
             const target = windows.find(w => w.get_monitor() === monitor) ?? windows[0];
             if (target) {
-                console.log(`rayshot: ${focus.get_wm_class() ?? 'a window'} took the focus from the overlay, taking it back`);
+                this._log(`${focus.get_wm_class() ?? 'a window'} took the focus from the overlay, taking it back`);
                 Main.activateWindow(target);
             }
             return GLib.SOURCE_REMOVE;
@@ -1085,7 +1107,7 @@ export default class RayshotExtension extends Extension {
         const {t0, timeoutId} = this._armed;
         removeSource(timeoutId);
         this._armed = null;
-        trace(t0, 'overlay first frame');
+        this._trace(t0, 'overlay first frame');
 
         const windows = global.get_window_actors()
             .map(a => a.get_meta_window())
@@ -1096,7 +1118,7 @@ export default class RayshotExtension extends Extension {
                 !this._isOverlay(w))
             .map(w => w.get_frame_rect());
         if (popups.length === 0) {
-            trace(t0, 'no wayland popup, no click');
+            this._trace(t0, 'no wayland popup, no click');
             return;
         }
 
@@ -1104,7 +1126,7 @@ export default class RayshotExtension extends Extension {
         const target = pickClickPoint(area, popups);
         const rects = popups.map(r => `${r.x},${r.y} ${r.width}x${r.height}`).join('; ');
         if (!target) {
-            trace(t0, `popups [${rects}] cover every click point, no click`);
+            this._trace(t0, `popups [${rects}] cover every click point, no click`);
             return;
         }
         this._clickWhenSettled(win, this._overlay, target, rects, t0, 0);
@@ -1134,7 +1156,7 @@ export default class RayshotExtension extends Extension {
                 const why = settled
                     ? `target ${target.x},${target.y} is not over the overlay`
                     : 'overlay never settled';
-                trace(t0, `popups [${rects}], ${why}, no click`);
+                this._trace(t0, `popups [${rects}], ${why}, no click`);
                 return;
             }
             this._settleId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, SETTLE_INTERVAL_MS, () => {
@@ -1152,6 +1174,6 @@ export default class RayshotExtension extends Extension {
         ptr.notify_button(Clutter.CURRENT_TIME, Clutter.BUTTON_MIDDLE, Clutter.ButtonState.PRESSED);
         ptr.notify_button(Clutter.CURRENT_TIME, Clutter.BUTTON_MIDDLE, Clutter.ButtonState.RELEASED);
         ptr.notify_absolute_motion(Clutter.CURRENT_TIME, x, y);
-        trace(t0, `popups [${rects}], clicked ${target.x},${target.y} after ${attempt} waits, pointer back to ${x},${y}`);
+        this._trace(t0, `popups [${rects}], clicked ${target.x},${target.y} after ${attempt} waits, pointer back to ${x},${y}`);
     }
 }

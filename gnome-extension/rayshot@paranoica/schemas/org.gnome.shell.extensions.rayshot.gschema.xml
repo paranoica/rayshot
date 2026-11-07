@@ -12,6 +12,11 @@
       <summary>Path to the rayshot program</summary>
       <description>Absolute path of the rayshot binary. Empty means the rayshot found on PATH.</description>
     </key>
+    <key name="debug-log" type="b">
+      <default>false</default>
+      <summary>Log every capture step</summary>
+      <description>Write timings and routine events of every capture to the journal. Errors are logged either way.</description>
+    </key>
     <key name="warm-overlay" type="b">
       <default>true</default>
       <summary>Keep the overlay process warm</summary>

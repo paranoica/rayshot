@@ -1,9 +1,9 @@
 {
   "uuid": "rayshot@paranoica",
   "name": "rayshot",
-  "description": "Freezes the screen on the rayshot hotkey and opens the rayshot editor over it. Needs the rayshot program.",
+  "description": "Instant screenshots with annotations: the hotkey (Ctrl+Print by default) freezes the screen at once and opens the rayshot editor over it, where you select a region, draw on it and copy or save it.\n\nNeeds the rayshot program, installed separately: https://github.com/paranoica/rayshot\n\nClipboard: the rayshot editor puts the screenshot on the clipboard when you press Enter, and the recognised text when you press Ctrl+Shift+C. The extension itself never reads the clipboard.",
   "shell-version": ["45", "46", "47", "48", "49", "50", "51"],
+  "url": "https://github.com/paranoica/rayshot",
   "settings-schema": "org.gnome.shell.extensions.rayshot",
-  "version": 4,
   "version-name": "0.4.0"
 }
