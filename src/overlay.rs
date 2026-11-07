@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use tokio::runtime::Handle;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
@@ -584,6 +584,18 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
         let Some(idx) = self.windows.iter().position(|w| w.window.id() == id) else {
             return;
         };
+
+        if let WindowEvent::MouseInput {
+            state: ElementState::Released,
+            ..
+        } = event
+            && self.windows[idx].unrendered_input
+        {
+            if let Err(e) = self.render_window(idx) {
+                eprintln!("[rayshot] render error: {e:?}");
+            }
+            self.windows[idx].unrendered_input = false;
+        }
 
         {
             let win = &mut self.windows[idx];
