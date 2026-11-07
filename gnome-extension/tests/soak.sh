@@ -93,6 +93,16 @@ ANY_SHELL=false
 export RAYSHOT_BIN="$BIN"
 export RAYSHOT_SOAK_OUT="$WORK/result.json"
 export RAYSHOT_SOAK_WARM="${1:-100}" RAYSHOT_SOAK_COLD="${2:-20}"
+export RAYSHOT_SOAK_SUITE="${RAYSHOT_SOAK_SUITE:-full}"
+MONITORS=""
+for size in ${RAYSHOT_SOAK_MONITORS:-1920x1080 1920x1080}; do
+    MONITORS="$MONITORS --virtual-monitor $size"
+done
+MUTTER_FEATURES="[]"
+if [ "$RAYSHOT_SOAK_SUITE" = displays ]; then
+    MUTTER_FEATURES="['scale-monitor-framebuffer']"
+    export RAYSHOT_NO_REMEMBER_SELECTION=1
+fi
 unset WAYLAND_DISPLAY DISPLAY
 
 RAYSHOT_NESTED_TAG="$TAG" dbus-run-session -- sh -c "
@@ -100,7 +110,9 @@ RAYSHOT_NESTED_TAG="$TAG" dbus-run-session -- sh -c "
     gsettings set org.gnome.shell enabled-extensions \"['rayshot@paranoica', 'rayshot-soak@paranoica']\"
     gsettings set org.gnome.shell welcome-dialog-last-shown-version '999'
     gsettings set org.gnome.shell disable-extension-version-validation $ANY_SHELL
-    exec gnome-shell --headless --wayland --virtual-monitor 1920x1080 --virtual-monitor 1920x1080
+    gsettings set org.gnome.mutter experimental-features \"$MUTTER_FEATURES\"
+    gsettings set org.gnome.desktop.input-sources sources \"[('xkb', 'us'), ('xkb', 'ru')]\"
+    exec gnome-shell --headless --wayland $MONITORS
 " >"$WORK/shell.log" 2>&1 &
 SHELL_PID=$!
 

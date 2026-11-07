@@ -28,6 +28,14 @@ app.connect('activate', () => {
     keys.connect('key-released', (_c, keyval) => note(`release ${keyval}`));
     win.add_controller(keys);
     win.connect('notify::is-active', () => note(win.is_active ? 'focus in' : 'focus out'));
+    const fill = GLib.getenv('RAYSHOT_SOAK_HELPER_FULLSCREEN');
+    if (fill) {
+        const css = new Gtk.CssProvider();
+        css.load_from_string(`window { background: ${fill}; }`);
+        Gtk.StyleContext.add_provider_for_display(win.get_display(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION);
+        win.fullscreen();
+    }
     win.present();
 });
 app.run([]);

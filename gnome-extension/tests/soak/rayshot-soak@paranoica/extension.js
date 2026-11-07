@@ -8,6 +8,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import {MAX_FAILURES} from '../rayshot@paranoica/backoff.js';
 import {defaultSeat} from '../rayshot@paranoica/compat.js';
+import {Displays} from './displays.js';
 
 const TICK_MS = 20;
 const STEP_TIMEOUT_MS = 5000;
@@ -229,7 +230,7 @@ export default class SoakDriver extends Extension {
         // A virtual device drops events sent right after it is created.
         this._keyboard = defaultSeat(global.stage, Clutter)
             .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
-        const steps = [
+        const steps = GLib.getenv('RAYSHOT_SOAK_SUITE') === 'displays' ? new Displays(this).steps() : [
             next => this._copies(next),
             next => this._coldCopies(next),
             next => this._copyFails(next),
