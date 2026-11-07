@@ -173,6 +173,8 @@ export class Displays {
                     this._russian(next);
                 else if (kind === 'fullscreen')
                     this._fullscreen(next);
+                else if (kind === 'shape-enter')
+                    this._shapeEnter(next);
                 else if (kind === 'text-enter' || kind === 'text-escape')
                     this._textKey(kind === 'text-enter' ? Clutter.KEY_Return : Clutter.KEY_Escape, next);
                 else if (kind === 'spam')
@@ -486,6 +488,87 @@ export class Displays {
                     `want ${hex(fill)}`);
             }, fail)), fail);
         }), () => fail('the helper window never went fullscreen'));
+    }
+
+    _shapeEnter(next) {
+        const name = 'enter with a shape selected lets go of the shape first';
+        const r = this._r();
+        const fail = why => this._fail(name, why, next);
+        const k = this._d._keyboard;
+        const now = () => GLib.get_monotonic_time();
+        const tap = v => {
+            k.notify_keyval(now(), v, Clutter.KeyState.PRESSED);
+            k.notify_keyval(now(), v, Clutter.KeyState.RELEASED);
+        };
+        const nudge = () => {
+            k.notify_keyval(now(), Clutter.KEY_Shift_L, Clutter.KeyState.PRESSED);
+            tap(Clutter.KEY_Right);
+            k.notify_keyval(now(), Clutter.KEY_Shift_L, Clutter.KeyState.RELEASED);
+        };
+        const marker = 'rayshot-soak-marker';
+        const clipboard = St.Clipboard.get_default();
+        const area = {x: 200, y: 200};
+        const from = {x: 400, y: 400};
+        const to = {x: 600, y: 550};
+        this._capture(from, overlay => {
+            try {
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${overlay.session} ${area.x} ${area.y} 900 800\n`), null);
+            } catch (e) {
+                fail(`cannot select: ${e.message}`);
+                return;
+            }
+            clipboard.set_text(St.ClipboardType.CLIPBOARD, marker);
+            const p = this._device();
+            const press = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED);
+            const release = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
+            const move = at => p.notify_absolute_motion(now(), at.x, at.y);
+            sequence([
+                () => tap(Clutter.KEY_r),
+                () => move(from),
+                press,
+                () => move({x: 500, y: 480}),
+                () => move(to),
+                release,
+                () => tap(Clutter.KEY_s),
+                () => move({x: from.x, y: 470}),
+                press,
+                release,
+                nudge,
+                nudge,
+                nudge,
+                () => tap(Clutter.KEY_Return),
+            ], () => later(600, () => clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c, text) => {
+                if (!r._busy || text !== marker) {
+                    this._d._result(name, false, `the first enter copied (clipboard ${text === marker ? 'unchanged' : 'changed'})`);
+                    if (r._busy)
+                        this._d._endSession(next);
+                    else
+                        next();
+                    return;
+                }
+                tap(Clutter.KEY_Return);
+                waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                    const scale = overlay.texture.get_width() / global.stage.width;
+                    const y = (470 - area.y) * scale;
+                    const moved = pixel(pb, (from.x + 30 - area.x) * scale, y);
+                    const old = pixel(pb, (from.x - area.x) * scale - 4, y);
+                    const red = moved !== null && moved[0] > 180 && moved[1] < 120 && moved[2] < 120;
+                    const stayed = old !== null && old[0] > 180 && old[1] < 120 && old[2] < 120;
+                    const ok = red && !stayed;
+                    this._d._result(name, ok, ok
+                        ? 'the first enter only let go of the shape, the second copied it nudged 30 px'
+                        : `after the second enter the rect edge is ${hex(moved)} at the nudged spot and ${hex(old)} where it was`);
+                    next();
+                }, why => {
+                    this._d._result(name, false, `the second enter: ${why}`);
+                    next();
+                })), () => {
+                    this._d._result(name, false, 'the second enter did not copy');
+                    this._d._endSession(next);
+                });
+            })));
+        }, fail);
     }
 
     _textKey(keyval, next) {

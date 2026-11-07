@@ -658,7 +658,9 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             Key::Named(NamedKey::Delete | NamedKey::Backspace)
                         );
                         if selected.is_some()
-                            && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+                            && (matches!(event.logical_key, Key::Named(NamedKey::Escape))
+                                || (!ctrl
+                                    && matches!(event.logical_key, Key::Named(NamedKey::Enter))))
                         {
                             self.selected = None;
                             self.scene.break_group();
