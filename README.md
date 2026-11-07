@@ -23,7 +23,7 @@ no flash, no screen-sharing prompt.
 - **Instant:** the screen freezes in about 2 ms and the editor follows right after.
 - **What you see is what you get:** the picture is the frame on screen at the keypress.
 - **Lightshot flow:** select, annotate, Enter copies, the floppy saves.
-- **Tools:** pen, line, arrow, rectangle, marker, text, pixelate and a real blur.
+- **Tools:** pen, line, arrow, rectangle, ellipse, numbered markers, marker, text, pixelate, a real blur and a colour picker.
 - **Multi-monitor:** select across monitors; the last selection is remembered.
 
 <div align="center">
@@ -280,17 +280,24 @@ Press the hotkey, drag a region, annotate, press Enter.
 | Key | Tool | | Key | Action |
 |---|---|---|---|---|
 | `S` / `V` | select, move, resize | | `Enter` / `Ctrl+C` | copy |
-| `P` | pen | | floppy button | save to your pictures folder |
-| `L` | line | | `Ctrl+Z` | undo |
-| `A` | arrow | | `Ctrl+Y` / `Ctrl+Shift+Z` | redo |
-| `R` | rectangle | | `Esc` | cancel |
-| `M` | marker | | | |
+| `P` | pen | | `Ctrl+S` | save to your pictures folder |
+| `L` | line | | `Ctrl+Shift+S` | save as… (choose folder and name) |
+| `A` | arrow | | `Ctrl+Z` | undo |
+| `R` | rectangle | | `Ctrl+Y` / `Ctrl+Shift+Z` | redo |
+| `E` | ellipse | | `Esc` | cancel |
+| `N` | numbered marker: click for 1, 2, 3… | | mouse wheel | line width |
+| `M` | marker | | `1`–`9` | colours |
 | `T` | text | | | |
 | `X` | pixelate | | | |
 | `B` | blur | | | |
+| `I` | colour picker: copies `#RRGGBB` | | | |
 
 Hold **Shift** while drawing for straight work, as in Paint: lines, arrows,
-the pen and the marker snap to 45° steps, and rectangles become squares.
+the pen and the marker snap to 45° steps, rectangles become squares and
+ellipses become circles.
+
+The gear on the toolbar chooses which tools are shown; hidden tools keep their
+keys. Your colour, width and toolbar choice are remembered between captures.
 
 **Where screenshots go.** Copying puts the image on the clipboard and keeps a
 temporary copy in `$XDG_RUNTIME_DIR/rayshot/`, which lives in RAM, is cleared
