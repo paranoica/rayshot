@@ -23,3 +23,20 @@ export function pickClickPoint(area, popups) {
     return candidates.find(p =>
         contains(area, p.x, p.y) && !popups.some(r => contains(r, p.x, p.y))) ?? null;
 }
+
+export function frameMonitors(connectors, indexOf, monitors, frame, stage) {
+    const sx = frame.width / stage.width;
+    const sy = frame.height / stage.height;
+    return connectors.flatMap(connector => {
+        const g = monitors[indexOf(connector)];
+        if (!g || !connector || /[\s:]/.test(connector))
+            return [];
+        const x0 = Math.round(g.x * sx);
+        const y0 = Math.round(g.y * sy);
+        const x1 = Math.min(Math.round((g.x + g.width) * sx), frame.width);
+        const y1 = Math.min(Math.round((g.y + g.height) * sy), frame.height);
+        if (x1 <= x0 || y1 <= y0)
+            return [];
+        return [`${connector}:${x0},${y0},${x1 - x0},${y1 - y0}`];
+    });
+}

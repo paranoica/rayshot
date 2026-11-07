@@ -111,6 +111,7 @@ fn main() -> Result<()> {
             let (width, height) = (dim(3)?, dim(4)?);
             live::skip_core_dumps();
             export::cleanup_old(&export::scratch_dir(), export::SCRATCH_MAX_AGE);
+            let mut monitors = Vec::new();
             if std::env::args().nth(5).as_deref() == Some("--protocol") {
                 let theirs: u32 = std::env::args()
                     .nth(6)
@@ -123,12 +124,14 @@ fn main() -> Result<()> {
                     );
                     std::process::exit(PROTOCOL_MISMATCH_EXIT);
                 }
+                let rest: Vec<String> = std::env::args().skip(7).collect();
+                monitors = live::parse_monitors(&rest);
             }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("failed to build tokio runtime")?;
-            return overlay::run_live(width, height, rt.handle().clone());
+            return overlay::run_live(width, height, monitors, rt.handle().clone());
         }
         // `trigger` was the old daemon hotkey command; it now just captures.
         Some(cmd) if !matches!(cmd, "trigger" | "shot") => {

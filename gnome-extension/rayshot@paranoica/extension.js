@@ -11,9 +11,9 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 
 import {MAX_FAILURES, respawnDelay, shouldRespawn} from './backoff.js';
-import {PROTOCOL_VERSION, defaultSeat, persistentNotice, readyVersion, resolveBin, unredirect} from './compat.js';
+import {PROTOCOL_VERSION, defaultSeat, monitorManager, persistentNotice, readyVersion, resolveBin, unredirect} from './compat.js';
 import {frameHeader} from './frame.js';
-import {pickClickPoint} from './geometry.js';
+import {frameMonitors, pickClickPoint} from './geometry.js';
 
 const ARM_TIMEOUT_MS = 5000;
 const DRAG_WATCH_MS = 50;
@@ -112,6 +112,10 @@ export default class RayshotExtension extends Extension {
         this._debugId = this._settings.connect('changed::debug-log', () => {
             this._debug = this._settings.get_boolean('debug-log');
         });
+        this._connectors = [];
+        this._outputsCancel = new Gio.Cancellable();
+        this._readOutputs();
+        this._monitorsId = Main.layoutManager.connect('monitors-changed', () => this._readOutputs());
         this._notified = new Set();
         this._copyNotice = null;
         this._log(`using ${this._bin() ?? 'no rayshot binary'}`);
@@ -186,11 +190,39 @@ export default class RayshotExtension extends Extension {
         this._gcId = removeSource(this._gcId);
         this._settings.disconnect(this._warmId);
         this._settings.disconnect(this._debugId);
+        Main.layoutManager.disconnect(this._monitorsId);
+        this._outputsCancel.cancel();
+        this._outputsCancel = null;
         this._selfMonitor?.cancel();
         this._selfMonitor = null;
         this._copyNotice?.destroy();
         this._copyNotice = null;
         this._settings = null;
+    }
+
+    _readOutputs() {
+        const cancellable = this._outputsCancel;
+        Gio.DBus.session.call('org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+            'org.gnome.Mutter.DisplayConfig', 'GetCurrentState', null, null, Gio.DBusCallFlags.NONE,
+            -1, cancellable, (conn, res) => {
+                try {
+                    const [, , logical] = conn.call_finish(res).recursiveUnpack();
+                    this._connectors = logical.flatMap(([, , , , , outputs]) =>
+                        outputs.map(([connector]) => connector));
+                } catch (e) {
+                    if (!cancellable.is_cancelled())
+                        logError(e, 'rayshot: cannot read the monitor layout');
+                }
+            });
+    }
+
+    _frameMonitors(texture) {
+        const n = global.display.get_n_monitors();
+        const geometries = [...Array(n).keys()].map(i => global.display.get_monitor_geometry(i));
+        const manager = monitorManager(global, Meta);
+        return frameMonitors(this._connectors, c => manager?.get_monitor_for_connector(c) ?? -1, geometries,
+            {width: texture.get_width(), height: texture.get_height()},
+            {width: global.stage.width, height: global.stage.height});
     }
 
     _log(what) {
@@ -632,8 +664,9 @@ export default class RayshotExtension extends Extension {
             framePath: null,
         };
         try {
-            server.proc.get_stdin_pipe().write_all(new TextEncoder().encode(
-                `show ${overlay.session} ${texture.get_width()} ${texture.get_height()}\n`), null);
+            const show = ['show', overlay.session, texture.get_width(), texture.get_height(),
+                ...this._frameMonitors(texture)].join(' ');
+            server.proc.get_stdin_pipe().write_all(new TextEncoder().encode(`${show}\n`), null);
         } catch (e) {
             logError(e, 'rayshot: overlay server unreachable, falling back');
             this._afterNextPaint(() => this._launch(texture, t0));
@@ -848,7 +881,7 @@ export default class RayshotExtension extends Extension {
         try {
             proc = Gio.Subprocess.new(
                 [bin, 'overlay', '--live', `${texture.get_width()}`, `${texture.get_height()}`,
-                    '--protocol', `${PROTOCOL_VERSION}`],
+                    '--protocol', `${PROTOCOL_VERSION}`, ...this._frameMonitors(texture)],
                 Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE);
         } catch (e) {
             logError(e, 'rayshot: spawn overlay failed');

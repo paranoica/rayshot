@@ -43,6 +43,7 @@ enum UserEvent {
         id: u64,
         width: u32,
         height: u32,
+        monitors: Vec<crate::live::MonitorRect>,
     },
     SessionFrame {
         id: u64,
@@ -75,7 +76,12 @@ pub fn run(rt: Handle) -> Result<()> {
     Ok(())
 }
 
-pub fn run_live(width: u32, height: u32, rt: Handle) -> Result<()> {
+pub fn run_live(
+    width: u32,
+    height: u32,
+    monitors: Vec<crate::live::MonitorRect>,
+    rt: Handle,
+) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("failed to create winit event loop")?;
@@ -87,6 +93,7 @@ pub fn run_live(width: u32, height: u32, rt: Handle) -> Result<()> {
     let mut app = OverlayApp::new(rt);
     app.live = true;
     app.frame_size = Some((width, height));
+    app.monitor_rects = monitors;
     event_loop.run_app(&mut app).context("event loop error")?;
     Ok(())
 }
@@ -118,7 +125,17 @@ fn read_commands(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let event = match crate::live::parse_command(&line) {
-            Some(Command::Show { id, width, height }) => UserEvent::Show { id, width, height },
+            Some(Command::Show {
+                id,
+                width,
+                height,
+                monitors,
+            }) => UserEvent::Show {
+                id,
+                width,
+                height,
+                monitors,
+            },
             Some(Command::Frame { id, path }) => {
                 let started = std::time::Instant::now();
                 let result = crate::capture::read_frame_file(&path).map_err(|e| format!("{e:#}"));
@@ -177,6 +194,7 @@ struct OverlayApp {
     live: bool,
     see_through: bool,
     frame_size: Option<(u32, u32)>,
+    monitor_rects: Vec<crate::live::MonitorRect>,
     pending_export: Option<Action>,
     frame: Option<Arc<Frame>>,
     pending_frame: Option<Frame>,
@@ -224,6 +242,7 @@ impl OverlayApp {
             live: false,
             see_through: false,
             frame_size: None,
+            monitor_rects: Vec::new(),
             pending_export: None,
             frame: None,
             pending_frame: None,
@@ -334,6 +353,14 @@ fn launch_path(
         .unwrap_or_else(|| std::path::PathBuf::from("/proc/self/exe"))
 }
 
+fn monitor_region(name: Option<&str>, rects: &[crate::live::MonitorRect]) -> Option<egui::Rect> {
+    let m = rects.iter().find(|m| Some(m.name.as_str()) == name)?;
+    Some(egui::Rect::from_min_size(
+        egui::pos2(m.x as f32, m.y as f32),
+        egui::vec2(m.width as f32, m.height as f32),
+    ))
+}
+
 fn spawn_detached(command: &str, file: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::process::CommandExt;
     let exe = launch_path(std::env::current_exe().ok(), &|p| p.exists());
@@ -432,6 +459,7 @@ struct WindowState {
     suboptimal_reconfigured: bool,
     frames: u64,
     cursor: Option<egui::Pos2>,
+    unrendered_input: bool,
 }
 
 impl ApplicationHandler<UserEvent> for OverlayApp {
@@ -478,7 +506,13 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
-            UserEvent::Show { id, width, height } => {
+            UserEvent::Show {
+                id,
+                width,
+                height,
+                monitors,
+            } => {
+                self.monitor_rects = monitors;
                 self.start_session(event_loop, id, width, height);
             }
             UserEvent::Select { id, from, to } => {
@@ -557,6 +591,14 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             if resp.repaint {
                 win.window.request_redraw();
             }
+            if matches!(
+                event,
+                WindowEvent::CursorMoved { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::MouseWheel { .. }
+            ) {
+                win.unrendered_input = true;
+            }
         }
 
         match event {
@@ -579,13 +621,14 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state.is_pressed() {
-                    if self.windows.iter().any(|w| {
-                        w.egui_ctx.memory(|m| m.focused()).is_some_and(|id| {
-                            egui::text_edit::TextEditState::load(&w.egui_ctx, id).is_some()
-                        })
-                    }) {
+                    let typing_before = self.text_has_keyboard();
+                    let drafting_before = self.text_edit.is_some();
+                    self.catch_up();
+                    if let Some(action) = self.pending.take() {
+                        self.run_action(event_loop, action);
+                    } else if typing_before || self.text_has_keyboard() {
                         self.request_redraw_all();
-                    } else if self.text_edit.is_some() {
+                    } else if drafting_before || self.text_edit.is_some() {
                         if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
                             self.commit_text();
                         }
@@ -640,17 +683,16 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             eprintln!("[rayshot] exit: Escape (cancelled)");
                             self.close(event_loop);
                         } else if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
-                            self.finish_and_exit(event_loop);
+                            self.run_action(event_loop, Action::Copy);
                         } else if ctrl && shift && is(KeyCode::KeyC) {
-                            self.copy_text_and_exit(event_loop);
+                            self.run_action(event_loop, Action::CopyText);
                         } else if ctrl && is(KeyCode::KeyC) {
-                            self.finish_and_exit(event_loop);
+                            self.run_action(event_loop, Action::Copy);
                         } else if ctrl && is(KeyCode::KeyS) {
-                            if shift {
-                                self.save_as_and_exit(event_loop);
-                            } else {
-                                self.save_and_exit(event_loop);
-                            }
+                            self.run_action(
+                                event_loop,
+                                if shift { Action::SaveAs } else { Action::Save },
+                            );
                         } else if dragging
                             && ctrl
                             && (is(KeyCode::KeyZ) || is(KeyCode::KeyY) || is(KeyCode::KeyD))
@@ -746,16 +788,11 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 if let Err(e) = self.render_window(idx) {
                     eprintln!("[rayshot] render error: {e:?}");
                 }
-                match self.pending.take() {
-                    Some(Action::Copy) => self.finish_and_exit(event_loop),
-                    Some(Action::Save) => self.save_and_exit(event_loop),
-                    Some(Action::SaveAs) => self.save_as_and_exit(event_loop),
-                    Some(Action::CopyText) => self.copy_text_and_exit(event_loop),
-                    Some(Action::Close) => {
-                        eprintln!("[rayshot] exit: toolbar close");
-                        self.close(event_loop);
-                    }
-                    None => {}
+                self.windows[idx].unrendered_input = false;
+                if !self.windows.iter().any(|w| w.unrendered_input)
+                    && let Some(action) = self.pending.take()
+                {
+                    self.run_action(event_loop, action);
                 }
             }
             _ => {}
@@ -817,10 +854,13 @@ impl OverlayApp {
             for monitor in event_loop.available_monitors() {
                 let pos = monitor.position();
                 let size = monitor.size();
-                let region = egui::Rect::from_min_size(
-                    egui::pos2(pos.x as f32, pos.y as f32),
-                    egui::vec2(size.width as f32, size.height as f32),
-                );
+                let region = monitor_region(monitor.name().as_deref(), &self.monitor_rects)
+                    .unwrap_or_else(|| {
+                        egui::Rect::from_min_size(
+                            egui::pos2(pos.x as f32, pos.y as f32),
+                            egui::vec2(size.width as f32, size.height as f32),
+                        )
+                    });
                 let attrs = Window::default_attributes()
                     .with_title("rayshot")
                     .with_visible(false)
@@ -859,6 +899,7 @@ impl OverlayApp {
             }
 
             let egui_ctx = egui::Context::default();
+            egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
             let mut fonts = egui::FontDefinitions::default();
             egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
             egui_ctx.set_fonts(fonts);
@@ -886,6 +927,7 @@ impl OverlayApp {
                 suboptimal_reconfigured: false,
                 frames: 0,
                 cursor: None,
+                unrendered_input: false,
             });
         }
         self.windows = windows;
@@ -1240,6 +1282,7 @@ impl OverlayApp {
                 egui::Sense::click_and_drag(),
             );
             let cursor_pos = raw_cursor.or_else(|| resp.interact_pointer_pos());
+            let press_pos = ui.input(|i| i.pointer.press_origin()).or(cursor_pos);
             let hit = |fp: egui::Pos2| {
                 crate::scene::shape_hit(shapes, fp).filter(|&i| Some(i) != editing_index)
             };
@@ -1273,7 +1316,7 @@ impl OverlayApp {
                         reedit_text = Some(i);
                     }
                     if resp.drag_started() {
-                        if let Some(p) = cursor_pos {
+                        if let Some(p) = press_pos {
                             let fp = to_frame(p);
                             drag_start = Some(fp);
                             let grip = selected.and_then(|i| {
@@ -1311,7 +1354,7 @@ impl OverlayApp {
                             }
                         }
                     }
-                    if resp.dragged() {
+                    if resp.dragged() || resp.drag_stopped() {
                         if let (Some(start), Some(p)) = (drag_start, cursor_pos) {
                             let fp = to_frame(p);
                             if let Some((i, grip, orig)) = &shape_drag {
@@ -1424,7 +1467,7 @@ impl OverlayApp {
                 }
                 _ => {
                     if resp.drag_started() {
-                        if let Some(p) = cursor_pos {
+                        if let Some(p) = press_pos {
                             let fp = to_frame(p);
                             draft_start = Some(fp);
                             straight_from = None;
@@ -1472,7 +1515,7 @@ impl OverlayApp {
                             }
                         }
                     }
-                    if resp.dragged() {
+                    if resp.dragged() || resp.drag_stopped() {
                         if let Some(p) = cursor_pos {
                             let fp = to_frame(p);
                             match tool {
@@ -2776,6 +2819,38 @@ impl OverlayApp {
         unsafe { libc::_exit(code) }
     }
 
+    fn text_has_keyboard(&self) -> bool {
+        self.windows.iter().any(|w| {
+            w.egui_ctx
+                .memory(|m| m.focused())
+                .is_some_and(|id| egui::text_edit::TextEditState::load(&w.egui_ctx, id).is_some())
+        })
+    }
+
+    fn catch_up(&mut self) {
+        for i in 0..self.windows.len() {
+            if self.windows[i].unrendered_input {
+                if let Err(e) = self.render_window(i) {
+                    eprintln!("[rayshot] render error: {e:?}");
+                }
+                self.windows[i].unrendered_input = false;
+            }
+        }
+    }
+
+    fn run_action(&mut self, event_loop: &ActiveEventLoop, action: Action) {
+        match action {
+            Action::Copy => self.finish_and_exit(event_loop),
+            Action::Save => self.save_and_exit(event_loop),
+            Action::SaveAs => self.save_as_and_exit(event_loop),
+            Action::CopyText => self.copy_text_and_exit(event_loop),
+            Action::Close => {
+                eprintln!("[rayshot] exit: toolbar close");
+                self.close(event_loop);
+            }
+        }
+    }
+
     fn defer_until_frame(&mut self, action: Action) -> bool {
         if self.frame.is_some() {
             return false;
@@ -3904,6 +3979,36 @@ mod tests {
             super::launch_path(None, &exists),
             std::path::PathBuf::from("/proc/self/exe")
         );
+    }
+
+    #[test]
+    fn a_window_takes_its_region_from_the_monitor_with_its_name() {
+        let rects = vec![
+            crate::live::MonitorRect {
+                name: "DP-1".into(),
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            crate::live::MonitorRect {
+                name: "DP-2".into(),
+                x: 1920,
+                y: 0,
+                width: 3840,
+                height: 2160,
+            },
+        ];
+        assert_eq!(
+            super::monitor_region(Some("DP-2"), &rects),
+            Some(egui::Rect::from_min_size(
+                egui::pos2(1920.0, 0.0),
+                egui::vec2(3840.0, 2160.0)
+            ))
+        );
+        assert_eq!(super::monitor_region(Some("HDMI-1"), &rects), None);
+        assert_eq!(super::monitor_region(None, &rects), None);
+        assert_eq!(super::monitor_region(Some("DP-1"), &[]), None);
     }
 
     #[test]

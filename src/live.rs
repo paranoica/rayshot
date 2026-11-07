@@ -1,7 +1,16 @@
 use std::path::PathBuf;
 
 /// Bumped whenever the extension and the binary would misread each other.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MonitorRect {
+    pub name: String,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
 
 #[derive(Debug, PartialEq)]
 pub enum Command {
@@ -9,6 +18,7 @@ pub enum Command {
         id: u64,
         width: u32,
         height: u32,
+        monitors: Vec<MonitorRect>,
     },
     Frame {
         id: u64,
@@ -23,6 +33,31 @@ pub enum Command {
         to: (f32, f32),
     },
     Quit,
+}
+
+fn parse_monitor(token: &str) -> Option<MonitorRect> {
+    let (name, rect) = token.rsplit_once(':')?;
+    if name.is_empty() {
+        return None;
+    }
+    let mut parts = rect.split(',').map(|v| v.parse::<u32>().ok());
+    let (x, y, width, height) = (
+        parts.next()??,
+        parts.next()??,
+        parts.next()??,
+        parts.next()??,
+    );
+    (parts.next().is_none() && width > 0 && height > 0).then(|| MonitorRect {
+        name: name.to_string(),
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+pub fn parse_monitors(tokens: &[String]) -> Vec<MonitorRect> {
+    tokens.iter().filter_map(|t| parse_monitor(t)).collect()
 }
 
 fn parse_select(rest: &str) -> Option<Command> {
@@ -61,10 +96,13 @@ pub fn parse_command(line: &str) -> Option<Command> {
     let id = parts.next()?.parse().ok()?;
     let width = parts.next()?.parse().ok().filter(|&w: &u32| w > 0)?;
     let height = parts.next()?.parse().ok().filter(|&h: &u32| h > 0)?;
-    parts
-        .next()
-        .is_none()
-        .then_some(Command::Show { id, width, height })
+    let monitors = parts.filter_map(parse_monitor).collect();
+    Some(Command::Show {
+        id,
+        width,
+        height,
+        monitors,
+    })
 }
 
 /// A crash is reported to the extension only once the kernel has finished the
@@ -149,7 +187,8 @@ mod tests {
             Some(Command::Show {
                 id: 3,
                 width: 3840,
-                height: 1080
+                height: 1080,
+                monitors: vec![]
             })
         );
         assert_eq!(
@@ -157,9 +196,88 @@ mod tests {
             Some(Command::Show {
                 id: u64::MAX,
                 width: 1,
-                height: 1
+                height: 1,
+                monitors: vec![]
             })
         );
+    }
+
+    fn monitor(name: &str, x: u32, y: u32, width: u32, height: u32) -> MonitorRect {
+        MonitorRect {
+            name: name.into(),
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn show_carries_where_each_monitor_sits_in_the_frame() {
+        assert_eq!(
+            parse_command("show 3 5760 2160 eDP-1:0,0,1920,1080 HDMI-A-1:1920,0,3840,2160\n"),
+            Some(Command::Show {
+                id: 3,
+                width: 5760,
+                height: 2160,
+                monitors: vec![
+                    monitor("eDP-1", 0, 0, 1920, 1080),
+                    monitor("HDMI-A-1", 1920, 0, 3840, 2160)
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn a_malformed_monitor_is_dropped_but_the_capture_goes_on() {
+        let bare = Some(Command::Show {
+            id: 3,
+            width: 1920,
+            height: 1080,
+            monitors: vec![],
+        });
+        for token in [
+            "DP-1:0,0,1920",
+            "DP-1:0,0,1920,1080,5",
+            ":0,0,1920,1080",
+            "DP-1",
+            "5",
+            "DP-1:0,0,0,1080",
+            "DP-1:-5,0,1920,1080",
+            "DP-1:a,0,1920,1080",
+        ] {
+            assert_eq!(
+                parse_command(&format!("show 3 1920 1080 {token}")),
+                bare,
+                "{token}"
+            );
+        }
+        assert_eq!(
+            parse_command("show 3 3840 1080 DP-1 DP-2:1920,0,1920,1080"),
+            Some(Command::Show {
+                id: 3,
+                width: 3840,
+                height: 1080,
+                monitors: vec![monitor("DP-2", 1920, 0, 1920, 1080)]
+            })
+        );
+    }
+
+    #[test]
+    fn one_shot_arguments_carry_the_monitors_too() {
+        let args: Vec<String> = ["DP-1:0,0,1920,1080", "DP-2:1920,0,1080,1920"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            parse_monitors(&args),
+            vec![
+                monitor("DP-1", 0, 0, 1920, 1080),
+                monitor("DP-2", 1920, 0, 1080, 1920)
+            ]
+        );
+        assert_eq!(parse_monitors(&[]), vec![]);
+        assert_eq!(parse_monitors(&["DP-1:0,0".to_string()]), vec![]);
     }
 
     #[test]
@@ -167,7 +285,6 @@ mod tests {
         assert_eq!(parse_command("show 3 0 1080"), None);
         assert_eq!(parse_command("show 3 1920 0"), None);
         assert_eq!(parse_command("show 3 1920"), None);
-        assert_eq!(parse_command("show 3 1920 1080 5"), None);
         assert_eq!(parse_command("show 3 a b"), None);
         assert_eq!(parse_command("show 1920 1080"), None);
         assert_eq!(parse_command("show -1 2 2"), None);

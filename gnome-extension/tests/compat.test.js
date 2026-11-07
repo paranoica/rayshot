@@ -1,4 +1,4 @@
-import {PROTOCOL_VERSION, readyVersion, resolveBin, unredirect, defaultSeat, persistentNotice} from '../rayshot@paranoica/compat.js';
+import {PROTOCOL_VERSION, readyVersion, resolveBin, unredirect, defaultSeat, persistentNotice, monitorManager} from '../rayshot@paranoica/compat.js';
 
 let failed = 0;
 let total = 0;
@@ -91,6 +91,11 @@ const old = persistentNotice(OldTray, {add: () => log.push('tray add')}, 'raysho
 check('GNOME 45 adds its own source and shows a lasting notice', log.join(' | '),
     'tray add | transient false | show rayshot: empty clipboard transient=false');
 check('GNOME 45 returns the notice', old instanceof OldNotification, true);
+
+const manager = {name: 'manager'};
+check('monitor manager from the backend', monitorManager({backend: {get_monitor_manager: () => manager}}, {}), manager);
+check('monitor manager from Meta on older shells', monitorManager({}, {MonitorManager: {get: () => manager}}), manager);
+check('no monitor manager at all', monitorManager({}, {}), null);
 
 print(`${total - failed}/${total} passed`);
 if (failed)

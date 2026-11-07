@@ -1,4 +1,4 @@
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 const usable = (path, exists) => typeof path === 'string' && path.startsWith('/') && exists(path);
 
@@ -52,4 +52,8 @@ export function persistentNotice(MessageTray, tray, title, body) {
     notice.setTransient(false);
     source.showNotification(notice);
     return notice;
+}
+
+export function monitorManager(global, Meta) {
+    return global.backend?.get_monitor_manager?.() ?? Meta.MonitorManager?.get?.() ?? null;
 }
