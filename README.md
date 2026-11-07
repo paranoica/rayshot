@@ -289,6 +289,9 @@ Press the hotkey, drag a region, annotate, press Enter.
 | `X` | pixelate | | | |
 | `B` | blur | | | |
 
+Hold **Shift** while drawing for straight work, as in Paint: lines, arrows,
+the pen and the marker snap to 45° steps, and rectangles become squares.
+
 **Where screenshots go.** Copying puts the image on the clipboard and keeps a
 temporary copy in `$XDG_RUNTIME_DIR/rayshot/`, which lives in RAM, is cleared
 at logout and pruned after 24 hours. Saving writes
