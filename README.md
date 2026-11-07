@@ -131,7 +131,9 @@ GNOME Shell 45 to 51 on Wayland. Every one of those versions runs the tests in
 CI: Fedora 39, Ubuntu 24.04, Fedora 41, Debian 13, Fedora 43, Ubuntu 26.04
 and Arch. GNOME 44 and older cannot load the extension. Other desktops can
 bind a key to `rayshot` and capture through the screenshot portal, without the
-freeze; that path is not tested. Real hardware testing is on NVIDIA.
+freeze; that path is not tested. Scaling at 100 %, 150 % and 200 %, mixed
+scaling and rotated monitors are tested on virtual monitors; real hardware
+testing is on NVIDIA at 100 %.
 
 ## Compared with others
 
@@ -144,13 +146,19 @@ sources, are in [docs/comparison.md](docs/comparison.md).
 
 ## Testing
 
-142 unit tests in Rust and five suites for the extension. A soak test runs a
+146 unit tests in Rust and five suites for the extension. A soak test runs a
 headless GNOME Shell with a real rayshot through 100 warm and 20 cold captures
 and 16 scenarios (crashes, monitors unplugged, sleep, lock, copy failures,
-OCR) and fails on any leak. CI runs a shorter soak on every GNOME version above.
+OCR) and fails on any leak. A second suite drags real selections with a
+virtual pointer at 100 %, 150 % and 200 %, on mixed scaling, rotated, stacked
+and side-by-side monitors of different sizes, an ultrawide and a fullscreen
+app, and checks the size of the copied PNG and the edges of coloured squares
+in it to a few pixels. CI runs both on every GNOME
+version above.
 
 ```sh
 gnome-extension/tests/soak.sh 100 20
+gnome-extension/tests/displays.sh
 ```
 
 ## Troubleshooting
