@@ -280,6 +280,18 @@ fn hit_handle(s: egui::Rect, p: egui::Pos2, radius: f32) -> Option<usize> {
 
 const GRIP_REACH: f32 = 9.0;
 
+fn selection_outline(
+    shape: &crate::scene::Shape,
+    to_screen: &dyn Fn(egui::Pos2) -> egui::Pos2,
+    scale: f32,
+) -> Option<egui::Rect> {
+    let b = crate::scene::bounds(shape)?;
+    Some(
+        egui::Rect::from_two_pos(to_screen(b.min), to_screen(b.max))
+            .expand(shape_width(shape).unwrap_or(0.0) * scale / 2.0 + 5.0),
+    )
+}
+
 #[derive(Debug, PartialEq)]
 enum TextOutcome {
     Added,
@@ -1200,12 +1212,28 @@ impl OverlayApp {
             let hit = |fp: egui::Pos2| {
                 crate::scene::shape_hit(shapes, fp).filter(|&i| Some(i) != editing_index)
             };
+            let selected_before = selected.filter(|&i| Some(i) != editing_index);
+            let capture_before = selection;
+            let on_capture_handle = |p: egui::Pos2| {
+                capture_before.is_some_and(|sel| {
+                    let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+                    let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
+                    hit_handle(s, p, hr).is_some()
+                })
+            };
+            let inside_selected = |p: egui::Pos2| {
+                selected_before.filter(|&i| {
+                    !on_capture_handle(p)
+                        && selection_outline(&shapes[i], &to_screen, scale)
+                            .is_some_and(|r| r.contains(p))
+                })
+            };
             match tool {
                 Tool::Select => {
                     if resp.clicked()
                         && let Some(p) = cursor_pos
                     {
-                        selected = hit(to_frame(p));
+                        selected = hit(to_frame(p)).or_else(|| inside_selected(p));
                     }
                     if resp.double_clicked()
                         && let Some(i) = selected
@@ -1226,7 +1254,7 @@ impl OverlayApp {
                             if let Some((i, g)) = grip {
                                 shape_drag = Some((i, Some(g), shapes[i].clone()));
                                 sel_mode = None;
-                            } else if let Some(i) = hit(fp) {
+                            } else if let Some(i) = inside_selected(p).or_else(|| hit(fp)) {
                                 selected = Some(i);
                                 shape_drag = Some((i, None, shapes[i].clone()));
                                 sel_mode = None;
@@ -1312,7 +1340,9 @@ impl OverlayApp {
                     } else if let Some(g) = hover.and_then(grip_under) {
                         grip_cursor(Some(g), false)
                     } else if sel_mode.is_none()
-                        && hover.is_some_and(|p| hit(to_frame(p)).is_some())
+                        && hover.is_some_and(|p| {
+                            inside_selected(p).is_some() || hit(to_frame(p)).is_some()
+                        })
                     {
                         egui::CursorIcon::Move
                     } else if let Some(sel) = selection {
@@ -1723,9 +1753,7 @@ impl OverlayApp {
             if let Some(i) = selected.filter(|&i| tool == Tool::Select && Some(i) != editing_index)
             {
                 let shape = shape_now(i);
-                if let Some(b) = crate::scene::bounds(shape) {
-                    let r = egui::Rect::from_two_pos(to_screen(b.min), to_screen(b.max))
-                        .expand(shape_width(shape).unwrap_or(0.0) * scale / 2.0 + 5.0);
+                if let Some(r) = selection_outline(shape, &to_screen, scale) {
                     let outline = [
                         r.left_top(),
                         r.right_top(),
@@ -3781,6 +3809,25 @@ mod tests {
             size: 24.0,
             replaces,
         }
+    }
+
+    #[test]
+    fn the_selection_outline_covers_the_inside_of_a_shape() {
+        let base = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(200.0, 150.0));
+        let to_screen = |p: egui::Pos2| egui::pos2(p.x * 2.0, p.y * 2.0);
+        let r = super::selection_outline(&boxed(base), &to_screen, 2.0).unwrap();
+        assert!(r.contains(egui::pos2(300.0, 250.0)), "middle of the box");
+        assert!(
+            r.contains(egui::pos2(200.0 - 7.0, 200.0 - 7.0)),
+            "just outside the line"
+        );
+        assert!(!r.contains(egui::pos2(200.0 - 20.0, 250.0)));
+        assert!(!r.contains(egui::pos2(420.0, 250.0)));
+        let blur = crate::scene::Shape::Blur {
+            points: vec![egui::pos2(1.0, 1.0)],
+            radius: 16.0,
+        };
+        assert_eq!(super::selection_outline(&blur, &to_screen, 2.0), None);
     }
 
     #[test]
