@@ -601,7 +601,7 @@ export default class RayshotExtension extends Extension {
     _onStageContent(shooter, res, t0) {
         const [content] = shooter.screenshot_stage_to_content_finish(res);
         if (this._frozen) {
-            this._log('screen already frozen, capture dropped');
+            console.log('rayshot: screen already frozen, capture dropped');
             return;
         }
         const texture = content.get_texture();
@@ -973,10 +973,10 @@ export default class RayshotExtension extends Extension {
             this._armed = null;
             const overlay = this._overlay;
             if (overlay && !overlay.shown) {
-                this._trace(t0, 'overlay showed no frame in time, terminating it');
+                console.log(`rayshot: overlay showed no frame in ${ARM_TIMEOUT_MS}ms, terminating it`);
                 this._terminate(overlay);
             } else {
-                this._trace(t0, 'no overlay first frame in time, grab left alone');
+                console.log(`rayshot: no overlay first frame in ${ARM_TIMEOUT_MS}ms, grab left alone`);
             }
             return GLib.SOURCE_REMOVE;
         });

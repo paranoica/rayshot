@@ -126,8 +126,10 @@ export default class SoakDriver extends Extension {
         // windows; such a session falls back to one-shot and is counted.
         const onServerExit = this._rayshot._onServerExit.bind(this._rayshot);
         this._rayshot._onServerExit = (server, epoch) => {
-            if (server.proc.get_if_signaled() && server.proc.get_term_sig() === 11)
+            if (server.proc.get_if_signaled() && server.proc.get_term_sig() === 11) {
                 this._lastSegv = GLib.get_monotonic_time();
+                this._lastSegvServer = server;
+            }
             onServerExit(server, epoch);
         };
         const unfreeze = this._rayshot._unfreeze.bind(this._rayshot);
@@ -175,6 +177,8 @@ export default class SoakDriver extends Extension {
             }
             return;
         }
+        const capturedAt = GLib.get_monotonic_time();
+        const sessionServer = r._server;
         r._capture();
         waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
             const o = r._overlay;
@@ -207,7 +211,7 @@ export default class SoakDriver extends Extension {
                     this._run(phase, total, i + 1);
             }, () => this._finish(`${phase} ${i}: session did not end`));
         }, () => {
-            if (GLib.get_monotonic_time() - this._lastSegv > 10 * GLib.USEC_PER_SEC) {
+            if (!sessionServer || this._lastSegvServer !== sessionServer || this._lastSegv < capturedAt) {
                 this._finish(`${phase} ${i}: overlay did not show`);
                 return;
             }
