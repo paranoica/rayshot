@@ -2,11 +2,51 @@ use std::path::{Path, PathBuf};
 
 use crate::scene::Tool;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Button {
+    Copy,
+    Save,
+    SaveAs,
+}
+
+impl Button {
+    pub const ALL: [Button; 3] = [Button::Copy, Button::Save, Button::SaveAs];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Button::Copy => "copy",
+            Button::Save => "save",
+            Button::SaveAs => "save-as",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Button> {
+        Button::ALL.into_iter().find(|b| b.name() == name)
+    }
+}
+
+pub const RECENT_MAX: usize = 5;
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Prefs {
     pub hidden: Vec<Tool>,
+    pub hidden_buttons: Vec<Button>,
     pub color: Option<egui::Color32>,
     pub width: Option<f32>,
+    pub recent: Vec<egui::Color32>,
+}
+
+pub fn push_recent(
+    recent: &mut Vec<egui::Color32>,
+    color: egui::Color32,
+    palette: &[egui::Color32],
+) {
+    if palette.contains(&color) {
+        return;
+    }
+    recent.retain(|c| *c != color);
+    recent.insert(0, color);
+    recent.truncate(RECENT_MAX);
 }
 
 pub const WIDTH_RANGE: (f32, f32) = (1.0, 20.0);
@@ -25,11 +65,25 @@ pub fn parse(text: &str) -> Prefs {
         match key.trim() {
             "hidden" => {
                 prefs.hidden = Vec::new();
-                for tool in value.split(',').filter_map(|n| Tool::from_name(n.trim())) {
-                    if !prefs.hidden.contains(&tool) {
-                        prefs.hidden.push(tool);
+                prefs.hidden_buttons = Vec::new();
+                for name in value.split(',').map(str::trim) {
+                    if let Some(tool) = Tool::from_name(name) {
+                        if !prefs.hidden.contains(&tool) {
+                            prefs.hidden.push(tool);
+                        }
+                    } else if let Some(button) = Button::from_name(name)
+                        && !prefs.hidden_buttons.contains(&button)
+                    {
+                        prefs.hidden_buttons.push(button);
                     }
                 }
+            }
+            "recent" => {
+                prefs.recent = value
+                    .split(',')
+                    .filter_map(|c| parse_color(c.trim()))
+                    .take(RECENT_MAX)
+                    .collect();
             }
             "color" => prefs.color = parse_color(value),
             "width" => {
@@ -45,17 +99,30 @@ pub fn parse(text: &str) -> Prefs {
     prefs
 }
 
-fn parse_color(value: &str) -> Option<egui::Color32> {
+pub fn hex(c: egui::Color32) -> String {
+    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
+}
+
+pub fn parse_color(value: &str) -> Option<egui::Color32> {
     let hex = value.strip_prefix('#').filter(|h| h.len() == 6)?;
     let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
     Some(egui::Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?))
 }
 
 pub fn render(prefs: &Prefs) -> String {
-    let hidden: Vec<&str> = prefs.hidden.iter().map(|t| t.name()).collect();
+    let hidden: Vec<&str> = prefs
+        .hidden
+        .iter()
+        .map(|t| t.name())
+        .chain(prefs.hidden_buttons.iter().map(|b| b.name()))
+        .collect();
     let mut out = format!("hidden = {}\n", hidden.join(", "));
+    if !prefs.recent.is_empty() {
+        let recent: Vec<String> = prefs.recent.iter().map(|c| hex(*c)).collect();
+        out += &format!("recent = {}\n", recent.join(", "));
+    }
     if let Some(c) = prefs.color {
-        out += &format!("color = #{:02X}{:02X}{:02X}\n", c.r(), c.g(), c.b());
+        out += &format!("color = {}\n", hex(c));
     }
     if let Some(w) = prefs.width {
         out += &format!("width = {w}\n");
@@ -103,10 +170,53 @@ mod tests {
     fn a_saved_file_reads_back_the_same() {
         let prefs = Prefs {
             hidden: vec![Tool::Blur, Tool::Counter],
+            hidden_buttons: vec![Button::SaveAs],
             color: Some(Color32::from_rgb(18, 52, 86)),
             width: Some(7.0),
+            recent: vec![Color32::from_rgb(1, 2, 3), Color32::from_rgb(250, 100, 0)],
         };
         assert_eq!(parse(&render(&prefs)), prefs);
+    }
+
+    #[test]
+    fn buttons_and_tools_share_the_hidden_list() {
+        let prefs = parse("hidden = copy, pen, save-as\n");
+        assert_eq!(prefs.hidden, vec![Tool::Pen]);
+        assert_eq!(prefs.hidden_buttons, vec![Button::Copy, Button::SaveAs]);
+    }
+
+    #[test]
+    fn recent_colours_keep_at_most_five_valid_ones() {
+        let prefs = parse("recent = #010203, bad, #0A0B0C, #111111, #222222, #333333, #444444\n");
+        assert_eq!(prefs.recent.len(), RECENT_MAX);
+        assert_eq!(prefs.recent[0], Color32::from_rgb(1, 2, 3));
+        assert_eq!(prefs.recent[1], Color32::from_rgb(10, 11, 12));
+    }
+
+    #[test]
+    fn a_new_colour_goes_first_and_a_reused_one_moves_up() {
+        let palette = [Color32::RED];
+        let (a, b, c) = (
+            Color32::from_rgb(1, 1, 1),
+            Color32::from_rgb(2, 2, 2),
+            Color32::from_rgb(3, 3, 3),
+        );
+        let mut recent = vec![a, b];
+        push_recent(&mut recent, c, &palette);
+        assert_eq!(recent, vec![c, a, b]);
+        push_recent(&mut recent, b, &palette);
+        assert_eq!(recent, vec![b, c, a], "no duplicates");
+        push_recent(&mut recent, Color32::RED, &palette);
+        assert_eq!(
+            recent,
+            vec![b, c, a],
+            "palette colours already have their own spot"
+        );
+        for i in 10..20 {
+            push_recent(&mut recent, Color32::from_rgb(i, i, i), &palette);
+        }
+        assert_eq!(recent.len(), RECENT_MAX);
+        assert_eq!(recent[0], Color32::from_rgb(19, 19, 19));
     }
 
     #[test]
@@ -115,6 +225,7 @@ mod tests {
             hidden: vec![Tool::Pixelate],
             color: Some(Color32::from_rgb(255, 0, 171)),
             width: Some(4.0),
+            ..Prefs::default()
         };
         let text = render(&prefs);
         assert!(text.contains("hidden = pixelate"), "{text}");

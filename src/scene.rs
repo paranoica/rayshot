@@ -69,21 +69,42 @@ impl Tool {
         }
     }
 
-    pub fn tooltip(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
-            Tool::Select => "Select / move / resize (S)",
-            Tool::Pen => "Pen (P)",
-            Tool::Line => "Line (L)",
-            Tool::Arrow => "Arrow (A)",
-            Tool::Rect => "Rectangle (R)",
-            Tool::Marker => "Marker (M)",
-            Tool::Text => "Text (T)",
-            Tool::Pixelate => "Pixelate (X)",
-            Tool::Blur => "Blur (B)",
-            Tool::Ellipse => "Ellipse (E)",
-            Tool::Counter => "Numbered marker (N)",
-            Tool::Picker => "Pick a colour (I)",
+            Tool::Select => "Select",
+            Tool::Pen => "Pen",
+            Tool::Line => "Line",
+            Tool::Arrow => "Arrow",
+            Tool::Rect => "Rectangle",
+            Tool::Marker => "Marker",
+            Tool::Text => "Text",
+            Tool::Pixelate => "Pixelate",
+            Tool::Blur => "Blur",
+            Tool::Ellipse => "Ellipse",
+            Tool::Counter => "Numbered marker",
+            Tool::Picker => "Colour picker",
         }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Tool::Select => "S",
+            Tool::Pen => "P",
+            Tool::Line => "L",
+            Tool::Arrow => "A",
+            Tool::Rect => "R",
+            Tool::Marker => "M",
+            Tool::Text => "T",
+            Tool::Pixelate => "X",
+            Tool::Blur => "B",
+            Tool::Ellipse => "E",
+            Tool::Counter => "N",
+            Tool::Picker => "I",
+        }
+    }
+
+    pub fn tooltip(self) -> String {
+        format!("{} ({})", self.label(), self.key())
     }
 }
 
@@ -480,11 +501,26 @@ pub fn paint(
     match shape {
         Shape::Ellipse { rect, color, width } => {
             let r = egui::Rect::from_two_pos(to_screen(rect.min), to_screen(rect.max));
-            painter.add(egui::Shape::ellipse_stroke(
-                r.center(),
-                r.size() / 2.0,
-                egui::Stroke::new(width * scale, *color),
-            ));
+            let (radius, stroke) = (r.size() / 2.0, width * scale);
+            if radius.min_elem() < stroke {
+                let c = r.center();
+                let reach = radius.max_elem() - radius.min_elem();
+                let along = if radius.x >= radius.y {
+                    egui::vec2(reach, 0.0)
+                } else {
+                    egui::vec2(0.0, reach)
+                };
+                let thick = stroke + radius.min_elem() * 2.0;
+                painter.line_segment([c - along, c + along], egui::Stroke::new(thick, *color));
+                painter.circle_filled(c - along, thick / 2.0, *color);
+                painter.circle_filled(c + along, thick / 2.0, *color);
+            } else {
+                painter.add(egui::Shape::ellipse_stroke(
+                    r.center(),
+                    radius,
+                    egui::Stroke::new(stroke, *color),
+                ));
+            }
         }
         Shape::Counter {
             center,
@@ -494,12 +530,24 @@ pub fn paint(
         } => {
             let c = to_screen(*center);
             let r = radius * scale;
+            for (grow, alpha) in [(1.22, 18), (1.14, 30), (1.07, 45)] {
+                painter.circle_filled(
+                    c + egui::vec2(0.0, r * 0.1),
+                    r * grow,
+                    egui::Color32::from_black_alpha(alpha),
+                );
+            }
             painter.circle_filled(c, r, *color);
-            painter.text(
+            painter.circle_stroke(
                 c,
+                r,
+                egui::Stroke::new((r * 0.13).max(1.5), egui::Color32::WHITE),
+            );
+            painter.text(
+                c - egui::vec2(0.0, r * 0.05),
                 egui::Align2::CENTER_CENTER,
                 number.to_string(),
-                egui::FontId::proportional(r * 1.15),
+                egui::FontId::proportional(r * 1.1),
                 text_on(*color),
             );
         }
@@ -703,6 +751,77 @@ mod tests {
             None,
             "corner outside the curve"
         );
+    }
+
+    fn painted_reach(shape: &Shape) -> f32 {
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(Default::default(), |ui| {
+            let painter = ui.ctx().layer_painter(egui::LayerId::background());
+            paint(
+                &painter,
+                shape,
+                &|p| p,
+                1.0,
+                egui::TextureId::default(),
+                1000.0,
+                1000.0,
+            );
+        });
+        let center = pos2(500.0, 500.0);
+        ctx.tessellate(output.shapes, 1.0)
+            .iter()
+            .flat_map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(m) => m.vertices.clone(),
+                _ => vec![],
+            })
+            .map(|v| (v.pos.x - center.x).abs().max((v.pos.y - center.y).abs()))
+            .fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn a_flat_ellipse_stays_where_it_was_drawn() {
+        for (rx, ry, width) in [
+            (5.0, 0.001, 20.0),
+            (40.0, 0.0005, 6.0),
+            (0.0005, 30.0, 6.0),
+            (2.0, 0.01, 3.0),
+        ] {
+            let e = Shape::Ellipse {
+                rect: egui::Rect::from_center_size(
+                    pos2(500.0, 500.0),
+                    egui::vec2(rx * 2.0, ry * 2.0),
+                ),
+                color: Color32::RED,
+                width,
+            };
+            let reach = painted_reach(&e);
+            assert!(
+                reach <= f32::max(rx, ry) + width + 2.0,
+                "r=({rx},{ry}) w={width} reach={reach}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_thin_ellipse_is_no_longer_than_its_outline_would_be() {
+        let e = Shape::Ellipse {
+            rect: egui::Rect::from_center_size(pos2(500.0, 500.0), egui::vec2(8.0, 6.0)),
+            color: Color32::RED,
+            width: 20.0,
+        };
+        let reach = painted_reach(&e);
+        assert!(reach <= 4.0 + 10.0 + 1.0, "{reach}");
+    }
+
+    #[test]
+    fn a_normal_ellipse_still_reaches_its_outline() {
+        let e = Shape::Ellipse {
+            rect: egui::Rect::from_center_size(pos2(500.0, 500.0), egui::vec2(200.0, 100.0)),
+            color: Color32::RED,
+            width: 4.0,
+        };
+        let reach = painted_reach(&e);
+        assert!((100.0..=106.0).contains(&reach), "{reach}");
     }
 
     #[test]

@@ -193,7 +193,12 @@ struct OverlayApp {
     draft_start: Option<egui::Pos2>,
     straight_from: Option<usize>,
     hidden: Vec<crate::scene::Tool>,
+    hidden_buttons: Vec<crate::prefs::Button>,
+    recent: Vec<egui::Color32>,
     show_settings: bool,
+    show_colours: bool,
+    custom_colour: bool,
+    hex_text: String,
     scroll_acc: f32,
     toast: Option<(String, std::time::Instant)>,
     colour_copy: Option<std::thread::JoinHandle<()>>,
@@ -231,7 +236,12 @@ impl OverlayApp {
             color: prefs.color.unwrap_or(egui::Color32::from_rgb(255, 60, 60)),
             stroke_width: prefs.width.unwrap_or(3.0),
             hidden: prefs.hidden,
+            hidden_buttons: prefs.hidden_buttons,
+            recent: prefs.recent,
             show_settings: false,
+            show_colours: false,
+            custom_colour: false,
+            hex_text: String::new(),
             draft: None,
             draft_start: None,
             straight_from: None,
@@ -475,7 +485,13 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state.is_pressed() {
-                    if self.text_edit.is_some() {
+                    if self.windows.iter().any(|w| {
+                        w.egui_ctx.memory(|m| m.focused()).is_some_and(|id| {
+                            egui::text_edit::TextEditState::load(&w.egui_ctx, id).is_some()
+                        })
+                    }) {
+                        self.request_redraw_all();
+                    } else if self.text_edit.is_some() {
                         if matches!(event.logical_key, Key::Named(NamedKey::Escape)) {
                             self.commit_text();
                         }
@@ -1009,7 +1025,12 @@ impl OverlayApp {
         let mut stroke_width = self.stroke_width;
         let mut scroll_acc = self.scroll_acc;
         let mut hidden = self.hidden.clone();
+        let mut hidden_buttons = self.hidden_buttons.clone();
         let mut show_settings = self.show_settings;
+        let mut show_colours = self.show_colours;
+        let mut custom_colour = self.custom_colour;
+        let mut hex_text = self.hex_text.clone();
+        let recent = self.recent.clone();
         let mut picked: Option<egui::Color32> = None;
         let toast = self
             .toast
@@ -1172,7 +1193,6 @@ impl OverlayApp {
                         && let (Some(p), Some(frame)) = (cursor_pos, frame_px.as_deref())
                         && let Some(c) = pixel_color(frame, to_frame(p))
                     {
-                        color = c;
                         picked = Some(c);
                     }
                 }
@@ -1705,6 +1725,7 @@ impl OverlayApp {
                         top = avail.top() + pad;
                     }
 
+                    let mut colour_button_y = top;
                     let tools_area = egui::Area::new(tools_id)
                         .fixed_pos(egui::pos2(x, top))
                         .constrain(false)
@@ -1721,11 +1742,13 @@ impl OverlayApp {
                                         }
                                     }
                                     ui.separator();
-                                    ui.scope(|ui| {
-                                        ui.spacing_mut().interact_size = egui::vec2(30.0, 28.0);
-                                        ui.color_edit_button_srgba(&mut color)
-                                            .on_hover_text("Colour");
-                                    });
+                                    let r = colour_button(ui, color, show_colours)
+                                        .on_hover_text("Colour (1–9)");
+                                    colour_button_y = r.rect.top();
+                                    if r.clicked() {
+                                        show_colours = !show_colours;
+                                        show_settings = false;
+                                    }
                                 });
                             });
                         });
@@ -1739,29 +1762,28 @@ impl OverlayApp {
                                 ui.spacing_mut().item_spacing.y = 3.0;
                                 ui.vertical(|ui| {
                                     use egui_phosphor::regular as p;
-                                    if tool_button(ui, p::COPY, false)
-                                        .on_hover_text("Copy to clipboard (Ctrl+C)")
-                                        .clicked()
-                                    {
-                                        action = Some(Action::Copy);
-                                    }
-                                    if tool_button(ui, p::FLOPPY_DISK, false)
-                                        .on_hover_text("Save to Pictures (Ctrl+S)")
-                                        .clicked()
-                                    {
-                                        action = Some(Action::Save);
-                                    }
-                                    if tool_button(ui, p::FOLDER_OPEN, false)
-                                        .on_hover_text("Save as… (Ctrl+Shift+S)")
-                                        .clicked()
-                                    {
-                                        action = Some(Action::SaveAs);
+                                    for (button, act) in [
+                                        (Button::Copy, Action::Copy),
+                                        (Button::Save, Action::Save),
+                                        (Button::SaveAs, Action::SaveAs),
+                                    ] {
+                                        if hidden_buttons.contains(&button) {
+                                            continue;
+                                        }
+                                        let (icon, label, key) = button_meta(button);
+                                        if tool_button(ui, icon, false)
+                                            .on_hover_text(format!("{label} ({key})"))
+                                            .clicked()
+                                        {
+                                            action = Some(act);
+                                        }
                                     }
                                     if tool_button(ui, p::GEAR_SIX, show_settings)
-                                        .on_hover_text("Choose the tools on the toolbar")
+                                        .on_hover_text("Customise the toolbar")
                                         .clicked()
                                     {
                                         show_settings = !show_settings;
+                                        show_colours = false;
                                     }
                                     if tool_button(ui, p::X, false)
                                         .on_hover_text("Cancel (Esc)")
@@ -1773,37 +1795,49 @@ impl OverlayApp {
                             });
                         });
 
-                    if show_settings {
-                        let settings_id = egui::Id::new("rayshot-settings");
-                        let settings_w = egui::AreaState::load(ui.ctx(), settings_id)
-                            .and_then(|st| st.size)
-                            .map_or(230.0, |sz| sz.x);
+                    let beside = |w: f32| {
                         let mut sx = x + width + gap;
-                        if sx + settings_w > avail.right() - pad {
-                            sx = x - gap - settings_w;
+                        if sx + w > avail.right() - pad {
+                            sx = x - gap - w;
                         }
-                        egui::Area::new(settings_id)
-                            .fixed_pos(egui::pos2(sx.max(avail.left() + pad), top))
+                        sx.max(avail.left() + pad)
+                    };
+                    let side_width = |id: egui::Id, guess: f32| {
+                        egui::AreaState::load(ui.ctx(), id)
+                            .and_then(|st| st.size)
+                            .map_or(guess, |sz| sz.x)
+                    };
+
+                    if show_colours {
+                        let colours_id = egui::Id::new("rayshot-colours");
+                        let w = side_width(colours_id, 170.0);
+                        egui::Area::new(colours_id)
+                            .fixed_pos(egui::pos2(beside(w), colour_button_y))
                             .constrain(true)
                             .show(ui.ctx(), |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    ui.label(egui::RichText::new("Toolbar").strong());
-                                    for t in Tool::ALL {
-                                        let mut shown = !hidden.contains(&t);
-                                        let text = format!("{}  {}", t.icon(), t.tooltip());
-                                        if ui.checkbox(&mut shown, text).changed() {
-                                            if shown {
-                                                hidden.retain(|h| *h != t);
-                                            } else {
-                                                hidden.push(t);
-                                            }
-                                        }
+                                    if colour_panel(
+                                        ui,
+                                        &mut color,
+                                        &recent,
+                                        &mut hex_text,
+                                        &mut custom_colour,
+                                    ) {
+                                        show_colours = false;
                                     }
-                                    ui.label(
-                                        egui::RichText::new("Hidden tools keep their keys.")
-                                            .small()
-                                            .weak(),
-                                    );
+                                });
+                            });
+                    }
+
+                    if show_settings {
+                        let settings_id = egui::Id::new("rayshot-settings");
+                        let w = side_width(settings_id, 260.0);
+                        egui::Area::new(settings_id)
+                            .fixed_pos(egui::pos2(beside(w), top))
+                            .constrain(true)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    settings_panel(ui, &mut hidden, &mut hidden_buttons);
                                 });
                             });
                     }
@@ -1856,7 +1890,11 @@ impl OverlayApp {
         self.stroke_width = stroke_width;
         self.scroll_acc = scroll_acc;
         self.hidden = hidden;
+        self.hidden_buttons = hidden_buttons;
         self.show_settings = show_settings;
+        self.show_colours = show_colours;
+        self.custom_colour = custom_colour;
+        self.hex_text = hex_text;
         if stroke_width != width_before {
             self.toast = Some((format!("{stroke_width:.0} px"), std::time::Instant::now()));
         }
@@ -1908,6 +1946,9 @@ impl OverlayApp {
             });
         }
         if let Some(s) = committed {
+            if !matches!(s, Shape::Pixelate { .. } | Shape::Blur { .. }) {
+                crate::prefs::push_recent(&mut self.recent, self.color, &PALETTE);
+            }
             self.scene.push(s);
         }
         if action.is_some() {
@@ -2259,6 +2300,7 @@ impl OverlayApp {
     fn commit_text(&mut self) {
         if let Some(d) = self.text_edit.take() {
             if !d.buf.trim().is_empty() {
+                crate::prefs::push_recent(&mut self.recent, d.color, &PALETTE);
                 self.scene.push(crate::scene::Shape::Text {
                     pos: d.pos,
                     text: d.buf,
@@ -2276,6 +2318,8 @@ impl OverlayApp {
                 hidden: self.hidden.clone(),
                 color: Some(self.color),
                 width: Some(self.stroke_width),
+                hidden_buttons: self.hidden_buttons.clone(),
+                recent: self.recent.clone(),
             });
         }
         if let Some(sel) = self.selection {
@@ -2298,6 +2342,8 @@ impl OverlayApp {
             self.stroke_width = w;
         }
         self.hidden = prefs.hidden;
+        self.hidden_buttons = prefs.hidden_buttons;
+        self.recent = prefs.recent;
     }
 
     fn wait_colour_copy(&mut self) {
@@ -2470,11 +2516,7 @@ fn pixel_color(frame: &Frame, p: egui::Pos2) -> Option<egui::Color32> {
     Some(egui::Color32::from_rgb(px[0], px[1], px[2]))
 }
 
-fn hex(c: egui::Color32) -> String {
-    format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b())
-}
-
-use crate::prefs::WIDTH_RANGE;
+use crate::prefs::{Button, WIDTH_RANGE, hex};
 const TOAST_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 const SCROLL_STEP: f32 = 30.0;
@@ -2650,6 +2692,220 @@ fn marker_color(c: egui::Color32) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 110)
 }
 
+const PALETTE_NAMES: [&str; 9] = [
+    "Red", "Orange", "Yellow", "Green", "Cyan", "Blue", "Purple", "White", "Black",
+];
+
+fn button_meta(button: Button) -> (&'static str, &'static str, &'static str) {
+    use egui_phosphor::regular as p;
+    match button {
+        Button::Copy => (p::COPY, "Copy", "Enter"),
+        Button::Save => (p::FLOPPY_DISK, "Save", "Ctrl S"),
+        Button::SaveAs => (p::FOLDER_OPEN, "Save as…", "Ctrl Shift S"),
+    }
+}
+
+fn colour_button(ui: &mut egui::Ui, color: egui::Color32, open: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), egui::Sense::click());
+    let painter = ui.painter();
+    if open || resp.hovered() {
+        painter.rect_filled(rect, 4, ui.visuals().widgets.hovered.weak_bg_fill);
+    }
+    painter.circle_filled(rect.center(), 9.0, color);
+    painter.circle_stroke(
+        rect.center(),
+        9.0,
+        egui::Stroke::new(1.5, egui::Color32::from_white_alpha(210)),
+    );
+    resp
+}
+
+fn swatch(ui: &mut egui::Ui, color: egui::Color32, selected: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::click());
+    let painter = ui.painter();
+    let c = rect.center();
+    if selected {
+        painter.circle_stroke(c, 11.5, egui::Stroke::new(2.0, egui::Color32::WHITE));
+    }
+    painter.circle_filled(c, if resp.hovered() { 9.5 } else { 8.5 }, color);
+    painter.circle_stroke(
+        c,
+        8.5,
+        egui::Stroke::new(1.0, egui::Color32::from_black_alpha(110)),
+    );
+    resp
+}
+
+fn hex_input(text: &str) -> Option<egui::Color32> {
+    let digits = text.trim();
+    let digits = digits.strip_prefix('#').unwrap_or(digits);
+    crate::prefs::parse_color(&format!("#{digits}"))
+}
+
+fn colour_panel(
+    ui: &mut egui::Ui,
+    color: &mut egui::Color32,
+    recent: &[egui::Color32],
+    hex_text: &mut String,
+    custom: &mut bool,
+) -> bool {
+    let mut chosen = false;
+    egui::Grid::new("rayshot-palette")
+        .spacing([4.0, 2.0])
+        .show(ui, |ui| {
+            for (i, c) in PALETTE.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if swatch(ui, *c, *color == *c)
+                        .on_hover_text(PALETTE_NAMES[i])
+                        .clicked()
+                    {
+                        *color = *c;
+                        chosen = true;
+                    }
+                    ui.label(egui::RichText::new((i + 1).to_string()).small().weak());
+                });
+                if i % 3 == 2 {
+                    ui.end_row();
+                }
+            }
+        });
+    if !recent.is_empty() {
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("Recent").small().weak());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            for c in recent {
+                if swatch(ui, *c, *color == *c)
+                    .on_hover_text(hex(*c))
+                    .clicked()
+                {
+                    *color = *c;
+                    chosen = true;
+                }
+            }
+        });
+    }
+    ui.separator();
+    let hex_id = egui::Id::new("rayshot-hex");
+    if !ui.memory(|m| m.has_focus(hex_id)) {
+        *hex_text = hex(*color).trim_start_matches('#').to_owned();
+    }
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("#").monospace().weak());
+        let resp = ui.add(
+            egui::TextEdit::singleline(hex_text)
+                .id(hex_id)
+                .desired_width(58.0)
+                .char_limit(7)
+                .font(egui::TextStyle::Monospace),
+        );
+        if resp.changed()
+            && let Some(c) = hex_input(hex_text)
+        {
+            *color = c;
+        }
+        if ui.selectable_label(*custom, "Custom…").clicked() {
+            *custom = !*custom;
+        }
+    });
+    if *custom {
+        egui::color_picker::color_picker_color32(ui, color, egui::color_picker::Alpha::Opaque);
+    }
+    chosen
+}
+
+fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+    let size = egui::vec2(34.0, 18.0);
+    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = ui.ctx().animate_bool(resp.id, *on);
+    let visuals = ui.style().interact_selectable(&resp, *on);
+    let radius = rect.height() / 2.0;
+    let track = if *on {
+        ui.visuals().selection.bg_fill
+    } else {
+        ui.visuals().widgets.inactive.bg_fill
+    };
+    ui.painter().rect(
+        rect,
+        radius,
+        track,
+        visuals.bg_stroke,
+        egui::StrokeKind::Inside,
+    );
+    let x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), t);
+    ui.painter().circle_filled(
+        egui::pos2(x, rect.center().y),
+        radius - 3.0,
+        egui::Color32::WHITE,
+    );
+    resp
+}
+
+fn keycap(ui: &mut egui::Ui, key: &str) {
+    egui::Frame::new()
+        .stroke(egui::Stroke::new(1.0, ui.visuals().weak_text_color()))
+        .corner_radius(4)
+        .inner_margin(egui::Margin::symmetric(5, 1))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(key).monospace().small());
+        });
+}
+
+fn settings_panel(
+    ui: &mut egui::Ui,
+    hidden: &mut Vec<crate::scene::Tool>,
+    hidden_buttons: &mut Vec<Button>,
+) {
+    use crate::scene::Tool;
+    let row = |ui: &mut egui::Ui, icon: &str, label: &str, key: &str, on: &mut bool| {
+        ui.label(egui::RichText::new(icon).size(16.0));
+        ui.label(label);
+        keycap(ui, key);
+        let changed = toggle(ui, on).changed();
+        ui.end_row();
+        changed
+    };
+    ui.label(egui::RichText::new("Tools").strong());
+    egui::Grid::new("rayshot-settings-tools")
+        .num_columns(4)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            for t in Tool::ALL {
+                let mut on = !hidden.contains(&t);
+                if row(ui, t.icon(), t.label(), t.key(), &mut on) {
+                    if on {
+                        hidden.retain(|h| *h != t);
+                    } else {
+                        hidden.push(t);
+                    }
+                }
+            }
+        });
+    ui.add_space(8.0);
+    ui.label(egui::RichText::new("Actions").strong());
+    egui::Grid::new("rayshot-settings-actions")
+        .num_columns(4)
+        .spacing([10.0, 6.0])
+        .show(ui, |ui| {
+            for b in Button::ALL {
+                let (icon, label, key) = button_meta(b);
+                let mut on = !hidden_buttons.contains(&b);
+                if row(ui, icon, label, key, &mut on) {
+                    if on {
+                        hidden_buttons.retain(|h| *h != b);
+                    } else {
+                        hidden_buttons.push(b);
+                    }
+                }
+            }
+        });
+}
+
 fn tool_button(ui: &mut egui::Ui, glyph: &str, selected: bool) -> egui::Response {
     let text = egui::RichText::new(glyph).size(18.0);
     ui.add_sized(
@@ -2756,6 +3012,16 @@ mod tests {
         );
         let mut acc = 0.0;
         assert_eq!(scrolled_width(3.0, &mut acc, 0.0), 3.0);
+    }
+
+    #[test]
+    fn the_hex_field_takes_what_the_picker_copies() {
+        let green = Some(egui::Color32::from_rgb(0, 255, 0));
+        assert_eq!(super::hex_input("00FF00"), green);
+        assert_eq!(super::hex_input("#00FF00"), green, "pasted from the picker");
+        assert_eq!(super::hex_input("00ff00 "), green);
+        assert_eq!(super::hex_input("00FF0"), None, "still typing");
+        assert_eq!(super::hex_input("##00FF00"), None);
     }
 
     #[test]
