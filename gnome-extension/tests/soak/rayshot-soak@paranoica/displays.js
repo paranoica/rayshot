@@ -14,6 +14,7 @@ const STEP_MS = 30;
 const FRAME_WAIT_MS = 5000;
 const SETTLE_MS = 200;
 const SHOW_WAIT_MS = 20000;
+const SELECT_SETTLE_MS = 500;
 const MARK = 40;
 const PAD = 40;
 const EDGE = 3;
@@ -131,6 +132,10 @@ function sequence(steps, done) {
     const run = i => {
         if (i === steps.length) {
             done();
+            return;
+        }
+        if (typeof steps[i] === 'number') {
+            later(steps[i], () => run(i + 1));
             return;
         }
         const before = pacer?.frames ?? 0;
@@ -678,7 +683,7 @@ export class Displays {
             St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, 'rayshot-soak-marker');
             const scale = overlay.texture.get_width() / global.stage.width;
             const target = want.map(v => Math.max(1, Math.round(v * scale)));
-            sequence([() => {}, ...keys.map(code => () => ctrl(code)), enter], () => waitFor(() => !r._busy,
+            sequence([SELECT_SETTLE_MS, () => {}, ...keys.map(code => () => ctrl(code)), enter], () => waitFor(() => !r._busy,
                 () => later(400, () => readPng(pb => {
                     const got = [pb.get_width(), pb.get_height()];
                     if (got[0] !== target[0] || got[1] !== target[1]) {
@@ -751,6 +756,7 @@ export class Displays {
             const top = out(anchor.y, 'y');
             const wrong = pan ? right + pan.x * s : 600 * s;
             sequence([
+                SELECT_SETTLE_MS,
                 () => {},
                 () => tap(Clutter.KEY_r),
                 () => ctrl(KEY_EQUAL),
@@ -871,7 +877,7 @@ export class Displays {
                 fail(`cannot select: ${e.message}`);
                 return;
             }
-            sequence([() => {}, plus, plus, () => tap(Clutter.KEY_Return)],
+            sequence([SELECT_SETTLE_MS, () => {}, plus, plus, () => tap(Clutter.KEY_Return)],
                 () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
                     this._clearMarks();
                     const want = [400 * s, 200 * s].map(Math.round);
@@ -909,6 +915,7 @@ export class Displays {
             const p = this._device();
             const move = at => p.notify_absolute_motion(now(), at.x, at.y);
             sequence([
+                SELECT_SETTLE_MS,
                 () => {},
                 () => tap(Clutter.KEY_r),
                 plus,
@@ -957,6 +964,7 @@ export class Displays {
             const press = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED);
             const release = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
             sequence([
+                SELECT_SETTLE_MS,
                 () => {},
                 () => tap(Clutter.KEY_r),
                 plus,
@@ -971,8 +979,8 @@ export class Displays {
                 () => {
                     press();
                     release();
+                    move({x: 650, y: 340});
                 },
-                () => move({x: 650, y: 340}),
                 press,
                 () => move({x: 675, y: 340}),
                 () => move({x: 700, y: 340}),
@@ -1052,11 +1060,15 @@ export class Displays {
                 ? [() => kit.tap(Clutter.KEY_H)]
                 : [() => kit.tap(Clutter.KEY_a), () => kit.shiftTap(Clutter.KEY_Return), () => kit.tap(Clutter.KEY_b)];
             sequence([
+                SELECT_SETTLE_MS,
                 () => {},
                 () => kit.tap(Clutter.KEY_t),
                 ...zoom,
                 () => kit.move({x: 300, y: 300}),
-                kit.click,
+                () => {
+                    kit.click();
+                    kit.move({x: 700, y: 700});
+                },
                 ...typing,
                 () => kit.tap(Clutter.KEY_Return),
                 () => kit.tap(Clutter.KEY_Return),
@@ -1095,6 +1107,7 @@ export class Displays {
             if (!this._select(overlay, [200, 200, 900, 800], fail))
                 return;
             sequence([
+                SELECT_SETTLE_MS,
                 () => {},
                 () => kit.tap(Clutter.KEY_1),
                 () => kit.tap(Clutter.KEY_r),
