@@ -103,6 +103,10 @@ if [ "$RAYSHOT_SOAK_SUITE" = displays ]; then
     MUTTER_FEATURES="['scale-monitor-framebuffer']"
     export RAYSHOT_NO_REMEMBER_SELECTION=1
 fi
+case "${RAYSHOT_SOAK_DEBUG:-}" in
+    ""|0|false|no) DEBUG_LOG=false ;;
+    *) DEBUG_LOG=true ;;
+esac
 unset WAYLAND_DISPLAY DISPLAY
 
 RAYSHOT_NESTED_TAG="$TAG" dbus-run-session -- sh -c "
@@ -111,7 +115,7 @@ RAYSHOT_NESTED_TAG="$TAG" dbus-run-session -- sh -c "
     gsettings set org.gnome.shell welcome-dialog-last-shown-version '999'
     gsettings set org.gnome.shell disable-extension-version-validation $ANY_SHELL
     gsettings set org.gnome.mutter experimental-features \"$MUTTER_FEATURES\"
-    gsettings --schemadir \"$EXT/rayshot@paranoica/schemas\" set org.gnome.shell.extensions.rayshot debug-log ${RAYSHOT_SOAK_DEBUG:-false}
+    gsettings --schemadir \"$EXT/rayshot@paranoica/schemas\" set org.gnome.shell.extensions.rayshot debug-log $DEBUG_LOG
     gsettings set org.gnome.desktop.input-sources sources \"[('xkb', 'us'), ('xkb', 'ru')]\"
     exec gnome-shell --headless --wayland $MONITORS
 " >"$WORK/shell.log" 2>&1 &
