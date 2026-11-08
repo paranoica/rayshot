@@ -83,5 +83,4 @@ jobs:
           gnome-extension/tests/containers/run.sh ${{ matrix.image }} bin/rayshot 20 5
 
       - name: Display layouts, HiDPI and rotation
-        continue-on-error: true
         run: gnome-extension/tests/containers/run.sh ${{ matrix.image }} bin/rayshot 0 0 displays
