@@ -231,6 +231,7 @@ struct OverlayApp {
     bindings: crate::keys::Bindings,
     zoom: f32,
     pan_drag: bool,
+    pan_start: egui::Vec2,
     sel_zoom: f32,
     sel_offset: egui::Vec2,
     lens_drag: bool,
@@ -285,6 +286,7 @@ impl OverlayApp {
             bindings: prefs.keys,
             zoom: 1.0,
             pan_drag: false,
+            pan_start: egui::Vec2::ZERO,
             sel_zoom: 1.0,
             sel_offset: egui::Vec2::ZERO,
             lens_drag: false,
@@ -1386,6 +1388,7 @@ impl OverlayApp {
         );
         let mut view_center = win.view_center;
         let mut pan_drag = self.pan_drag;
+        let mut pan_start = self.pan_start;
         let mut sel_zoom = self.sel_zoom;
         let mut sel_offset = self.sel_offset;
         let mut lens_drag = self.lens_drag;
@@ -1536,15 +1539,23 @@ impl OverlayApp {
             } else {
                 cursor_pos.is_some_and(in_lens)
             };
-            if panning && resp.dragged() {
+            if panning && resp.drag_started() {
+                pan_start = match (lens_drag, lens) {
+                    (true, Some(l)) => l.offset(),
+                    _ => view.center().to_vec2(),
+                };
+            }
+            if let (true, true, Some(from), Some(now)) =
+                (panning, resp.dragged(), press_pos, cursor_pos)
+            {
+                let moved = now - from;
                 if let (true, Some(l)) = (lens_drag, lens) {
-                    let shifted = l.offset() - resp.drag_delta() / (scale * l.z);
-                    if let Some(moved) = Lens::new(l.outer, l.z, shifted) {
-                        sel_offset = moved.offset();
+                    if let Some(next) = Lens::new(l.outer, l.z, pan_start - moved / (scale * l.z)) {
+                        sel_offset = next.offset();
                     }
                 } else if zoom > 1.0 {
-                    let moved = view.center() - resp.drag_delta() / scale;
-                    view_center = Some(view_rect(region, zoom, moved).center());
+                    let centre = (pan_start - moved / scale).to_pos2();
+                    view_center = Some(view_rect(region, zoom, centre).center());
                 }
             }
             let active_lens = lens.filter(|_| lensed);
@@ -2605,6 +2616,7 @@ impl OverlayApp {
         self.show_settings = show_settings;
         self.windows[idx].view_center = view_center;
         self.pan_drag = pan_drag;
+        self.pan_start = pan_start;
         self.sel_offset = sel_offset;
         self.sel_zoom = sel_zoom;
         self.lens_drag = lens_drag;
