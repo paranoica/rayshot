@@ -232,6 +232,7 @@ struct OverlayApp {
     export_scale: f32,
     loupe_on: bool,
     rebinding: Option<crate::keys::Command>,
+    held_after_capture: Option<KeyCode>,
     rebind_note: Option<RebindNote>,
     show_settings: bool,
     show_colours: bool,
@@ -282,6 +283,7 @@ impl OverlayApp {
             export_scale: 1.0,
             loupe_on: true,
             rebinding: None,
+            held_after_capture: None,
             rebind_note: None,
             show_settings: false,
             show_colours: false,
@@ -683,6 +685,20 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             return;
         };
 
+        if let WindowEvent::KeyboardInput { event: ke, .. } = &event
+            && let PhysicalKey::Code(code) = ke.physical_key
+            && self.held_after_capture == Some(code)
+        {
+            if !ke.state.is_pressed() {
+                self.held_after_capture = None;
+                return;
+            }
+            if ke.repeat {
+                return;
+            }
+            self.held_after_capture = None;
+        }
+
         if let WindowEvent::MouseInput {
             state: ElementState::Released,
             ..
@@ -734,6 +750,9 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                     let typing_before = self.text_has_keyboard();
                     let drafting_before = self.text_edit.is_some();
                     self.catch_up();
+                    if typing_before || self.text_has_keyboard() {
+                        self.rebinding = None;
+                    }
                     if let Some(action) = self.pending.take() {
                         self.run_action(event_loop, action);
                     } else if let Some(target) = self.rebinding {
@@ -770,7 +789,12 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             event.logical_key,
                             Key::Named(NamedKey::Delete | NamedKey::Backspace)
                         );
-                        if selected.is_some()
+                        if self.rebind_note.is_some()
+                            && matches!(event.logical_key, Key::Named(NamedKey::Escape))
+                        {
+                            self.rebind_note = None;
+                            self.request_redraw_all();
+                        } else if selected.is_some()
                             && (matches!(event.logical_key, Key::Named(NamedKey::Escape))
                                 || (!ctrl
                                     && matches!(event.logical_key, Key::Named(NamedKey::Enter))))
@@ -811,15 +835,8 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             self.scene.redo();
                             self.selected = None;
                             self.request_redraw_all();
-                        } else if let Some(command) = code
-                            .and_then(crate::keys::Key::from_code)
-                            .map(|key| crate::keys::Chord {
-                                ctrl,
-                                shift,
-                                alt,
-                                key,
-                            })
-                            .and_then(|chord| self.bindings.command(chord))
+                        } else if let Some(command) =
+                            code.and_then(|c| self.bindings.resolve(ctrl, shift, alt, c))
                         {
                             self.run_command(event_loop, command);
                         } else if !ctrl {
@@ -1341,6 +1358,12 @@ impl OverlayApp {
 
         let full_output = ctx.run_ui(raw_input, |ui| {
             let avail = ui.max_rect();
+            if rebinding.is_some()
+                && text_info.is_none()
+                && let Some(id) = ui.ctx().memory(|m| m.focused())
+            {
+                ui.ctx().memory_mut(|m| m.surrender_focus(id));
+            }
 
             let scale = (avail.width() / region.width()).min(avail.height() / region.height());
             let draw_size = egui::vec2(region.width() * scale, region.height() * scale);
@@ -2470,6 +2493,9 @@ impl OverlayApp {
             self.selected = None;
             self.scene = crate::scene::Scene::default();
         }
+        if start_text.is_some() || reedit_text.is_some() {
+            self.rebinding = None;
+        }
         if let Some(pos) = start_text {
             removed.extend(self.commit_text());
             self.text_edit = Some(TextDraft {
@@ -3039,10 +3065,15 @@ impl OverlayApp {
     fn capture_rebind(&mut self, target: crate::keys::Command, event: &winit::event::KeyEvent) {
         use crate::keys::{Assign, Chord, Key as Bindable};
         self.request_redraw_all();
+        let held = match event.physical_key {
+            PhysicalKey::Code(code) => Some(code),
+            _ => None,
+        };
         match event.logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.rebinding = None;
                 self.rebind_note = None;
+                self.held_after_capture = held;
                 return;
             }
             Key::Named(
@@ -3077,9 +3108,11 @@ impl OverlayApp {
             Assign::Done => {
                 self.rebinding = None;
                 self.rebind_note = None;
+                self.held_after_capture = held;
             }
             Assign::Conflict(other) => {
                 self.rebinding = None;
+                self.held_after_capture = held;
                 self.rebind_note = Some(RebindNote::Conflict {
                     target,
                     chord,

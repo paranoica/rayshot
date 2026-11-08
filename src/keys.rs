@@ -286,12 +286,11 @@ impl Chord {
 
 pub fn reserved(chord: Chord) -> Option<&'static str> {
     let plain = !chord.ctrl && !chord.shift && !chord.alt;
-    let ctrl_only = chord.ctrl && !chord.alt;
     match chord.key {
         Key::Digit(d) if plain && d != b'0' => Some("1–9 pick colours"),
-        Key::Letter(b'Z') if ctrl_only => Some("Ctrl+Z undoes and redoes"),
-        Key::Letter(b'Y') if ctrl_only && !chord.shift => Some("Ctrl+Y redoes"),
-        Key::Letter(b'D') if ctrl_only && !chord.shift => Some("Ctrl+D duplicates a shape"),
+        Key::Letter(b'Z') if chord.ctrl => Some("Ctrl+Z undoes and redoes"),
+        Key::Letter(b'Y') if chord.ctrl => Some("Ctrl+Y redoes"),
+        Key::Letter(b'D') if chord.ctrl => Some("Ctrl+D duplicates a shape"),
         _ => None,
     }
 }
@@ -331,6 +330,40 @@ impl Bindings {
 
     pub fn command(&self, chord: Chord) -> Option<Command> {
         self.0.iter().find(|(_, k)| *k == chord).map(|(c, _)| *c)
+    }
+
+    pub fn resolve(
+        &self,
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+        code: winit::keyboard::KeyCode,
+    ) -> Option<Command> {
+        use winit::keyboard::KeyCode;
+        let key = match code {
+            KeyCode::NumpadAdd => Key::Equal,
+            KeyCode::NumpadSubtract => Key::Minus,
+            _ => Key::from_code(code)?,
+        };
+        let exact = Chord {
+            ctrl,
+            shift,
+            alt,
+            key,
+        };
+        if let Some(command) = self.command(exact) {
+            return Some(command);
+        }
+        let unshifted = self.command(Chord {
+            shift: false,
+            ..exact
+        })?;
+        (shift
+            && matches!(
+                unshifted,
+                Command::Tool(_) | Command::ZoomIn | Command::ZoomOut
+            ))
+        .then_some(unshifted)
     }
 
     fn set(&mut self, command: Command, chord: Chord) {
@@ -393,7 +426,8 @@ impl Bindings {
             let (Some(command), Some(chord)) = (Command::from_name(name), Chord::parse(key)) else {
                 continue;
             };
-            if reserved(chord).is_none() && !entries.iter().any(|(c, _)| *c == command) {
+            if reserved(chord).is_none() {
+                entries.retain(|(c, _)| *c != command);
                 entries.push((command, chord));
             }
         }
@@ -497,7 +531,21 @@ mod tests {
 
     #[test]
     fn the_editor_s_fixed_keys_cannot_be_taken() {
-        for text in ["1", "5", "9", "Ctrl+Z", "Ctrl+Shift+Z", "Ctrl+Y", "Ctrl+D"] {
+        for text in [
+            "1",
+            "5",
+            "9",
+            "Ctrl+Z",
+            "Ctrl+Shift+Z",
+            "Ctrl+Alt+Z",
+            "Ctrl+Alt+Shift+Z",
+            "Ctrl+Y",
+            "Ctrl+Shift+Y",
+            "Ctrl+Alt+Y",
+            "Ctrl+D",
+            "Ctrl+Shift+D",
+            "Ctrl+Alt+D",
+        ] {
             assert!(reserved(chord(text)).is_some(), "{text}");
         }
         for text in ["0", "Ctrl+1", "Shift+5", "Q", "Ctrl+Q", "Alt+Z"] {
@@ -606,5 +654,69 @@ mod tests {
             assert_eq!(Command::from_name(&c.name()), Some(c));
         }
         assert_eq!(Command::from_name("nope"), None);
+    }
+
+    #[test]
+    fn a_saved_swap_survives_loading() {
+        let b = Bindings::from_pref("pen:R rectangle:P");
+        assert_eq!(b.chord(Command::Tool(Tool::Pen)), chord("R"));
+        assert_eq!(b.chord(Command::Tool(Tool::Rect)), chord("P"));
+    }
+
+    #[test]
+    fn an_entry_on_an_untouched_default_is_dropped() {
+        let b = Bindings::from_pref("pen:R");
+        assert_eq!(b.chord(Command::Tool(Tool::Rect)), chord("R"));
+        assert_eq!(b.chord(Command::Tool(Tool::Pen)), chord("P"));
+    }
+
+    #[test]
+    fn the_last_of_repeated_entries_wins() {
+        let b = Bindings::from_pref("pen:Q pen:W");
+        assert_eq!(b.chord(Command::Tool(Tool::Pen)), chord("W"));
+        assert_eq!(b.command(chord("Q")), None);
+    }
+
+    #[test]
+    fn plus_and_the_keypad_zoom_the_export() {
+        use winit::keyboard::KeyCode;
+        let b = Bindings::defaults();
+        assert_eq!(
+            b.resolve(true, true, false, KeyCode::Equal),
+            Some(Command::ZoomIn),
+            "Ctrl+Shift+= is Ctrl++"
+        );
+        assert_eq!(
+            b.resolve(true, false, false, KeyCode::NumpadAdd),
+            Some(Command::ZoomIn)
+        );
+        assert_eq!(
+            b.resolve(true, false, false, KeyCode::NumpadSubtract),
+            Some(Command::ZoomOut)
+        );
+        assert_eq!(b.resolve(false, false, false, KeyCode::NumpadAdd), None);
+    }
+
+    #[test]
+    fn shift_still_picks_a_tool_but_not_an_action() {
+        use winit::keyboard::KeyCode;
+        let b = Bindings::defaults();
+        assert_eq!(
+            b.resolve(false, true, false, KeyCode::KeyR),
+            Some(Command::Tool(Tool::Rect))
+        );
+        assert_eq!(
+            b.resolve(true, false, false, KeyCode::KeyS),
+            Some(Command::Save)
+        );
+        assert_eq!(
+            b.resolve(true, true, false, KeyCode::KeyS),
+            Some(Command::SaveAs)
+        );
+        assert_eq!(b.resolve(false, true, false, KeyCode::KeyZ), None);
+        assert_eq!(b.resolve(false, false, true, KeyCode::KeyR), None);
+        let mut rebound = Bindings::defaults();
+        assert_eq!(rebound.assign(Command::Copy, chord("Ctrl+K")), Assign::Done);
+        assert_eq!(rebound.resolve(true, true, false, KeyCode::KeyK), None);
     }
 }
