@@ -254,6 +254,10 @@ export class Displays {
                     this._fullscreen(next);
                 else if (kind === 'export-scale')
                     this._exportScale(next);
+                else if (kind === 'zoom-draw')
+                    this._zoomDraw(null, next);
+                else if (kind === 'zoom-pan')
+                    this._zoomDraw({x: -100, y: -50}, next);
                 else if (kind === 'rebound')
                     this._rebound(next);
                 else if (kind === 'shape-enter')
@@ -579,7 +583,7 @@ export class Displays {
     }
 
     _exportScale(next) {
-        const name = 'ctrl minus and ctrl zero set the exported size';
+        const name = 'the zoom sets the exported size';
         const r = this._r();
         const k = this._d._keyboard;
         const now = () => GLib.get_monotonic_time();
@@ -615,14 +619,97 @@ export class Displays {
                     then(got);
                 }, fail)), () => fail('enter did not copy')));
         }, fail);
-        run([KEY_MINUS, KEY_MINUS], [100, 50], half => run([], [200, 100], fresh =>
-            run([KEY_EQUAL, KEY_EQUAL, KEY_EQUAL, KEY_0], [200, 100], full =>
-                run([KEY_KPPLUS], [300, 150], keypad => {
-                    this._d._result(name, true, `two ctrl minus gave ${half.join('x')}, ` +
-                        `the next capture ${fresh.join('x')}, ctrl zero after ctrl plus ${full.join('x')}, ` +
-                        `ctrl keypad plus ${keypad.join('x')}`);
-                    next();
-                }))));
+        run([KEY_EQUAL, KEY_EQUAL], [400, 200], twice => run([], [200, 100], fresh =>
+            run([KEY_EQUAL, KEY_EQUAL, KEY_0], [200, 100], reset =>
+                run([KEY_KPPLUS, KEY_EQUAL, KEY_MINUS, KEY_MINUS, KEY_MINUS], [200, 100], floor =>
+                    run([KEY_KPPLUS], [300, 150], keypad => {
+                        this._d._result(name, true, `two ctrl plus gave ${twice.join('x')}, ` +
+                            `the next capture ${fresh.join('x')}, ctrl zero ${reset.join('x')}, ` +
+                            `ctrl minus stops at ${floor.join('x')}, ctrl keypad plus ${keypad.join('x')}`);
+                        next();
+                    })))));
+    }
+
+    _zoomDraw(pan, next) {
+        const name = pan
+            ? 'a rectangle drawn at 200 % after a middle drag lands where it was drawn'
+            : 'a rectangle drawn at 200 % lands where it was drawn';
+        const r = this._r();
+        const fail = why => this._fail(name, why, next);
+        const k = this._d._keyboard;
+        const now = () => GLib.get_monotonic_time();
+        const tap = v => {
+            k.notify_keyval(now(), v, Clutter.KeyState.PRESSED);
+            k.notify_keyval(now(), v, Clutter.KeyState.RELEASED);
+        };
+        const ctrl = code => {
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
+        };
+        const anchor = {x: 300, y: 300};
+        const to = {x: 500, y: 400};
+        this._capture(anchor, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            try {
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${overlay.session} 200 200 900 800\n`), null);
+            } catch (e) {
+                fail(`cannot select: ${e.message}`);
+                return;
+            }
+            const p = this._device();
+            const move = at => p.notify_absolute_motion(now(), at.x, at.y);
+            const middle = state => p.notify_button(now(), Clutter.BUTTON_MIDDLE, state);
+            const grab = {x: 1000, y: 700};
+            const panning = pan ? [
+                () => move(grab),
+                () => middle(Clutter.ButtonState.PRESSED),
+                ...[1, 2, 3, 4].map(i => () => move({x: grab.x + pan.x * i / 4, y: grab.y + pan.y * i / 4})),
+                () => middle(Clutter.ButtonState.RELEASED),
+            ] : [];
+            const shift = pan ?? {x: 0, y: 0};
+            const view = {x: 150 - shift.x / 2, y: 150 - shift.y / 2};
+            const out = (v, axis) => (view[axis] + v / 2 - 200) * 2 * s;
+            const right = out(to.x, 'x');
+            const bottom = out(to.y, 'y');
+            const left = out(anchor.x, 'x');
+            const top = out(anchor.y, 'y');
+            const wrong = pan ? out(to.x, 'x') - pan.x : 600 * s;
+            sequence([
+                () => {},
+                () => ctrl(KEY_EQUAL),
+                () => ctrl(KEY_EQUAL),
+                ...panning,
+                () => tap(Clutter.KEY_r),
+                () => move(anchor),
+                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
+                () => move({x: 400, y: 350}),
+                () => move(to),
+                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED),
+                () => tap(Clutter.KEY_Return),
+            ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                const want = [1400 * s, 1200 * s].map(Math.round);
+                if (pb.get_width() !== want[0] || pb.get_height() !== want[1]) {
+                    fail(`the png is ${pb.get_width()}x${pb.get_height()}, want ${want.join('x')}`);
+                    return;
+                }
+                const red = c => c !== null && c[0] > 180 && c[1] < 120 && c[2] < 120;
+                const midY = (top + bottom) / 2;
+                const midX = (left + right) / 2;
+                const edgeAt = pixel(pb, right - 2, midY);
+                const bottomAt = pixel(pb, midX, bottom - 2);
+                const inside = pixel(pb, midX, midY);
+                const elsewhere = pixel(pb, wrong - 2, midY);
+                const ok = red(edgeAt) && red(bottomAt) && !red(inside) && !red(elsewhere);
+                this._d._result(name, ok, ok
+                    ? `png ${pb.get_width()}x${pb.get_height()}, right and bottom edges where they were drawn`
+                    : `right edge ${hex(edgeAt)}, bottom edge ${hex(bottomAt)}, inside ${hex(inside)}, ` +
+                      `where a wrong edge would be ${hex(elsewhere)}`);
+                next();
+            }, fail)), () => fail('enter did not copy')));
+        }, fail);
     }
 
     _rebound(next) {
