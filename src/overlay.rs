@@ -229,8 +229,7 @@ struct OverlayApp {
     hidden_buttons: Vec<crate::prefs::Button>,
     recent: Vec<egui::Color32>,
     bindings: crate::keys::Bindings,
-    export_scale: f32,
-    loupe_on: bool,
+    zoom: f32,
     rebinding: Option<crate::keys::Command>,
     held_after_capture: Option<KeyCode>,
     rebind_note: Option<RebindNote>,
@@ -280,8 +279,7 @@ impl OverlayApp {
             hidden_buttons: prefs.hidden_buttons,
             recent: prefs.recent,
             bindings: prefs.keys,
-            export_scale: 1.0,
-            loupe_on: true,
+            zoom: 1.0,
             rebinding: None,
             held_after_capture: None,
             rebind_note: None,
@@ -386,55 +384,44 @@ fn monitor_region(name: Option<&str>, rects: &[crate::live::MonitorRect]) -> Opt
     ))
 }
 
-const LOUPE_CELLS: usize = 15;
-const LOUPE_ZOOM: f32 = 8.0;
-const LOUPE_GAP: f32 = 24.0;
+const ZOOM_STEPS: [f32; 5] = [1.0, 1.5, 2.0, 3.0, 4.0];
 
-fn loupe_cells(frame: &Frame, center: egui::Pos2, n: usize) -> Vec<Option<egui::Color32>> {
-    let (cx, cy) = (center.x.floor() as i64, center.y.floor() as i64);
-    let half = (n / 2) as i64;
-    (0..n as i64)
-        .flat_map(|j| (0..n as i64).map(move |i| (cx - half + i, cy - half + j)))
-        .map(|(x, y)| {
-            if x < 0 || y < 0 {
-                None
-            } else {
-                pixel_color(frame, egui::pos2(x as f32, y as f32))
-            }
-        })
-        .collect()
-}
-
-fn loupe_origin(cursor: egui::Pos2, size: egui::Vec2, bounds: egui::Rect) -> egui::Pos2 {
-    let mut x = cursor.x + LOUPE_GAP;
-    if x + size.x > bounds.right() {
-        x = cursor.x - LOUPE_GAP - size.x;
-    }
-    let mut y = cursor.y + LOUPE_GAP;
-    if y + size.y > bounds.bottom() {
-        y = cursor.y - LOUPE_GAP - size.y;
-    }
-    egui::pos2(
-        x.min(bounds.right() - size.x).max(bounds.left()),
-        y.min(bounds.bottom() - size.y).max(bounds.top()),
-    )
-}
-
-const EXPORT_SCALES: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
-
-fn step_scale(current: f32, up: bool) -> f32 {
+fn step_zoom(current: f32, up: bool) -> f32 {
     if up {
-        EXPORT_SCALES
+        ZOOM_STEPS
             .into_iter()
-            .find(|s| *s > current + 1e-3)
-            .unwrap_or(EXPORT_SCALES[EXPORT_SCALES.len() - 1])
+            .find(|z| *z > current + 1e-3)
+            .unwrap_or(ZOOM_STEPS[ZOOM_STEPS.len() - 1])
     } else {
-        EXPORT_SCALES
+        ZOOM_STEPS
             .into_iter()
             .rev()
-            .find(|s| *s < current - 1e-3)
-            .unwrap_or(EXPORT_SCALES[0])
+            .find(|z| *z < current - 1e-3)
+            .unwrap_or(ZOOM_STEPS[0])
     }
+}
+
+fn view_rect(region: egui::Rect, zoom: f32, center: egui::Pos2) -> egui::Rect {
+    let size = region.size() / zoom.max(1.0);
+    let half = size / 2.0;
+    let c = egui::pos2(
+        center.x.clamp(region.min.x + half.x, region.max.x - half.x),
+        center.y.clamp(region.min.y + half.y, region.max.y - half.y),
+    );
+    egui::Rect::from_center_size(c, size)
+}
+
+fn zoom_center(region: egui::Rect, view: egui::Rect, anchor: egui::Pos2, zoom: f32) -> egui::Pos2 {
+    let t = (anchor - view.min) / view.size();
+    let size = region.size() / zoom.max(1.0);
+    let min = anchor - t * size;
+    min + size / 2.0
+}
+
+fn fit(avail: egui::Rect, view: egui::Rect) -> (f32, egui::Rect) {
+    let scale = (avail.width() / view.width()).min(avail.height() / view.height());
+    let image_rect = egui::Rect::from_center_size(avail.center(), view.size() * scale);
+    (scale, image_rect)
 }
 
 fn scaled_size(width: f32, height: f32, scale: f32) -> (u32, u32) {
@@ -577,6 +564,7 @@ struct WindowState {
     frames: u64,
     cursor: Option<egui::Pos2>,
     unrendered_input: bool,
+    view_center: Option<egui::Pos2>,
 }
 
 impl ApplicationHandler<UserEvent> for OverlayApp {
@@ -1044,6 +1032,7 @@ impl OverlayApp {
                 frames: 0,
                 cursor: None,
                 unrendered_input: false,
+                view_center: None,
             });
         }
         self.windows = windows;
@@ -1306,6 +1295,12 @@ impl OverlayApp {
         }
 
         let region = win.region;
+        let view = view_rect(
+            region,
+            self.zoom,
+            win.view_center.unwrap_or(region.center()),
+        );
+        let mut view_center = win.view_center;
         let frame_tex = win.frame_texture_id;
         if frame_tex.is_none() && !live {
             return Ok(());
@@ -1331,9 +1326,8 @@ impl OverlayApp {
         let mut scroll_acc = self.scroll_acc;
         let mut hidden = self.hidden.clone();
         let mut hidden_buttons = self.hidden_buttons.clone();
-        let export_scale = self.export_scale;
+        let zoom = self.zoom;
         let frame_dims = self.frame_dims().unwrap_or((u32::MAX, u32::MAX));
-        let loupe_on = self.loupe_on;
         let mut bindings = self.bindings.clone();
         let mut rebinding = self.rebinding;
         let mut rebind_note = self.rebind_note.clone();
@@ -1382,22 +1376,20 @@ impl OverlayApp {
                 ui.ctx().memory_mut(|m| m.surrender_focus(id));
             }
 
-            let scale = (avail.width() / region.width()).min(avail.height() / region.height());
-            let draw_size = egui::vec2(region.width() * scale, region.height() * scale);
-            let image_rect = egui::Rect::from_center_size(avail.center(), draw_size);
+            let (scale, image_rect) = fit(avail, view);
 
             let to_frame = |p: egui::Pos2| {
                 let local = (p - image_rect.min) / scale;
                 egui::pos2(
-                    (region.min.x + local.x).clamp(0.0, frame_w),
-                    (region.min.y + local.y).clamp(0.0, frame_h),
+                    (view.min.x + local.x).clamp(0.0, frame_w),
+                    (view.min.y + local.y).clamp(0.0, frame_h),
                 )
             };
-            let to_screen = |fp: egui::Pos2| image_rect.min + (fp - region.min) * scale;
+            let to_screen = |fp: egui::Pos2| image_rect.min + (fp - view.min) * scale;
 
             let uv = egui::Rect::from_min_max(
-                egui::pos2(region.min.x / frame_w, region.min.y / frame_h),
-                egui::pos2(region.max.x / frame_w, region.max.y / frame_h),
+                egui::pos2(view.min.x / frame_w, view.min.y / frame_h),
+                egui::pos2(view.max.x / frame_w, view.max.y / frame_h),
             );
             if let (false, Some(texture_id)) = (see_through, frame_tex) {
                 ui.painter()
@@ -1409,6 +1401,14 @@ impl OverlayApp {
                 egui::Id::new("rayshot-canvas"),
                 egui::Sense::click_and_drag(),
             );
+            let middle = egui::PointerButton::Middle;
+            let panning = resp.drag_started_by(middle)
+                || resp.dragged_by(middle)
+                || resp.drag_stopped_by(middle);
+            if resp.dragged_by(middle) && zoom > 1.0 {
+                let moved = view.center() - resp.drag_delta() / scale;
+                view_center = Some(view_rect(region, zoom, moved).center());
+            }
             let cursor_pos = raw_cursor.or_else(|| resp.interact_pointer_pos());
             let press_pos = ui.input(|i| i.pointer.press_origin()).or(cursor_pos);
             let hit = |fp: egui::Pos2| {
@@ -1431,6 +1431,7 @@ impl OverlayApp {
                 })
             };
             match tool {
+                _ if panning => {}
                 Tool::Select => {
                     if resp.clicked()
                         && let Some(p) = cursor_pos
@@ -1900,18 +1901,24 @@ impl OverlayApp {
                 }
                 if region.contains(sel.min) {
                     let (_, _, cw, ch) = crop_box(sel, frame_dims.0, frame_dims.1);
-                    let label = size_label(cw, ch, export_scale);
+                    let label = size_label(cw, ch, zoom);
                     let galley = painter.layout_no_wrap(
                         label,
                         egui::FontId::proportional(12.0),
                         egui::Color32::WHITE,
                     );
                     let pad = egui::vec2(6.0, 3.0);
+                    let pill_size = galley.size() + 2.0 * pad;
                     let pill_min = egui::pos2(
-                        s_true.left(),
-                        s_true.top() - galley.size().y - 2.0 * pad.y - 6.0,
+                        s_true
+                            .left()
+                            .min(avail.right() - pill_size.x)
+                            .max(avail.left()),
+                        (s_true.top() - pill_size.y - 6.0)
+                            .min(avail.bottom() - pill_size.y)
+                            .max(avail.top()),
                     );
-                    let pill = egui::Rect::from_min_size(pill_min, galley.size() + 2.0 * pad);
+                    let pill = egui::Rect::from_min_size(pill_min, pill_size);
                     painter.rect_filled(pill, 4, egui::Color32::from_black_alpha(190));
                     painter.galley(pill_min + pad, galley, egui::Color32::WHITE);
                 }
@@ -2338,69 +2345,8 @@ impl OverlayApp {
                 }
                 painter.galley(rect.min + pad + egui::vec2(sw, 0.0), galley, egui::Color32::WHITE);
             };
-            let over_handle = selection.zip(raw_cursor).is_some_and(|(sel, p)| {
-                let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
-                let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
-                hit_handle(s, p, hr).is_some()
-            });
-            let precise = tool == Tool::Select
-                && loupe_on
-                && shape_drag.is_none()
-                && (selection.is_none()
-                    || matches!(sel_mode, Some(SelMode::New) | Some(SelMode::Resize(_)))
-                    || over_handle);
-            let mut loupe_box = None;
-            if precise && let (Some(p), Some(frame)) = (raw_cursor, frame_px.as_deref()) {
-                let n = LOUPE_CELLS;
-                let grid = LOUPE_ZOOM * n as f32;
-                let below = if toast.is_some() { 52.0 } else { 22.0 };
-                let size = egui::vec2(grid, grid + below);
-                let origin = loupe_origin(p, size, avail);
-                loupe_box = Some(egui::Rect::from_min_size(origin, egui::vec2(grid, grid + 22.0)));
-                let field = egui::Rect::from_min_size(origin, egui::vec2(grid, grid));
-                painter.rect_filled(field.expand(2.0), 4, egui::Color32::from_black_alpha(220));
-                let fp = to_frame(p);
-                let fp = egui::pos2(
-                    fp.x.clamp(0.0, frame.width.saturating_sub(1) as f32),
-                    fp.y.clamp(0.0, frame.height.saturating_sub(1) as f32),
-                );
-                for (k, c) in loupe_cells(frame, fp, n).into_iter().enumerate() {
-                    let at = origin + egui::vec2((k % n) as f32, (k / n) as f32) * LOUPE_ZOOM;
-                    painter.rect_filled(
-                        egui::Rect::from_min_size(at, egui::vec2(LOUPE_ZOOM, LOUPE_ZOOM)),
-                        0,
-                        c.unwrap_or(egui::Color32::from_gray(24)),
-                    );
-                }
-                let mid = egui::Rect::from_min_size(
-                    origin + egui::vec2((n / 2) as f32, (n / 2) as f32) * LOUPE_ZOOM,
-                    egui::vec2(LOUPE_ZOOM, LOUPE_ZOOM),
-                );
-                painter.rect_stroke(
-                    mid,
-                    0,
-                    egui::Stroke::new(2.0f32, egui::Color32::from_black_alpha(200)),
-                    egui::StrokeKind::Outside,
-                );
-                painter.rect_stroke(
-                    mid,
-                    0,
-                    egui::Stroke::new(1.0f32, egui::Color32::WHITE),
-                    egui::StrokeKind::Inside,
-                );
-                painter.text(
-                    egui::pos2(field.center().x, field.bottom() + 6.0),
-                    egui::Align2::CENTER_TOP,
-                    format!("{}, {}", fp.x as i32, fp.y as i32),
-                    egui::FontId::monospace(12.0),
-                    egui::Color32::WHITE,
-                );
-            }
             if let Some(p) = raw_cursor {
-                let at = match loupe_box {
-                    Some(b) => b.left_bottom() + egui::vec2(0.0, 6.0),
-                    None => p + egui::vec2(18.0, 18.0),
-                };
+                let at = p + egui::vec2(18.0, 18.0);
                 if let Some(text) = &toast {
                     label(painter, at, text, None);
                 } else if tool == Tool::Picker
@@ -2440,6 +2386,7 @@ impl OverlayApp {
         self.rebinding = rebinding;
         self.rebind_note = rebind_note;
         self.show_settings = show_settings;
+        self.windows[idx].view_center = view_center;
         self.show_colours = show_colours;
         self.picker_hsv = picker_hsv;
         self.hex_text = hex_text;
@@ -2861,7 +2808,7 @@ impl OverlayApp {
     fn export_image(&self) -> Result<Option<image::RgbaImage>> {
         Ok(self
             .render_selection_to_image(false)?
-            .map(|img| scaled(img, self.export_scale)))
+            .map(|img| scaled(img, self.zoom)))
     }
 
     fn finish(&self) -> Result<Option<std::path::PathBuf>> {
@@ -2872,7 +2819,7 @@ impl OverlayApp {
             Err(e) => {
                 eprintln!("[rayshot] annotated export failed ({e:#}); using raw crop");
                 match self.cropped_image() {
-                    Some(img) => scaled(img, self.export_scale),
+                    Some(img) => scaled(img, self.zoom),
                     None => return Ok(None),
                 }
             }
@@ -3062,22 +3009,38 @@ impl OverlayApp {
             Command::Save => self.run_action(event_loop, Action::Save),
             Command::SaveAs => self.run_action(event_loop, Action::SaveAs),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => {
-                self.export_scale = match command {
-                    Command::ZoomIn => step_scale(self.export_scale, true),
-                    Command::ZoomOut => step_scale(self.export_scale, false),
+                let next = match command {
+                    Command::ZoomIn => step_zoom(self.zoom, true),
+                    Command::ZoomOut => step_zoom(self.zoom, false),
                     _ => 1.0,
                 };
-                let percent = (self.export_scale * 100.0).round();
-                self.toast = Some((format!("Export {percent} %"), std::time::Instant::now()));
-                self.request_redraw_all();
-            }
-            Command::Loupe => {
-                self.loupe_on = !self.loupe_on;
-                let state = if self.loupe_on { "on" } else { "off" };
-                self.toast = Some((format!("Loupe {state}"), std::time::Instant::now()));
+                self.set_zoom(next);
+                let percent = (self.zoom * 100.0).round();
+                self.toast = Some((format!("Zoom {percent} %"), std::time::Instant::now()));
                 self.request_redraw_all();
             }
         }
+    }
+
+    fn set_zoom(&mut self, next: f32) {
+        let zoom = self.zoom;
+        for win in &mut self.windows {
+            let region = win.region;
+            let view = view_rect(region, zoom, win.view_center.unwrap_or(region.center()));
+            let size = win
+                .window
+                .inner_size()
+                .to_logical::<f32>(win.window.scale_factor());
+            let avail =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size.width, size.height));
+            let (scale, image_rect) = fit(avail, view);
+            let anchor = win
+                .cursor
+                .filter(|p| image_rect.contains(*p))
+                .map_or(view.center(), |p| view.min + (p - image_rect.min) / scale);
+            win.view_center = (next > 1.0).then(|| zoom_center(region, view, anchor, next));
+        }
+        self.zoom = next;
     }
 
     fn capture_rebind(&mut self, target: crate::keys::Command, event: &winit::event::KeyEvent) {
@@ -3994,7 +3957,6 @@ fn settings_panel(
             row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ZoomIn, None);
             row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ZoomOut, None);
             row(ui, p::ARROWS_OUT_SIMPLE, Command::ZoomReset, None);
-            row(ui, p::MAGNIFYING_GLASS, Command::Loupe, None);
         });
     ui.add_space(6.0);
     let changed = Command::ALL.iter().any(|c| !bindings.is_default(*c));
@@ -4484,23 +4446,70 @@ mod tests {
     }
 
     #[test]
-    fn export_scale_steps_through_the_agreed_sizes() {
-        let mut s = 1.0;
+    fn zoom_steps_through_the_agreed_sizes() {
+        let mut z = 1.0;
         let mut ups = Vec::new();
-        for _ in 0..4 {
-            s = super::step_scale(s, true);
-            ups.push(s);
+        for _ in 0..5 {
+            z = super::step_zoom(z, true);
+            ups.push(z);
         }
-        assert_eq!(ups, vec![1.5, 2.0, 2.0, 2.0]);
-        let mut s = 1.0;
+        assert_eq!(ups, vec![1.5, 2.0, 3.0, 4.0, 4.0]);
         let mut downs = Vec::new();
         for _ in 0..5 {
-            s = super::step_scale(s, false);
-            downs.push(s);
+            z = super::step_zoom(z, false);
+            downs.push(z);
         }
-        assert_eq!(downs, vec![0.75, 0.5, 0.25, 0.25, 0.25]);
-        assert_eq!(super::step_scale(1.2, true), 1.5);
-        assert_eq!(super::step_scale(1.2, false), 1.0);
+        assert_eq!(downs, vec![3.0, 2.0, 1.5, 1.0, 1.0]);
+        assert_eq!(super::step_zoom(1.2, true), 1.5);
+        assert_eq!(super::step_zoom(1.2, false), 1.0);
+    }
+
+    #[test]
+    fn the_zoomed_view_stays_inside_the_monitor() {
+        let region = egui::Rect::from_min_size(egui::pos2(1920.0, 0.0), egui::vec2(1920.0, 1080.0));
+        assert_eq!(
+            super::view_rect(region, 2.0, egui::pos2(2880.0, 540.0)),
+            egui::Rect::from_min_max(egui::pos2(2400.0, 270.0), egui::pos2(3360.0, 810.0))
+        );
+        assert_eq!(
+            super::view_rect(region, 2.0, egui::pos2(1930.0, 10.0)),
+            egui::Rect::from_min_max(egui::pos2(1920.0, 0.0), egui::pos2(2880.0, 540.0)),
+            "pushed back from the top left corner"
+        );
+        assert_eq!(
+            super::view_rect(region, 4.0, egui::pos2(9000.0, 9000.0)),
+            egui::Rect::from_min_max(egui::pos2(3360.0, 810.0), egui::pos2(3840.0, 1080.0)),
+            "pushed back from the bottom right corner"
+        );
+        assert_eq!(super::view_rect(region, 1.0, egui::pos2(0.0, 0.0)), region);
+    }
+
+    #[test]
+    fn zooming_keeps_the_point_under_the_cursor_in_place() {
+        let region = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let anchor = egui::pos2(480.0, 270.0);
+        let center = super::zoom_center(region, region, anchor, 2.0);
+        let view = super::view_rect(region, 2.0, center);
+        assert_eq!(view.min, egui::pos2(240.0, 135.0));
+        assert_eq!(view.size(), egui::vec2(960.0, 540.0));
+        let center = super::zoom_center(region, view, anchor, 4.0);
+        let deeper = super::view_rect(region, 4.0, center);
+        assert_eq!(deeper.min, egui::pos2(360.0, 202.5));
+        let back = super::zoom_center(region, deeper, anchor, 1.0);
+        assert_eq!(super::view_rect(region, 1.0, back), region);
+    }
+
+    #[test]
+    fn the_view_fills_the_window_at_the_zoomed_scale() {
+        let avail = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1920.0, 1080.0));
+        let view = egui::Rect::from_min_max(egui::pos2(480.0, 270.0), egui::pos2(1440.0, 810.0));
+        let (scale, image_rect) = super::fit(avail, view);
+        assert_eq!(scale, 2.0);
+        assert_eq!(image_rect, avail);
+        let hidpi = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(3840.0, 2160.0));
+        let (scale, image_rect) = super::fit(avail, hidpi);
+        assert_eq!(scale, 0.5, "frame pixels of a 2x monitor are half a point");
+        assert_eq!(image_rect, avail);
     }
 
     #[test]
@@ -4538,59 +4547,6 @@ mod tests {
             half.get_pixel(25, 12).0,
             [10, 20, 30, 255],
             "a flat colour stays flat"
-        );
-    }
-
-    #[test]
-    fn the_loupe_samples_the_pixels_around_the_cursor() {
-        let mut rgba = Vec::new();
-        for y in 0..10u8 {
-            for x in 0..10u8 {
-                rgba.extend_from_slice(&[x, y, 0, 255]);
-            }
-        }
-        let frame = Frame {
-            width: 10,
-            height: 10,
-            rgba,
-        };
-        let cells = super::loupe_cells(&frame, egui::pos2(5.5, 5.5), 3);
-        assert_eq!(cells.len(), 9);
-        assert_eq!(cells[0], Some(egui::Color32::from_rgb(4, 4, 0)));
-        assert_eq!(
-            cells[4],
-            Some(egui::Color32::from_rgb(5, 5, 0)),
-            "the centre is under the cursor"
-        );
-        assert_eq!(cells[8], Some(egui::Color32::from_rgb(6, 6, 0)));
-        let edge = super::loupe_cells(&frame, egui::pos2(0.2, 9.9), 3);
-        assert_eq!(edge[0], None, "left of the frame");
-        assert_eq!(edge[4], Some(egui::Color32::from_rgb(0, 9, 0)));
-        assert_eq!(edge[7], None, "below the frame");
-    }
-
-    #[test]
-    fn the_loupe_sits_beside_the_cursor_and_stays_on_screen() {
-        let bounds = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
-        let size = egui::vec2(120.0, 140.0);
-        assert_eq!(
-            super::loupe_origin(egui::pos2(100.0, 100.0), size, bounds),
-            egui::pos2(124.0, 124.0)
-        );
-        assert_eq!(
-            super::loupe_origin(egui::pos2(790.0, 100.0), size, bounds),
-            egui::pos2(790.0 - 24.0 - 120.0, 124.0),
-            "flips left at the right edge"
-        );
-        assert_eq!(
-            super::loupe_origin(egui::pos2(100.0, 590.0), size, bounds),
-            egui::pos2(124.0, 590.0 - 24.0 - 140.0),
-            "flips up at the bottom edge"
-        );
-        assert_eq!(
-            super::loupe_origin(egui::pos2(900.0, 700.0), size, bounds),
-            egui::pos2(800.0 - 120.0, 600.0 - 140.0),
-            "a cursor past the window keeps the loupe inside it"
         );
     }
 

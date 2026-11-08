@@ -10,11 +10,10 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
-    Loupe,
 }
 
 impl Command {
-    pub const ALL: [Command; 20] = [
+    pub const ALL: [Command; 19] = [
         Command::Tool(Tool::ALL[0]),
         Command::Tool(Tool::ALL[1]),
         Command::Tool(Tool::ALL[2]),
@@ -34,7 +33,6 @@ impl Command {
         Command::ZoomIn,
         Command::ZoomOut,
         Command::ZoomReset,
-        Command::Loupe,
     ];
 
     pub fn name(self) -> String {
@@ -47,7 +45,6 @@ impl Command {
             Command::ZoomIn => "zoom-in".into(),
             Command::ZoomOut => "zoom-out".into(),
             Command::ZoomReset => "zoom-reset".into(),
-            Command::Loupe => "loupe".into(),
         }
     }
 
@@ -62,10 +59,9 @@ impl Command {
             Command::CopyText => "Copy text",
             Command::Save => "Save",
             Command::SaveAs => "Save as…",
-            Command::ZoomIn => "Export larger",
-            Command::ZoomOut => "Export smaller",
-            Command::ZoomReset => "Export at 100 %",
-            Command::Loupe => "Loupe",
+            Command::ZoomIn => "Zoom in",
+            Command::ZoomOut => "Zoom out",
+            Command::ZoomReset => "Actual size",
         }
     }
 
@@ -79,7 +75,6 @@ impl Command {
             Command::ZoomIn => "Ctrl+=",
             Command::ZoomOut => "Ctrl+-",
             Command::ZoomReset => "Ctrl+0",
-            Command::Loupe => "Z",
         };
         Chord::parse(text).expect("default chords parse")
     }
@@ -483,7 +478,6 @@ mod tests {
         assert_eq!(b.chord(Command::ZoomIn), chord("Ctrl+="));
         assert_eq!(b.chord(Command::ZoomOut), chord("Ctrl+-"));
         assert_eq!(b.chord(Command::ZoomReset), chord("Ctrl+0"));
-        assert_eq!(b.chord(Command::Loupe), chord("Z"));
     }
 
     #[test]
