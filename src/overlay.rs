@@ -4121,6 +4121,34 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     resp
 }
 
+const SETTINGS_ICON_W: f32 = 18.0;
+const SETTINGS_LABEL_W: f32 = 116.0;
+const SETTINGS_KEY_W: f32 = 112.0;
+const SETTINGS_TOGGLE_W: f32 = 34.0;
+const SETTINGS_ROW_H: f32 = 20.0;
+const SETTINGS_ZOOM_OPEN: &str = "rayshot-settings-zoom";
+
+fn settings_cell<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, SETTINGS_ROW_H),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_width(width);
+            ui.set_min_height(SETTINGS_ROW_H);
+            add(ui)
+        },
+    )
+    .inner
+}
+
+fn settings_width(ui: &egui::Ui) -> f32 {
+    SETTINGS_ICON_W
+        + SETTINGS_LABEL_W
+        + SETTINGS_KEY_W
+        + SETTINGS_TOGGLE_W
+        + 3.0 * ui.spacing().item_spacing.x
+}
+
 fn key_cell(
     ui: &mut egui::Ui,
     command: crate::keys::Command,
@@ -4128,7 +4156,7 @@ fn key_cell(
     rebinding: &mut Option<crate::keys::Command>,
     note: &mut Option<RebindNote>,
 ) {
-    ui.horizontal(|ui| {
+    settings_cell(ui, SETTINGS_KEY_W, |ui| {
         let capturing = *rebinding == Some(command);
         let text = if capturing {
             "Press a key…".to_string()
@@ -4136,23 +4164,27 @@ fn key_cell(
             bindings.chord(command).label()
         };
         let label = egui::RichText::new(text).monospace().small();
+        let custom = !bindings.is_default(command);
         if ui
-            .add(egui::Button::selectable(capturing, label))
+            .add(egui::Button::selectable(capturing, label).truncate())
             .on_hover_text("Click, then press the new key. Esc cancels.")
             .clicked()
         {
             *rebinding = (!capturing).then_some(command);
             *note = None;
         }
-        if !bindings.is_default(command)
-            && ui
-                .small_button(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)
-                .on_hover_text("Back to the default key")
-                .clicked()
-        {
-            bindings.reset(command);
-            *rebinding = None;
-            *note = None;
+        if custom {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)
+                    .on_hover_text("Back to the default key")
+                    .clicked()
+                {
+                    bindings.reset(command);
+                    *rebinding = None;
+                    *note = None;
+                }
+            });
         }
     });
 }
@@ -4164,39 +4196,43 @@ fn note_row(
     note: &mut Option<RebindNote>,
 ) {
     let warn = ui.visuals().warn_fg_color;
-    match note.clone() {
+    let indent = SETTINGS_ICON_W + ui.spacing().item_spacing.x;
+    let width = settings_width(ui) - indent;
+    let text = match note.clone() {
         Some(RebindNote::Conflict {
             target,
             chord,
             other,
-        }) if target == command => {
-            ui.label("");
-            ui.label(
-                egui::RichText::new(format!("{} is used by {}", chord.label(), other.label()))
-                    .small()
-                    .color(warn),
-            );
-            ui.horizontal(|ui| {
-                if ui.small_button("Swap").clicked() {
-                    bindings.swap(target, other);
-                    *note = None;
+        }) if target == command => Some((
+            format!("{} is used by {}", chord.label(), other.label()),
+            Some((target, other)),
+        )),
+        Some(RebindNote::Refused { target, why }) if target == command => Some((why, None)),
+        _ => None,
+    };
+    let Some((text, swap)) = text else {
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.allocate_ui_with_layout(
+            egui::vec2(width, 0.0),
+            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+            |ui| {
+                ui.set_width(width);
+                ui.add(egui::Label::new(egui::RichText::new(text).small().color(warn)).wrap());
+                if let Some((target, other)) = swap {
+                    if ui.small_button("Swap").clicked() {
+                        bindings.swap(target, other);
+                        *note = None;
+                    }
+                    if ui.small_button("Cancel").clicked() {
+                        *note = None;
+                    }
                 }
-                if ui.small_button("Cancel").clicked() {
-                    *note = None;
-                }
-            });
-            ui.label("");
-            ui.end_row();
-        }
-        Some(RebindNote::Refused { target, why }) if target == command => {
-            ui.label("");
-            ui.label(egui::RichText::new(why).small().color(warn));
-            ui.label("");
-            ui.label("");
-            ui.end_row();
-        }
-        _ => {}
-    }
+            },
+        );
+    });
 }
 
 fn settings_panel(
@@ -4210,94 +4246,113 @@ fn settings_panel(
     use crate::keys::Command;
     use crate::scene::Tool;
     use egui_phosphor::regular as p;
+    let width = settings_width(ui);
+    ui.set_width(width);
+    ui.spacing_mut().item_spacing.y = 2.0;
     let header = |ui: &mut egui::Ui, title: &str| {
-        ui.label("");
-        ui.label(egui::RichText::new(title).strong());
-        ui.end_row();
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.add_space(SETTINGS_ICON_W + ui.spacing().item_spacing.x);
+            ui.label(egui::RichText::new(title).strong());
+        });
     };
     let mut row = |ui: &mut egui::Ui, icon: &str, command: Command, on: Option<&mut bool>| {
-        ui.label(egui::RichText::new(icon).size(16.0));
-        ui.label(command.label());
-        key_cell(ui, command, bindings, rebinding, note);
-        let changed = match on {
-            Some(on) => toggle(ui, on).changed(),
-            None => {
-                ui.label("");
-                false
-            }
-        };
-        ui.end_row();
+        let changed = ui
+            .horizontal(|ui| {
+                settings_cell(ui, SETTINGS_ICON_W, |ui| {
+                    ui.label(egui::RichText::new(icon).size(16.0));
+                });
+                settings_cell(ui, SETTINGS_LABEL_W, |ui| {
+                    ui.add(egui::Label::new(command.label()).truncate());
+                });
+                key_cell(ui, command, bindings, rebinding, note);
+                settings_cell(ui, SETTINGS_TOGGLE_W, |ui| match on {
+                    Some(on) => toggle(ui, on).changed(),
+                    None => false,
+                })
+            })
+            .inner;
         note_row(ui, command, bindings, note);
         changed
     };
-    let grid = egui::Grid::new("rayshot-settings")
-        .num_columns(4)
-        .min_col_width(0.0)
-        .spacing([10.0, 6.0])
-        .show(ui, |ui| {
-            header(ui, "Tools");
-            for t in Tool::ALL {
-                let mut on = !hidden.contains(&t);
-                if row(ui, t.icon(), Command::Tool(t), Some(&mut on)) {
-                    if on {
-                        hidden.retain(|h| *h != t);
-                    } else {
-                        hidden.push(t);
-                    }
-                }
+    header(ui, "Tools");
+    for t in Tool::ALL {
+        let mut on = !hidden.contains(&t);
+        if row(ui, t.icon(), Command::Tool(t), Some(&mut on)) {
+            if on {
+                hidden.retain(|h| *h != t);
+            } else {
+                hidden.push(t);
             }
-            ui.end_row();
-            header(ui, "Actions");
-            for b in Button::ALL {
-                let (icon, command) = button_meta(b);
-                let mut on = !hidden_buttons.contains(&b);
-                if row(ui, icon, command, Some(&mut on)) {
-                    if on {
-                        hidden_buttons.retain(|h| *h != b);
-                    } else {
-                        hidden_buttons.push(b);
-                    }
-                }
+        }
+    }
+    header(ui, "Actions");
+    for b in Button::ALL {
+        let (icon, command) = button_meta(b);
+        let mut on = !hidden_buttons.contains(&b);
+        if row(ui, icon, command, Some(&mut on)) {
+            if on {
+                hidden_buttons.retain(|h| *h != b);
+            } else {
+                hidden_buttons.push(b);
             }
-            ui.end_row();
-            header(ui, "Other keys");
-            row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ZoomIn, None);
-            row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ZoomOut, None);
-            row(ui, p::ARROWS_OUT_SIMPLE, Command::ZoomReset, None);
-            row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ScreenZoomIn, None);
-            row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ScreenZoomOut, None);
-            row(ui, p::ARROWS_OUT_SIMPLE, Command::ScreenZoomReset, None);
-        });
-    let width = grid.response.rect.width();
-    ui.add_space(8.0);
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 0.0),
-        egui::Layout::top_down(egui::Align::Center),
-        |ui| {
-            ui.set_width(width);
-            let changed = Command::ALL.iter().any(|c| !bindings.is_default(*c));
-            if ui
-                .add_enabled(changed, egui::Button::new("Reset all keys"))
-                .clicked()
-            {
-                bindings.reset_all();
-                *rebinding = None;
-                *note = None;
-            }
-            ui.add_space(4.0);
+        }
+    }
+    ui.add_space(4.0);
+    let open_id = egui::Id::new(SETTINGS_ZOOM_OPEN);
+    let mut open = ui
+        .ctx()
+        .data(|d| d.get_temp::<bool>(open_id))
+        .unwrap_or(false);
+    let toggled = ui
+        .horizontal(|ui| {
+            settings_cell(ui, SETTINGS_ICON_W, |ui| {
+                ui.label(if open { p::CARET_DOWN } else { p::CARET_RIGHT });
+            });
             ui.add(
-                egui::Label::new(
-                    egui::RichText::new(
-                        "Esc, Enter, 1–9, Delete, the arrows, undo, redo and Ctrl+D can't be changed.",
-                    )
-                    .small()
-                    .weak(),
+                egui::Button::new(egui::RichText::new("Zoom keys").strong())
+                    .frame(false)
+                    .min_size(egui::vec2(SETTINGS_LABEL_W, SETTINGS_ROW_H)),
+            )
+            .clicked()
+        })
+        .inner;
+    if toggled {
+        open = !open;
+        ui.ctx().data_mut(|d| d.insert_temp(open_id, open));
+    }
+    if open {
+        row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ZoomIn, None);
+        row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ZoomOut, None);
+        row(ui, p::ARROWS_OUT_SIMPLE, Command::ZoomReset, None);
+        row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ScreenZoomIn, None);
+        row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ScreenZoomOut, None);
+        row(ui, p::ARROWS_OUT_SIMPLE, Command::ScreenZoomReset, None);
+    }
+    ui.add_space(8.0);
+    ui.vertical_centered(|ui| {
+        let changed = Command::ALL.iter().any(|c| !bindings.is_default(*c));
+        if ui
+            .add_enabled(changed, egui::Button::new("Reset all keys"))
+            .clicked()
+        {
+            bindings.reset_all();
+            *rebinding = None;
+            *note = None;
+        }
+        ui.add_space(2.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Esc, Enter, 1–9, Delete, the arrows, undo, redo and Ctrl+D can't be changed.",
                 )
-                .halign(egui::Align::Center)
-                .wrap(),
-            );
-        },
-    );
+                .small()
+                .weak(),
+            )
+            .halign(egui::Align::Center)
+            .wrap(),
+        );
+    });
 }
 
 fn tool_button(ui: &mut egui::Ui, glyph: &str, selected: bool) -> egui::Response {
@@ -4917,6 +4972,76 @@ mod tests {
             lefts.iter().all(|x| (x - first).abs() < 0.5),
             "toggles at {lefts:?}"
         );
+    }
+
+    fn settings_size(
+        bindings: &mut crate::keys::Bindings,
+        rebinding: &mut Option<crate::keys::Command>,
+        note: &mut Option<super::RebindNote>,
+        open: bool,
+    ) -> egui::Vec2 {
+        let ctx = egui::Context::default();
+        ctx.data_mut(|d| d.insert_temp(egui::Id::new(super::SETTINGS_ZOOM_OPEN), open));
+        let mut hidden = Vec::new();
+        let mut hidden_buttons = Vec::new();
+        let mut size = egui::Vec2::ZERO;
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                super::settings_panel(
+                    ui,
+                    &mut hidden,
+                    &mut hidden_buttons,
+                    bindings,
+                    rebinding,
+                    note,
+                );
+                size = ui.min_rect().size();
+            });
+        }
+        size
+    }
+
+    #[test]
+    fn the_toolbar_settings_keep_their_width_whatever_the_keys() {
+        use crate::keys::{Bindings, Chord, Command};
+        use crate::scene::Tool;
+        let base = settings_size(&mut Bindings::defaults(), &mut None, &mut None, false);
+        let mut rebound = Bindings::defaults();
+        let _ = rebound.assign(
+            Command::Tool(Tool::Pen),
+            Chord::parse("Ctrl+Alt+Shift+F12").unwrap(),
+        );
+        let custom = settings_size(&mut rebound, &mut None, &mut None, false);
+        let capturing = settings_size(
+            &mut Bindings::defaults(),
+            &mut Some(Command::Tool(Tool::Line)),
+            &mut None,
+            false,
+        );
+        let conflict = settings_size(
+            &mut Bindings::defaults(),
+            &mut None,
+            &mut Some(super::RebindNote::Conflict {
+                target: Command::Tool(Tool::Line),
+                chord: Chord::parse("Ctrl+Shift+S").unwrap(),
+                other: Command::SaveAs,
+            }),
+            false,
+        );
+        let open = settings_size(&mut Bindings::defaults(), &mut None, &mut None, true);
+        for (what, size) in [
+            ("custom", custom),
+            ("capturing", capturing),
+            ("conflict", conflict),
+            ("zoom keys open", open),
+        ] {
+            assert_eq!(size.x, base.x, "{what}: {size:?} vs {base:?}");
+        }
+        assert!(
+            open.y > base.y,
+            "the zoom keys add rows: {open:?} vs {base:?}"
+        );
+        assert!(base.y <= 560.0, "{base:?}");
     }
 
     #[test]
