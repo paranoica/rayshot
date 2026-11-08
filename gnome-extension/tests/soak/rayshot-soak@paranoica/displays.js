@@ -1181,8 +1181,7 @@ export class Displays {
                 return;
             }
             clipboard.set_text(St.ClipboardType.CLIPBOARD, marker);
-            later(300, () => {
-                ctrl(KEY_C);
+            sequence([SELECT_SETTLE_MS, () => {}, () => ctrl(KEY_C)], () => {
                 later(800, () => clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c, text) => {
                     if (!r._busy || text !== marker) {
                         restore();
