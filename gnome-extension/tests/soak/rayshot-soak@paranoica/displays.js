@@ -26,6 +26,9 @@ const KEY_0 = 11;
 const KEY_MINUS = 12;
 const KEY_EQUAL = 13;
 const KEY_KPPLUS = 78;
+const KEY_Z = 44;
+const KEY_Y = 21;
+const KEY_D = 32;
 
 const WANTS = {
     plain: [1, 1],
@@ -223,6 +226,34 @@ function pixel(pb, x, y) {
     return [data[at], data[at + 1], data[at + 2]];
 }
 
+function colourBounds(pb, match) {
+    const data = pb.get_pixels();
+    const stride = pb.get_rowstride();
+    const n = pb.get_n_channels();
+    let box = null;
+    for (let y = 0; y < pb.get_height(); y++) {
+        for (let x = 0; x < pb.get_width(); x++) {
+            const at = y * stride + x * n;
+            if (match([data[at], data[at + 1], data[at + 2]])) {
+                box ??= {x0: x, y0: y, x1: x, y1: y};
+                box.x0 = Math.min(box.x0, x);
+                box.y0 = Math.min(box.y0, y);
+                box.x1 = Math.max(box.x1, x);
+                box.y1 = Math.max(box.y1, y);
+            }
+        }
+    }
+    return box;
+}
+
+function isRed(c) {
+    return c !== null && c[0] > 180 && c[1] < 120 && c[2] < 120;
+}
+
+function isGreen(c) {
+    return c !== null && c[1] > 150 && c[0] < 120 && c[2] < 140;
+}
+
 function redBox(pb) {
     const data = pb.get_pixels();
     const stride = pb.get_rowstride();
@@ -288,6 +319,12 @@ export class Displays {
                     this._lensDraw(next);
                 else if (kind === 'lens-grip')
                     this._lensGrip(next);
+                else if (kind === 'text-lines')
+                    this._textLines(false, next);
+                else if (kind === 'lens-text')
+                    this._textLines(true, next);
+                else if (kind === 'edit-keys')
+                    this._editKeys(next);
                 else if (kind === 'rebound')
                     this._rebound(next);
                 else if (kind === 'shape-enter')
@@ -952,6 +989,141 @@ export class Displays {
                     : `left edge ${hex(left)}, top edge ${hex(top)}; ${redBox(pb)}`);
                 next();
             }, fail)), () => fail('enter did not copy (the scene or the selection is gone)')));
+        }, fail);
+    }
+
+    _keyKit() {
+        const k = this._d._keyboard;
+        const now = () => GLib.get_monotonic_time();
+        const p = this._device();
+        return {
+            now,
+            tap: v => {
+                k.notify_keyval(now(), v, Clutter.KeyState.PRESSED);
+                k.notify_keyval(now(), v, Clutter.KeyState.RELEASED);
+            },
+            shiftTap: v => {
+                k.notify_keyval(now(), Clutter.KEY_Shift_L, Clutter.KeyState.PRESSED);
+                k.notify_keyval(now(), v, Clutter.KeyState.PRESSED);
+                k.notify_keyval(now(), v, Clutter.KeyState.RELEASED);
+                k.notify_keyval(now(), Clutter.KEY_Shift_L, Clutter.KeyState.RELEASED);
+            },
+            ctrl: code => {
+                k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+                k.notify_key(now(), code, Clutter.KeyState.PRESSED);
+                k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+                k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
+            },
+            move: at => p.notify_absolute_motion(now(), at.x, at.y),
+            press: () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
+            release: () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED),
+            click: () => {
+                p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED);
+                p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
+            },
+        };
+    }
+
+    _select(overlay, area, fail) {
+        try {
+            overlay.proc.get_stdin_pipe().write_all(
+                new TextEncoder().encode(`select ${overlay.session} ${area.join(' ')}\n`), null);
+            return true;
+        } catch (e) {
+            fail(`cannot select: ${e.message}`);
+            return false;
+        }
+    }
+
+    _textLines(lens, next) {
+        const name = lens
+            ? 'text typed in a zoomed selection is magnified where it was typed'
+            : 'shift enter starts a second line of text';
+        const r = this._r();
+        const fail = why => this._fail(name, why, next);
+        const kit = this._keyKit();
+        const area = lens ? [200, 200, 600, 400] : [200, 200, 900, 800];
+        this._capture({x: 100, y: 100}, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            if (!this._select(overlay, area, fail))
+                return;
+            const zoom = lens ? [() => kit.ctrl(KEY_EQUAL), () => kit.ctrl(KEY_EQUAL)] : [];
+            const typing = lens
+                ? [() => kit.tap(Clutter.KEY_H)]
+                : [() => kit.tap(Clutter.KEY_a), () => kit.shiftTap(Clutter.KEY_Return), () => kit.tap(Clutter.KEY_b)];
+            sequence([
+                () => {},
+                () => kit.tap(Clutter.KEY_t),
+                ...zoom,
+                () => kit.move({x: 300, y: 300}),
+                kit.click,
+                ...typing,
+                () => kit.tap(Clutter.KEY_Return),
+                () => kit.tap(Clutter.KEY_Return),
+            ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                const box = colourBounds(pb, isRed);
+                let ok = false;
+                let detail = 'no red text';
+                if (box) {
+                    const w = (box.x1 - box.x0) / s;
+                    const h = (box.y1 - box.y0) / s;
+                    detail = `text at ${box.x0 / s},${box.y0 / s}, ${Math.round(w)}x${Math.round(h)}`;
+                    ok = lens
+                        ? box.x0 / s >= 98 && box.x0 / s <= 116 && box.y0 / s >= 98 && box.y0 / s <= 130 && h >= 25
+                        : h >= 30 && w < 40;
+                }
+                this._d._result(name, ok, `png ${pb.get_width()}x${pb.get_height()}, ${detail}`);
+                next();
+            }, fail)), () => fail('enter did not copy')));
+        }, fail);
+    }
+
+    _editKeys(next) {
+        const name = 'undo, redo, a colour digit and ctrl d act on the drawing';
+        const r = this._r();
+        const fail = why => this._fail(name, why, next);
+        const kit = this._keyKit();
+        const drag = (from, to) => [
+            () => kit.move(from),
+            kit.press,
+            () => kit.move({x: (from.x + to.x) / 2, y: (from.y + to.y) / 2}),
+            () => kit.move(to),
+            kit.release,
+        ];
+        this._capture({x: 100, y: 100}, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            if (!this._select(overlay, [200, 200, 900, 800], fail))
+                return;
+            sequence([
+                () => {},
+                () => kit.tap(Clutter.KEY_1),
+                () => kit.tap(Clutter.KEY_r),
+                ...drag({x: 300, y: 300}, {x: 400, y: 380}),
+                ...drag({x: 300, y: 450}, {x: 400, y: 530}),
+                () => kit.ctrl(KEY_Z),
+                () => kit.ctrl(KEY_Z),
+                () => kit.ctrl(KEY_Y),
+                () => kit.tap(Clutter.KEY_4),
+                ...drag({x: 500, y: 300}, {x: 600, y: 380}),
+                () => kit.tap(Clutter.KEY_s),
+                () => kit.move({x: 501, y: 340}),
+                kit.click,
+                () => kit.ctrl(KEY_D),
+                () => kit.tap(Clutter.KEY_Return),
+                () => kit.tap(Clutter.KEY_1),
+                () => kit.tap(Clutter.KEY_Return),
+            ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                const at = (x, y) => pixel(pb, (x - 200) * s, (y - 200) * s);
+                const kept = at(302, 340);
+                const undone = at(302, 490);
+                const green = at(502, 340);
+                const copy = at(518, 370);
+                const ok = isRed(kept) && !isRed(undone) && isGreen(green) && isGreen(copy);
+                this._d._result(name, ok, ok
+                    ? 'the redone rect is red, the undone one is gone, the green one and its copy are there'
+                    : `redone ${hex(kept)}, undone ${hex(undone)}, green ${hex(green)}, copy ${hex(copy)}`);
+                next();
+            }, fail)), () => fail('enter did not copy')));
         }, fail);
     }
 
