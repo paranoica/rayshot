@@ -431,6 +431,7 @@ struct Lens {
     outer: egui::Rect,
     inner: egui::Rect,
     z: f32,
+    center: egui::Pos2,
 }
 
 impl Lens {
@@ -445,23 +446,35 @@ impl Lens {
             want.x.clamp(outer.min.x + half.x, outer.max.x - half.x),
             want.y.clamp(outer.min.y + half.y, outer.max.y - half.y),
         );
-        Some(Lens {
+        let raw = egui::Rect::from_center_size(c, size);
+        let lo = egui::pos2(outer.min.x.ceil(), outer.min.y.ceil());
+        let hi = egui::pos2(outer.max.x.floor(), outer.max.y.floor());
+        let inner = egui::Rect::from_min_max(
+            egui::pos2(raw.min.x.round().max(lo.x), raw.min.y.round().max(lo.y)),
+            egui::pos2(raw.max.x.round().min(hi.x), raw.max.y.round().min(hi.y)),
+        );
+        (inner.width() >= 1.0 && inner.height() >= 1.0).then_some(Lens {
             outer,
-            inner: egui::Rect::from_center_size(c, size),
+            inner,
             z,
+            center: c,
         })
     }
 
+    fn ratio(&self) -> egui::Vec2 {
+        self.outer.size() / self.inner.size()
+    }
+
     fn into_frame(&self, q: egui::Pos2) -> egui::Pos2 {
-        self.inner.min + (q - self.outer.min) / self.z
+        self.inner.min + (q - self.outer.min) / self.ratio()
     }
 
     fn out_of_frame(&self, f: egui::Pos2) -> egui::Pos2 {
-        self.outer.min + (f - self.inner.min) * self.z
+        self.outer.min + (f - self.inner.min) * self.ratio()
     }
 
     fn offset(&self) -> egui::Vec2 {
-        self.inner.center() - self.outer.center()
+        self.center - self.outer.center()
     }
 }
 
@@ -699,6 +712,8 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                 let rect = forwarded_selection(from, to, fw as f32, fh as f32);
                 (self.selection, self.forwarded) =
                     next_selection(self.selection, self.forwarded, rect);
+                self.sel_zoom = 1.0;
+                self.sel_offset = egui::Vec2::ZERO;
                 self.request_redraw_all();
             }
             UserEvent::Cancel { id } => {
@@ -1537,14 +1552,25 @@ impl OverlayApp {
                 let q = plain_to_frame(p);
                 active_lens.map_or(q, |l| l.into_frame(q))
             };
-            let tool_screen =
-                |f: egui::Pos2| plain_to_screen(active_lens.map_or(f, |l| l.out_of_frame(f)));
             let tool_scale = active_lens.map_or(scale, |l| scale * l.z);
+            let owner_of = |i: usize| {
+                lens.filter(|l| {
+                    selection_outline(&shapes[i], &|f: egui::Pos2| f, 1.0)
+                        .is_some_and(|r| l.inner.contains(r.center()))
+                })
+            };
+            let owner_screen =
+                |i: usize, f: egui::Pos2| plain_to_screen(owner_of(i).map_or(f, |l| l.out_of_frame(f)));
+            let through = |p: egui::Pos2, lensed: bool| {
+                let q = plain_to_frame(p);
+                lens.filter(|_| lensed).map_or(q, |l| l.into_frame(q))
+            };
             let inside_selected = |p: egui::Pos2| {
                 selected_before.filter(|&i| {
+                    let os = |f: egui::Pos2| owner_screen(i, f);
+                    let oscale = owner_of(i).map_or(scale, |l| scale * l.z);
                     !on_capture_handle(p)
-                        && selection_outline(&shapes[i], &tool_screen, tool_scale)
-                            .is_some_and(|r| r.contains(p))
+                        && selection_outline(&shapes[i], &os, oscale).is_some_and(|r| r.contains(p))
                 })
             };
             match tool {
@@ -1568,13 +1594,24 @@ impl OverlayApp {
                             let grip = selected.and_then(|i| {
                                 crate::scene::grips(&shapes[i])
                                     .into_iter()
-                                    .find(|(_, at)| (tool_screen(*at) - p).length() <= GRIP_REACH)
+                                    .find(|(_, at)| {
+                                        (owner_screen(i, *at) - p).length() <= GRIP_REACH
+                                    })
                                     .map(|(g, _)| (i, g))
                             });
+                            let owned = grip.map(|(i, _)| i).or_else(|| inside_selected(p));
                             if let Some((i, g)) = grip {
+                                lens_drag = owner_of(i).is_some();
+                                drag_start = Some(through(p, lens_drag));
                                 shape_drag = Some((i, Some(g), shapes[i].clone()));
                                 sel_mode = None;
-                            } else if let Some(i) = inside_selected(p).or_else(|| hit(fp)) {
+                            } else if let Some(i) = owned {
+                                lens_drag = owner_of(i).is_some();
+                                drag_start = Some(through(p, lens_drag));
+                                selected = Some(i);
+                                shape_drag = Some((i, None, shapes[i].clone()));
+                                sel_mode = None;
+                            } else if let Some(i) = hit(fp) {
                                 selected = Some(i);
                                 shape_drag = Some((i, None, shapes[i].clone()));
                                 sel_mode = None;
@@ -1606,7 +1643,7 @@ impl OverlayApp {
                     }
                     if resp.dragged() || resp.drag_stopped() {
                         if let (Some(start), Some(p)) = (drag_start, cursor_pos) {
-                            let fp = tool_frame(p);
+                            let fp = through(p, lens_drag);
                             if let Some((i, grip, orig)) = &shape_drag {
                                 let moved = match grip {
                                     None => crate::scene::translated(orig, fp - start),
@@ -1656,7 +1693,7 @@ impl OverlayApp {
                         selected.and_then(|i| {
                             crate::scene::grips(&shapes[i])
                                 .into_iter()
-                                .find(|(_, at)| (tool_screen(*at) - p).length() <= GRIP_REACH)
+                                .find(|(_, at)| (owner_screen(i, *at) - p).length() <= GRIP_REACH)
                                 .map(|(g, _)| g)
                         })
                     };
@@ -4764,6 +4801,23 @@ mod tests {
     }
 
     #[test]
+    fn the_lens_source_is_whole_pixels_so_the_export_matches_the_view() {
+        let outer = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(1010.0, 720.0));
+        for z in [1.5, 3.0] {
+            let lens = super::Lens::new(outer, z, egui::vec2(13.3, -7.7)).unwrap();
+            for v in [
+                lens.inner.min.x,
+                lens.inner.min.y,
+                lens.inner.max.x,
+                lens.inner.max.y,
+            ] {
+                assert_eq!(v.fract(), 0.0, "{z}: {:?}", lens.inner);
+            }
+            assert!(outer.contains_rect(lens.inner), "{z}: {:?}", lens.inner);
+        }
+    }
+
+    #[test]
     fn the_lens_can_be_moved_but_not_past_the_selection() {
         let outer = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(500.0, 400.0));
         let moved = super::Lens::new(outer, 2.0, egui::vec2(-50.0, 30.0)).unwrap();
@@ -4774,6 +4828,13 @@ mod tests {
             egui::Rect::from_min_max(egui::pos2(400.0, 100.0), egui::pos2(500.0, 175.0))
         );
         assert_eq!(pushed.offset(), egui::vec2(150.0, -112.5));
+        let a = super::Lens::new(outer, 3.0, egui::vec2(0.3, 0.0)).unwrap();
+        let b = super::Lens::new(outer, 3.0, a.offset() + egui::vec2(0.3, 0.0)).unwrap();
+        assert!(
+            (b.offset().x - 0.6).abs() < 1e-4,
+            "small pans add up: {:?}",
+            b.offset()
+        );
     }
 
     #[test]
