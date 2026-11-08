@@ -229,6 +229,7 @@ struct OverlayApp {
     hidden_buttons: Vec<crate::prefs::Button>,
     recent: Vec<egui::Color32>,
     bindings: crate::keys::Bindings,
+    export_scale: f32,
     rebinding: Option<crate::keys::Command>,
     rebind_note: Option<RebindNote>,
     show_settings: bool,
@@ -277,6 +278,7 @@ impl OverlayApp {
             hidden_buttons: prefs.hidden_buttons,
             recent: prefs.recent,
             bindings: prefs.keys,
+            export_scale: 1.0,
             rebinding: None,
             rebind_note: None,
             show_settings: false,
@@ -378,6 +380,50 @@ fn monitor_region(name: Option<&str>, rects: &[crate::live::MonitorRect]) -> Opt
         egui::pos2(m.x as f32, m.y as f32),
         egui::vec2(m.width as f32, m.height as f32),
     ))
+}
+
+const EXPORT_SCALES: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
+
+fn step_scale(current: f32, up: bool) -> f32 {
+    if up {
+        EXPORT_SCALES
+            .into_iter()
+            .find(|s| *s > current + 1e-3)
+            .unwrap_or(EXPORT_SCALES[EXPORT_SCALES.len() - 1])
+    } else {
+        EXPORT_SCALES
+            .into_iter()
+            .rev()
+            .find(|s| *s < current - 1e-3)
+            .unwrap_or(EXPORT_SCALES[0])
+    }
+}
+
+fn scaled_size(width: f32, height: f32, scale: f32) -> (u32, u32) {
+    let side = |v: f32| (v * scale).round().max(1.0) as u32;
+    (side(width), side(height))
+}
+
+fn size_label(width: f32, height: f32, scale: f32) -> String {
+    let base = format!("{} × {}", width.round() as i32, height.round() as i32);
+    if (scale - 1.0).abs() < 1e-3 {
+        return base;
+    }
+    let (w, h) = scaled_size(width, height, scale);
+    format!("{base} → {w} × {h}")
+}
+
+fn scaled(img: image::RgbaImage, scale: f32) -> image::RgbaImage {
+    if (scale - 1.0).abs() < 1e-3 {
+        return img;
+    }
+    let (w, h) = scaled_size(img.width() as f32, img.height() as f32, scale);
+    let filter = if scale < 1.0 {
+        image::imageops::FilterType::Lanczos3
+    } else {
+        image::imageops::FilterType::CatmullRom
+    };
+    image::imageops::resize(&img, w, h, filter)
 }
 
 fn spawn_detached(command: &str, file: &std::path::Path) -> std::io::Result<()> {
@@ -1219,6 +1265,7 @@ impl OverlayApp {
         let mut scroll_acc = self.scroll_acc;
         let mut hidden = self.hidden.clone();
         let mut hidden_buttons = self.hidden_buttons.clone();
+        let export_scale = self.export_scale;
         let mut bindings = self.bindings.clone();
         let mut rebinding = self.rebinding;
         let mut rebind_note = self.rebind_note.clone();
@@ -1778,11 +1825,7 @@ impl OverlayApp {
                     );
                 }
                 if region.contains(sel.min) {
-                    let label = format!(
-                        "{} × {}",
-                        sel.width().round() as i32,
-                        sel.height().round() as i32
-                    );
+                    let label = size_label(sel.width(), sel.height(), export_scale);
                     let galley = painter.layout_no_wrap(
                         label,
                         egui::FontId::proportional(12.0),
@@ -2681,15 +2724,21 @@ impl OverlayApp {
             .context("export image build failed")
     }
 
+    fn export_image(&self) -> Result<Option<image::RgbaImage>> {
+        Ok(self
+            .render_selection_to_image(false)?
+            .map(|img| scaled(img, self.export_scale)))
+    }
+
     fn finish(&self) -> Result<Option<std::path::PathBuf>> {
         let render_started = std::time::Instant::now();
-        let img = match self.render_selection_to_image(false) {
+        let img = match self.export_image() {
             Ok(Some(img)) => img,
             Ok(None) => return Ok(None),
             Err(e) => {
                 eprintln!("[rayshot] annotated export failed ({e:#}); using raw crop");
                 match self.cropped_image() {
-                    Some(img) => img,
+                    Some(img) => scaled(img, self.export_scale),
                     None => return Ok(None),
                 }
             }
@@ -2878,7 +2927,17 @@ impl OverlayApp {
             Command::CopyText => self.run_action(event_loop, Action::CopyText),
             Command::Save => self.run_action(event_loop, Action::Save),
             Command::SaveAs => self.run_action(event_loop, Action::SaveAs),
-            Command::ZoomIn | Command::ZoomOut | Command::ZoomReset | Command::Loupe => {}
+            Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => {
+                self.export_scale = match command {
+                    Command::ZoomIn => step_scale(self.export_scale, true),
+                    Command::ZoomOut => step_scale(self.export_scale, false),
+                    _ => 1.0,
+                };
+                let percent = (self.export_scale * 100.0).round();
+                self.toast = Some((format!("Export {percent} %"), std::time::Instant::now()));
+                self.request_redraw_all();
+            }
+            Command::Loupe => {}
         }
     }
 
@@ -2982,7 +3041,7 @@ impl OverlayApp {
         if self.defer_until_frame(Action::SaveAs) {
             return;
         }
-        let png = match self.render_selection_to_image(false) {
+        let png = match self.export_image() {
             Ok(Some(img)) => crate::export::to_png_bytes(&img),
             Ok(None) => {
                 eprintln!("[rayshot] nothing to save (no selection)");
@@ -3052,7 +3111,7 @@ impl OverlayApp {
         if self.defer_until_frame(Action::Save) {
             return;
         }
-        let img = match self.render_selection_to_image(false) {
+        let img = match self.export_image() {
             Ok(Some(img)) => img,
             Ok(None) => {
                 eprintln!("[rayshot] nothing to save (no selection)");
@@ -4275,6 +4334,54 @@ mod tests {
         assert!(
             lefts.iter().all(|x| (x - first).abs() < 0.5),
             "toggles at {lefts:?}"
+        );
+    }
+
+    #[test]
+    fn export_scale_steps_through_the_agreed_sizes() {
+        let mut s = 1.0;
+        let mut ups = Vec::new();
+        for _ in 0..4 {
+            s = super::step_scale(s, true);
+            ups.push(s);
+        }
+        assert_eq!(ups, vec![1.5, 2.0, 2.0, 2.0]);
+        let mut s = 1.0;
+        let mut downs = Vec::new();
+        for _ in 0..5 {
+            s = super::step_scale(s, false);
+            downs.push(s);
+        }
+        assert_eq!(downs, vec![0.75, 0.5, 0.25, 0.25, 0.25]);
+        assert_eq!(super::step_scale(1.2, true), 1.5);
+        assert_eq!(super::step_scale(1.2, false), 1.0);
+    }
+
+    #[test]
+    fn the_size_label_shows_the_exported_size() {
+        assert_eq!(super::size_label(1920.0, 1080.0, 1.0), "1920 × 1080");
+        assert_eq!(
+            super::size_label(1920.0, 1080.0, 0.5),
+            "1920 × 1080 → 960 × 540"
+        );
+        assert_eq!(super::size_label(101.0, 33.0, 1.5), "101 × 33 → 152 × 50");
+        assert_eq!(super::size_label(3.0, 3.0, 0.25), "3 × 3 → 1 × 1");
+    }
+
+    #[test]
+    fn the_export_is_resized_by_the_scale() {
+        let img = image::RgbaImage::from_pixel(100, 50, image::Rgba([10, 20, 30, 255]));
+        assert_eq!(super::scaled(img.clone(), 0.5).dimensions(), (50, 25));
+        assert_eq!(super::scaled(img.clone(), 2.0).dimensions(), (200, 100));
+        let same = super::scaled(img.clone(), 1.0);
+        assert_eq!(same, img);
+        let tiny = image::RgbaImage::new(3, 3);
+        assert_eq!(super::scaled(tiny, 0.25).dimensions(), (1, 1));
+        let half = super::scaled(img, 0.5);
+        assert_eq!(
+            half.get_pixel(25, 12).0,
+            [10, 20, 30, 255],
+            "a flat colour stays flat"
         );
     }
 
