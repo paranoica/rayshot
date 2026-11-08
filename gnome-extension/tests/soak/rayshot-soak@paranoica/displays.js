@@ -286,6 +286,8 @@ export class Displays {
                     this._lensExport(next);
                 else if (kind === 'lens-draw')
                     this._lensDraw(next);
+                else if (kind === 'lens-grip')
+                    this._lensGrip(next);
                 else if (kind === 'rebound')
                     this._rebound(next);
                 else if (kind === 'shape-enter')
@@ -838,12 +840,14 @@ export class Displays {
                     const want = [400 * s, 200 * s].map(Math.round);
                     const got = [pb.get_width(), pb.get_height()];
                     const mark = pixel(pb, 240 * s, 140 * s);
+                    const corner = pixel(pb, 270 * s, 170 * s);
                     const before = pixel(pb, 180 * s, 140 * s);
                     const ok = got[0] === want[0] && got[1] === want[1] &&
-                        near(mark, COLOURS[1]) && !near(before, COLOURS[1]);
+                        near(mark, COLOURS[1]) && near(corner, COLOURS[1]) && !near(before, COLOURS[1]);
                     this._d._result(name, ok, ok
                         ? `png ${got.join('x')}, the 40 px mark fills 80 px in the middle`
-                        : `png ${got.join('x')} (want ${want.join('x')}), mark ${hex(mark)}, left of it ${hex(before)}`);
+                        : `png ${got.join('x')} (want ${want.join('x')}), mark ${hex(mark)}, ` +
+                          `its far corner ${hex(corner)}, left of it ${hex(before)}`);
                     next();
                 }, fail)), () => fail('enter did not copy')));
         }, fail);
@@ -855,6 +859,7 @@ export class Displays {
         const fail = why => this._fail(name, why, next);
         const {tap, plus} = this._lensKeys();
         const now = () => GLib.get_monotonic_time();
+        this._mark(310, 260, COLOURS[1]);
         this._capture({x: 100, y: 100}, overlay => {
             const s = overlay.texture.get_width() / global.stage.width;
             try {
@@ -883,13 +888,68 @@ export class Displays {
                 const bottom = pixel(pb, 250 * s, 150 * s - 2);
                 const inside = pixel(pb, 250 * s, 125 * s);
                 const unlensed = pixel(pb, 400 * s - 2, 125 * s);
-                const ok = red(edge) && red(bottom) && !red(inside) && !red(unlensed);
+                const mark = pixel(pb, 90 * s, 90 * s);
+                this._clearMarks();
+                const ok = red(edge) && red(bottom) && !red(inside) && !red(unlensed) && near(mark, COLOURS[1]);
                 this._d._result(name, ok, ok
                     ? `png ${pb.get_width()}x${pb.get_height()}, right and bottom edges where they were drawn`
                     : `right edge ${hex(edge)}, bottom edge ${hex(bottom)}, inside ${hex(inside)}, ` +
-                      `where an unzoomed edge would be ${hex(unlensed)}; ${redBox(pb)}`);
+                      `where an unzoomed edge would be ${hex(unlensed)}, magnified mark ${hex(mark)}; ${redBox(pb)}`);
                 next();
             }, fail)), () => fail('enter did not copy')));
+        }, fail);
+    }
+
+    _lensGrip(next) {
+        const name = 'a magnified grip outside the zoomed selection can be dragged';
+        const r = this._r();
+        const fail = why => this._fail(name, why, next);
+        const {tap, plus} = this._lensKeys();
+        const now = () => GLib.get_monotonic_time();
+        this._capture({x: 100, y: 100}, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            try {
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${overlay.session} 200 200 600 400\n`), null);
+            } catch (e) {
+                fail(`cannot select: ${e.message}`);
+                return;
+            }
+            const p = this._device();
+            const move = at => p.notify_absolute_motion(now(), at.x, at.y);
+            const press = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED);
+            const release = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
+            sequence([
+                () => {},
+                plus,
+                plus,
+                () => tap(Clutter.KEY_r),
+                () => move({x: 500, y: 300}),
+                press,
+                () => move({x: 580, y: 340}),
+                () => move({x: 650, y: 380}),
+                release,
+                () => tap(Clutter.KEY_s),
+                () => move({x: 500, y: 340}),
+                press,
+                release,
+                () => move({x: 650, y: 340}),
+                press,
+                () => move({x: 675, y: 340}),
+                () => move({x: 700, y: 340}),
+                release,
+                () => tap(Clutter.KEY_Return),
+                () => tap(Clutter.KEY_Return),
+            ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                const red = c => c !== null && c[0] > 180 && c[1] < 120 && c[2] < 120;
+                const left = pixel(pb, 302 * s, 140 * s);
+                const top = pixel(pb, 360 * s, 102 * s);
+                const ok = red(left) && red(top);
+                this._d._result(name, ok, ok
+                    ? `png ${pb.get_width()}x${pb.get_height()}, the rectangle is still there`
+                    : `left edge ${hex(left)}, top edge ${hex(top)}; ${redBox(pb)}`);
+                next();
+            }, fail)), () => fail('enter did not copy (the scene or the selection is gone)')));
         }, fail);
     }
 
