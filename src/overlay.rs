@@ -414,7 +414,10 @@ fn loupe_origin(cursor: egui::Pos2, size: egui::Vec2, bounds: egui::Rect) -> egu
     if y + size.y > bounds.bottom() {
         y = cursor.y - LOUPE_GAP - size.y;
     }
-    egui::pos2(x.max(bounds.left()), y.max(bounds.top()))
+    egui::pos2(
+        x.min(bounds.right() - size.x).max(bounds.left()),
+        y.min(bounds.bottom() - size.y).max(bounds.top()),
+    )
 }
 
 const EXPORT_SCALES: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
@@ -439,12 +442,26 @@ fn scaled_size(width: f32, height: f32, scale: f32) -> (u32, u32) {
     (side(width), side(height))
 }
 
-fn size_label(width: f32, height: f32, scale: f32) -> String {
-    let base = format!("{} × {}", width.round() as i32, height.round() as i32);
+fn crop_box(sel: egui::Rect, width: u32, height: u32) -> (u32, u32, u32, u32) {
+    let (fw, fh) = (width as f32, height as f32);
+    let x = sel.min.x.floor().clamp(0.0, fw);
+    let y = sel.min.y.floor().clamp(0.0, fh);
+    let x2 = sel.max.x.ceil().clamp(0.0, fw);
+    let y2 = sel.max.y.ceil().clamp(0.0, fh);
+    (
+        x as u32,
+        y as u32,
+        (x2 - x).max(0.0) as u32,
+        (y2 - y).max(0.0) as u32,
+    )
+}
+
+fn size_label(width: u32, height: u32, scale: f32) -> String {
+    let base = format!("{width} × {height}");
     if (scale - 1.0).abs() < 1e-3 {
         return base;
     }
-    let (w, h) = scaled_size(width, height, scale);
+    let (w, h) = scaled_size(width as f32, height as f32, scale);
     format!("{base} → {w} × {h}")
 }
 
@@ -691,12 +708,11 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
         {
             if !ke.state.is_pressed() {
                 self.held_after_capture = None;
+            } else if ke.repeat {
                 return;
+            } else {
+                self.held_after_capture = None;
             }
-            if ke.repeat {
-                return;
-            }
-            self.held_after_capture = None;
         }
 
         if let WindowEvent::MouseInput {
@@ -1316,6 +1332,7 @@ impl OverlayApp {
         let mut hidden = self.hidden.clone();
         let mut hidden_buttons = self.hidden_buttons.clone();
         let export_scale = self.export_scale;
+        let frame_dims = self.frame_dims().unwrap_or((u32::MAX, u32::MAX));
         let loupe_on = self.loupe_on;
         let mut bindings = self.bindings.clone();
         let mut rebinding = self.rebinding;
@@ -1882,7 +1899,8 @@ impl OverlayApp {
                     );
                 }
                 if region.contains(sel.min) {
-                    let label = size_label(sel.width(), sel.height(), export_scale);
+                    let (_, _, cw, ch) = crop_box(sel, frame_dims.0, frame_dims.1);
+                    let label = size_label(cw, ch, export_scale);
                     let galley = painter.layout_no_wrap(
                         label,
                         egui::FontId::proportional(12.0),
@@ -2335,12 +2353,17 @@ impl OverlayApp {
             if precise && let (Some(p), Some(frame)) = (raw_cursor, frame_px.as_deref()) {
                 let n = LOUPE_CELLS;
                 let grid = LOUPE_ZOOM * n as f32;
-                let size = egui::vec2(grid, grid + 22.0);
+                let below = if toast.is_some() { 52.0 } else { 22.0 };
+                let size = egui::vec2(grid, grid + below);
                 let origin = loupe_origin(p, size, avail);
-                loupe_box = Some(egui::Rect::from_min_size(origin, size));
+                loupe_box = Some(egui::Rect::from_min_size(origin, egui::vec2(grid, grid + 22.0)));
                 let field = egui::Rect::from_min_size(origin, egui::vec2(grid, grid));
                 painter.rect_filled(field.expand(2.0), 4, egui::Color32::from_black_alpha(220));
                 let fp = to_frame(p);
+                let fp = egui::pos2(
+                    fp.x.clamp(0.0, frame.width.saturating_sub(1) as f32),
+                    fp.y.clamp(0.0, frame.height.saturating_sub(1) as f32),
+                );
                 for (k, c) in loupe_cells(frame, fp, n).into_iter().enumerate() {
                     let at = origin + egui::vec2((k % n) as f32, (k / n) as f32) * LOUPE_ZOOM;
                     painter.rect_filled(
@@ -2646,15 +2669,12 @@ impl OverlayApp {
     fn cropped_image(&self) -> Option<image::RgbaImage> {
         let sel = self.selection?;
         let frame = self.frame.as_ref()?;
-        let x = sel.min.x.floor().clamp(0.0, frame.width as f32) as u32;
-        let y = sel.min.y.floor().clamp(0.0, frame.height as f32) as u32;
-        let x2 = sel.max.x.ceil().clamp(0.0, frame.width as f32) as u32;
-        let y2 = sel.max.y.ceil().clamp(0.0, frame.height as f32) as u32;
-        if x2 <= x || y2 <= y {
+        let (x, y, w, h) = crop_box(sel, frame.width, frame.height);
+        if w == 0 || h == 0 {
             return None;
         }
         let full = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())?;
-        Some(image::imageops::crop_imm(&full, x, y, x2 - x, y2 - y).to_image())
+        Some(image::imageops::crop_imm(&full, x, y, w, h).to_image())
     }
 
     fn render_selection_to_image(&self, redactions_only: bool) -> Result<Option<image::RgbaImage>> {
@@ -2664,11 +2684,9 @@ impl OverlayApp {
             return Ok(None);
         };
 
-        let fx = sel.min.x.floor().clamp(0.0, frame.width as f32);
-        let fy = sel.min.y.floor().clamp(0.0, frame.height as f32);
-        let fx2 = sel.max.x.ceil().clamp(0.0, frame.width as f32);
-        let fy2 = sel.max.y.ceil().clamp(0.0, frame.height as f32);
-        let (w, h) = ((fx2 - fx) as u32, (fy2 - fy) as u32);
+        let (x, y, w, h) = crop_box(sel, frame.width, frame.height);
+        let (fx, fy) = (x as f32, y as f32);
+        let (fx2, fy2) = ((x + w) as f32, (y + h) as f32);
         if w == 0 || h == 0 {
             return Ok(None);
         }
@@ -4486,14 +4504,24 @@ mod tests {
     }
 
     #[test]
+    fn the_crop_covers_every_pixel_the_selection_touches() {
+        let sel = egui::Rect::from_min_max(egui::pos2(10.4, 0.0), egui::pos2(110.6, 10.0));
+        assert_eq!(super::crop_box(sel, 1920, 1080), (10, 0, 101, 10));
+        let past = egui::Rect::from_min_max(egui::pos2(-5.0, 1070.2), egui::pos2(30.0, 1200.0));
+        assert_eq!(super::crop_box(past, 1920, 1080), (0, 1070, 30, 10));
+        let outside = egui::Rect::from_min_max(egui::pos2(1930.0, 5.0), egui::pos2(1990.0, 50.0));
+        assert_eq!(super::crop_box(outside, 1920, 1080).2, 0);
+    }
+
+    #[test]
     fn the_size_label_shows_the_exported_size() {
-        assert_eq!(super::size_label(1920.0, 1080.0, 1.0), "1920 × 1080");
+        assert_eq!(super::size_label(1920, 1080, 1.0), "1920 × 1080");
         assert_eq!(
-            super::size_label(1920.0, 1080.0, 0.5),
+            super::size_label(1920, 1080, 0.5),
             "1920 × 1080 → 960 × 540"
         );
-        assert_eq!(super::size_label(101.0, 33.0, 1.5), "101 × 33 → 152 × 50");
-        assert_eq!(super::size_label(3.0, 3.0, 0.25), "3 × 3 → 1 × 1");
+        assert_eq!(super::size_label(101, 33, 1.5), "101 × 33 → 152 × 50");
+        assert_eq!(super::size_label(3, 3, 0.25), "3 × 3 → 1 × 1");
     }
 
     #[test]
@@ -4558,6 +4586,11 @@ mod tests {
             super::loupe_origin(egui::pos2(100.0, 590.0), size, bounds),
             egui::pos2(124.0, 590.0 - 24.0 - 140.0),
             "flips up at the bottom edge"
+        );
+        assert_eq!(
+            super::loupe_origin(egui::pos2(900.0, 700.0), size, bounds),
+            egui::pos2(800.0 - 120.0, 600.0 - 140.0),
+            "a cursor past the window keeps the loupe inside it"
         );
     }
 
