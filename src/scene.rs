@@ -102,10 +102,6 @@ impl Tool {
             Tool::Picker => "I",
         }
     }
-
-    pub fn tooltip(self) -> String {
-        format!("{} ({})", self.label(), self.key())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

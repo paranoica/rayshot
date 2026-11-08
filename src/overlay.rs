@@ -172,6 +172,19 @@ enum Action {
     Close,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum RebindNote {
+    Conflict {
+        target: crate::keys::Command,
+        chord: crate::keys::Chord,
+        other: crate::keys::Command,
+    },
+    Refused {
+        target: crate::keys::Command,
+        why: String,
+    },
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum SelMode {
     New,
@@ -215,6 +228,9 @@ struct OverlayApp {
     hidden: Vec<crate::scene::Tool>,
     hidden_buttons: Vec<crate::prefs::Button>,
     recent: Vec<egui::Color32>,
+    bindings: crate::keys::Bindings,
+    rebinding: Option<crate::keys::Command>,
+    rebind_note: Option<RebindNote>,
     show_settings: bool,
     show_colours: bool,
     picker_hsv: Hsv,
@@ -260,6 +276,9 @@ impl OverlayApp {
             hidden: prefs.hidden,
             hidden_buttons: prefs.hidden_buttons,
             recent: prefs.recent,
+            bindings: prefs.keys,
+            rebinding: None,
+            rebind_note: None,
             show_settings: false,
             show_colours: false,
             picker_hsv: Hsv::of(egui::Color32::RED),
@@ -638,6 +657,8 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                     self.catch_up();
                     if let Some(action) = self.pending.take() {
                         self.run_action(event_loop, action);
+                    } else if let Some(target) = self.rebinding {
+                        self.capture_rebind(target, &event);
                     } else if typing_before || self.text_has_keyboard() {
                         self.request_redraw_all();
                     } else if drafting_before || self.text_edit.is_some() {
@@ -648,6 +669,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                     } else {
                         let ctrl = self.modifiers.control_key();
                         let shift = self.modifiers.shift_key();
+                        let alt = self.modifiers.alt_key();
                         let code = match event.physical_key {
                             PhysicalKey::Code(c) => Some(c),
                             _ => None,
@@ -698,15 +720,6 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             self.close(event_loop);
                         } else if matches!(event.logical_key, Key::Named(NamedKey::Enter)) {
                             self.run_action(event_loop, Action::Copy);
-                        } else if ctrl && shift && is(KeyCode::KeyC) {
-                            self.run_action(event_loop, Action::CopyText);
-                        } else if ctrl && is(KeyCode::KeyC) {
-                            self.run_action(event_loop, Action::Copy);
-                        } else if ctrl && is(KeyCode::KeyS) {
-                            self.run_action(
-                                event_loop,
-                                if shift { Action::SaveAs } else { Action::Save },
-                            );
                         } else if dragging
                             && ctrl
                             && (is(KeyCode::KeyZ) || is(KeyCode::KeyY) || is(KeyCode::KeyD))
@@ -719,34 +732,18 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                             self.scene.redo();
                             self.selected = None;
                             self.request_redraw_all();
+                        } else if let Some(command) = code
+                            .and_then(crate::keys::Key::from_code)
+                            .map(|key| crate::keys::Chord {
+                                ctrl,
+                                shift,
+                                alt,
+                                key,
+                            })
+                            .and_then(|chord| self.bindings.command(chord))
+                        {
+                            self.run_command(event_loop, command);
                         } else if !ctrl {
-                            let new_tool = if is(KeyCode::KeyS) || is(KeyCode::KeyV) {
-                                Some(Tool::Select)
-                            } else if is(KeyCode::KeyR) {
-                                Some(Tool::Rect)
-                            } else if is(KeyCode::KeyA) {
-                                Some(Tool::Arrow)
-                            } else if is(KeyCode::KeyL) {
-                                Some(Tool::Line)
-                            } else if is(KeyCode::KeyP) {
-                                Some(Tool::Pen)
-                            } else if is(KeyCode::KeyM) {
-                                Some(Tool::Marker)
-                            } else if is(KeyCode::KeyT) {
-                                Some(Tool::Text)
-                            } else if is(KeyCode::KeyX) {
-                                Some(Tool::Pixelate)
-                            } else if is(KeyCode::KeyB) {
-                                Some(Tool::Blur)
-                            } else if is(KeyCode::KeyE) {
-                                Some(Tool::Ellipse)
-                            } else if is(KeyCode::KeyN) {
-                                Some(Tool::Counter)
-                            } else if is(KeyCode::KeyI) {
-                                Some(Tool::Picker)
-                            } else {
-                                None
-                            };
                             let digit = [
                                 KeyCode::Digit1,
                                 KeyCode::Digit2,
@@ -767,13 +764,6 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
                                 self.color = c;
                                 if let Some(i) = selected {
                                     self.recolor_selected(i);
-                                }
-                                self.request_redraw_all();
-                            }
-                            if let Some(t) = new_tool {
-                                self.tool = t;
-                                if t != Tool::Select {
-                                    self.selected = None;
                                 }
                                 self.request_redraw_all();
                             }
@@ -1229,6 +1219,9 @@ impl OverlayApp {
         let mut scroll_acc = self.scroll_acc;
         let mut hidden = self.hidden.clone();
         let mut hidden_buttons = self.hidden_buttons.clone();
+        let mut bindings = self.bindings.clone();
+        let mut rebinding = self.rebinding;
+        let mut rebind_note = self.rebind_note.clone();
         let mut show_settings = self.show_settings;
         let mut show_colours = self.show_colours;
         let mut picker_hsv = self.picker_hsv;
@@ -2092,8 +2085,11 @@ impl OverlayApp {
                                 ui.spacing_mut().item_spacing.y = 3.0;
                                 ui.vertical(|ui| {
                                     for t in Tool::ALL.into_iter().filter(|t| !hidden.contains(t)) {
+                                        let key = bindings
+                                            .chord(crate::keys::Command::Tool(t))
+                                            .label();
                                         if tool_button(ui, t.icon(), tool == t)
-                                            .on_hover_text(t.tooltip())
+                                            .on_hover_text(format!("{} ({key})", t.label()))
                                             .clicked()
                                         {
                                             tool = t;
@@ -2129,9 +2125,9 @@ impl OverlayApp {
                                         if hidden_buttons.contains(&button) {
                                             continue;
                                         }
-                                        let (icon, label, key) = button_meta(button);
+                                        let (icon, _) = button_meta(button);
                                         if tool_button(ui, icon, false)
-                                            .on_hover_text(format!("{label} ({key})"))
+                                            .on_hover_text(button_hint(button, &bindings))
                                             .clicked()
                                         {
                                             action = Some(act);
@@ -2196,7 +2192,14 @@ impl OverlayApp {
                             .constrain(true)
                             .show(ui.ctx(), |ui| {
                                 egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                    settings_panel(ui, &mut hidden, &mut hidden_buttons);
+                                    settings_panel(
+                                        ui,
+                                        &mut hidden,
+                                        &mut hidden_buttons,
+                                        &mut bindings,
+                                        &mut rebinding,
+                                        &mut rebind_note,
+                                    );
                                 });
                             });
                     }
@@ -2250,6 +2253,13 @@ impl OverlayApp {
         self.scroll_acc = scroll_acc;
         self.hidden = hidden;
         self.hidden_buttons = hidden_buttons;
+        if !show_settings {
+            rebinding = None;
+            rebind_note = None;
+        }
+        self.bindings = bindings;
+        self.rebinding = rebinding;
+        self.rebind_note = rebind_note;
         self.show_settings = show_settings;
         self.show_colours = show_colours;
         self.picker_hsv = picker_hsv;
@@ -2751,6 +2761,7 @@ impl OverlayApp {
                 width: Some(self.stroke_width),
                 hidden_buttons: self.hidden_buttons.clone(),
                 recent: self.recent.clone(),
+                keys: self.bindings.clone(),
             });
         }
         if let Some(sel) = self.selection {
@@ -2775,6 +2786,7 @@ impl OverlayApp {
         self.hidden = prefs.hidden;
         self.hidden_buttons = prefs.hidden_buttons;
         self.recent = prefs.recent;
+        self.bindings = prefs.keys;
     }
 
     fn wait_colour_copy(&mut self) {
@@ -2848,6 +2860,83 @@ impl OverlayApp {
                     eprintln!("[rayshot] render error: {e:?}");
                 }
                 self.windows[i].unrendered_input = false;
+            }
+        }
+    }
+
+    fn run_command(&mut self, event_loop: &ActiveEventLoop, command: crate::keys::Command) {
+        use crate::keys::Command;
+        match command {
+            Command::Tool(t) => {
+                self.tool = t;
+                if t != crate::scene::Tool::Select {
+                    self.selected = None;
+                }
+                self.request_redraw_all();
+            }
+            Command::Copy => self.run_action(event_loop, Action::Copy),
+            Command::CopyText => self.run_action(event_loop, Action::CopyText),
+            Command::Save => self.run_action(event_loop, Action::Save),
+            Command::SaveAs => self.run_action(event_loop, Action::SaveAs),
+            Command::ZoomIn | Command::ZoomOut | Command::ZoomReset | Command::Loupe => {}
+        }
+    }
+
+    fn capture_rebind(&mut self, target: crate::keys::Command, event: &winit::event::KeyEvent) {
+        use crate::keys::{Assign, Chord, Key as Bindable};
+        self.request_redraw_all();
+        match event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.rebinding = None;
+                self.rebind_note = None;
+                return;
+            }
+            Key::Named(
+                NamedKey::Control
+                | NamedKey::Shift
+                | NamedKey::Alt
+                | NamedKey::AltGraph
+                | NamedKey::Super
+                | NamedKey::Meta
+                | NamedKey::Hyper,
+            ) => return,
+            _ => {}
+        }
+        let key = match event.physical_key {
+            PhysicalKey::Code(code) => Bindable::from_code(code),
+            _ => None,
+        };
+        let Some(key) = key else {
+            self.rebind_note = Some(RebindNote::Refused {
+                target,
+                why: "This key cannot be used here".into(),
+            });
+            return;
+        };
+        let chord = Chord {
+            ctrl: self.modifiers.control_key(),
+            shift: self.modifiers.shift_key(),
+            alt: self.modifiers.alt_key(),
+            key,
+        };
+        match self.bindings.assign(target, chord) {
+            Assign::Done => {
+                self.rebinding = None;
+                self.rebind_note = None;
+            }
+            Assign::Conflict(other) => {
+                self.rebinding = None;
+                self.rebind_note = Some(RebindNote::Conflict {
+                    target,
+                    chord,
+                    other,
+                });
+            }
+            Assign::Reserved(why) => {
+                self.rebind_note = Some(RebindNote::Refused {
+                    target,
+                    why: why.into(),
+                });
             }
         }
     }
@@ -3265,13 +3354,23 @@ const PALETTE_NAMES: [&str; 9] = [
     "Red", "Orange", "Yellow", "Green", "Cyan", "Blue", "Purple", "White", "Black",
 ];
 
-fn button_meta(button: Button) -> (&'static str, &'static str, &'static str) {
+fn button_meta(button: Button) -> (&'static str, crate::keys::Command) {
+    use crate::keys::Command;
     use egui_phosphor::regular as p;
     match button {
-        Button::Copy => (p::COPY, "Copy", "Enter"),
-        Button::CopyText => (p::TEXT_AA, "Copy text", "Ctrl Shift C"),
-        Button::Save => (p::FLOPPY_DISK, "Save", "Ctrl S"),
-        Button::SaveAs => (p::FOLDER_OPEN, "Save as…", "Ctrl Shift S"),
+        Button::Copy => (p::COPY, Command::Copy),
+        Button::CopyText => (p::TEXT_AA, Command::CopyText),
+        Button::Save => (p::FLOPPY_DISK, Command::Save),
+        Button::SaveAs => (p::FOLDER_OPEN, Command::SaveAs),
+    }
+}
+
+fn button_hint(button: Button, bindings: &crate::keys::Bindings) -> String {
+    let (_, command) = button_meta(button);
+    let key = bindings.chord(command).label();
+    match button {
+        Button::Copy => format!("{} (Enter, {key})", command.label()),
+        _ => format!("{} ({key})", command.label()),
     }
 }
 
@@ -3548,34 +3647,114 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     resp
 }
 
-fn keycap(ui: &mut egui::Ui, key: &str) {
-    egui::Frame::new()
-        .stroke(egui::Stroke::new(1.0f32, ui.visuals().weak_text_color()))
-        .corner_radius(4)
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(key).monospace().small());
-        });
+fn key_cell(
+    ui: &mut egui::Ui,
+    command: crate::keys::Command,
+    bindings: &mut crate::keys::Bindings,
+    rebinding: &mut Option<crate::keys::Command>,
+    note: &mut Option<RebindNote>,
+) {
+    ui.horizontal(|ui| {
+        let capturing = *rebinding == Some(command);
+        let text = if capturing {
+            "Press a key…".to_string()
+        } else {
+            bindings.chord(command).label()
+        };
+        let label = egui::RichText::new(text).monospace().small();
+        if ui
+            .add(egui::Button::selectable(capturing, label))
+            .on_hover_text("Click, then press the new key. Esc cancels.")
+            .clicked()
+        {
+            *rebinding = (!capturing).then_some(command);
+            *note = None;
+        }
+        if !bindings.is_default(command)
+            && ui
+                .small_button(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)
+                .on_hover_text("Back to the default key")
+                .clicked()
+        {
+            bindings.reset(command);
+            *rebinding = None;
+            *note = None;
+        }
+    });
+}
+
+fn note_row(
+    ui: &mut egui::Ui,
+    command: crate::keys::Command,
+    bindings: &mut crate::keys::Bindings,
+    note: &mut Option<RebindNote>,
+) {
+    let warn = ui.visuals().warn_fg_color;
+    match note.clone() {
+        Some(RebindNote::Conflict {
+            target,
+            chord,
+            other,
+        }) if target == command => {
+            ui.label("");
+            ui.label(
+                egui::RichText::new(format!("{} is used by {}", chord.label(), other.label()))
+                    .small()
+                    .color(warn),
+            );
+            ui.horizontal(|ui| {
+                if ui.small_button("Swap").clicked() {
+                    bindings.swap(target, other);
+                    *note = None;
+                }
+                if ui.small_button("Cancel").clicked() {
+                    *note = None;
+                }
+            });
+            ui.label("");
+            ui.end_row();
+        }
+        Some(RebindNote::Refused { target, why }) if target == command => {
+            ui.label("");
+            ui.label(egui::RichText::new(why).small().color(warn));
+            ui.label("");
+            ui.label("");
+            ui.end_row();
+        }
+        _ => {}
+    }
 }
 
 fn settings_panel(
     ui: &mut egui::Ui,
     hidden: &mut Vec<crate::scene::Tool>,
     hidden_buttons: &mut Vec<Button>,
+    bindings: &mut crate::keys::Bindings,
+    rebinding: &mut Option<crate::keys::Command>,
+    note: &mut Option<RebindNote>,
 ) {
+    use crate::keys::Command;
     use crate::scene::Tool;
-    let row = |ui: &mut egui::Ui, icon: &str, label: &str, key: &str, on: &mut bool| {
-        ui.label(egui::RichText::new(icon).size(16.0));
-        ui.label(label);
-        keycap(ui, key);
-        let changed = toggle(ui, on).changed();
-        ui.end_row();
-        changed
-    };
+    use egui_phosphor::regular as p;
     let header = |ui: &mut egui::Ui, title: &str| {
         ui.label("");
         ui.label(egui::RichText::new(title).strong());
         ui.end_row();
+    };
+    let mut row = |ui: &mut egui::Ui, icon: &str, command: Command, on: Option<&mut bool>| {
+        ui.label(egui::RichText::new(icon).size(16.0));
+        ui.label(command.label());
+        key_cell(ui, command, bindings, rebinding, note);
+        let changed = match on {
+            Some(on) => toggle(ui, on).changed(),
+            None => {
+                ui.label("");
+                false
+            }
+        };
+        ui.end_row();
+        note_row(ui, command, bindings, note);
+        changed
     };
     egui::Grid::new("rayshot-settings")
         .num_columns(4)
@@ -3584,7 +3763,7 @@ fn settings_panel(
             header(ui, "Tools");
             for t in Tool::ALL {
                 let mut on = !hidden.contains(&t);
-                if row(ui, t.icon(), t.label(), t.key(), &mut on) {
+                if row(ui, t.icon(), Command::Tool(t), Some(&mut on)) {
                     if on {
                         hidden.retain(|h| *h != t);
                     } else {
@@ -3595,9 +3774,9 @@ fn settings_panel(
             ui.end_row();
             header(ui, "Actions");
             for b in Button::ALL {
-                let (icon, label, key) = button_meta(b);
+                let (icon, command) = button_meta(b);
                 let mut on = !hidden_buttons.contains(&b);
-                if row(ui, icon, label, key, &mut on) {
+                if row(ui, icon, command, Some(&mut on)) {
                     if on {
                         hidden_buttons.retain(|h| *h != b);
                     } else {
@@ -3605,7 +3784,33 @@ fn settings_panel(
                     }
                 }
             }
+            ui.end_row();
+            header(ui, "Other keys");
+            row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ZoomIn, None);
+            row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ZoomOut, None);
+            row(ui, p::ARROWS_OUT_SIMPLE, Command::ZoomReset, None);
+            row(ui, p::MAGNIFYING_GLASS, Command::Loupe, None);
         });
+    ui.add_space(6.0);
+    let changed = Command::ALL.iter().any(|c| !bindings.is_default(*c));
+    if ui
+        .add_enabled(changed, egui::Button::new("Reset all keys").small())
+        .clicked()
+    {
+        bindings.reset_all();
+        *rebinding = None;
+        *note = None;
+    }
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                "Esc, Enter, 1–9, Ctrl+Z, Ctrl+Y, Delete, the arrows and Ctrl+D always keep their keys.",
+            )
+            .small()
+            .weak(),
+        )
+        .wrap(),
+    );
 }
 
 fn tool_button(ui: &mut egui::Ui, glyph: &str, selected: bool) -> egui::Response {
@@ -4044,10 +4249,20 @@ mod tests {
         let ctx = egui::Context::default();
         let mut hidden = Vec::new();
         let mut hidden_buttons = Vec::new();
+        let mut bindings = crate::keys::Bindings::defaults();
+        let mut rebinding = None;
+        let mut note = None;
         let mut lefts = Vec::new();
         for _ in 0..2 {
             let out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                super::settings_panel(ui, &mut hidden, &mut hidden_buttons);
+                super::settings_panel(
+                    ui,
+                    &mut hidden,
+                    &mut hidden_buttons,
+                    &mut bindings,
+                    &mut rebinding,
+                    &mut note,
+                );
             });
             lefts = Vec::new();
             for clipped in &out.shapes {

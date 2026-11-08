@@ -36,6 +36,7 @@ pub struct Prefs {
     pub color: Option<egui::Color32>,
     pub width: Option<f32>,
     pub recent: Vec<egui::Color32>,
+    pub keys: crate::keys::Bindings,
 }
 
 pub fn push_recent(
@@ -88,6 +89,7 @@ pub fn parse(text: &str) -> Prefs {
                     .collect();
             }
             "color" => prefs.color = parse_color(value),
+            "keys" => prefs.keys = crate::keys::Bindings::from_pref(value),
             "width" => {
                 prefs.width = value
                     .parse::<f32>()
@@ -128,6 +130,10 @@ pub fn render(prefs: &Prefs) -> String {
     }
     if let Some(w) = prefs.width {
         out += &format!("width = {w}\n");
+    }
+    let keys = prefs.keys.to_pref();
+    if !keys.is_empty() {
+        out += &format!("keys = {keys}\n");
     }
     out
 }
@@ -176,8 +182,22 @@ mod tests {
             color: Some(Color32::from_rgb(18, 52, 86)),
             width: Some(7.0),
             recent: vec![Color32::from_rgb(1, 2, 3), Color32::from_rgb(250, 100, 0)],
+            keys: crate::keys::Bindings::from_pref("pen:Q save:Ctrl+K"),
         };
         assert_eq!(parse(&render(&prefs)), prefs);
+    }
+
+    #[test]
+    fn rebound_keys_are_kept_and_defaults_are_not_written() {
+        let keys = crate::keys::Bindings::from_pref("pen:Q");
+        let text = render(&Prefs {
+            keys: keys.clone(),
+            ..Default::default()
+        });
+        assert!(text.contains("keys = pen:Q\n"), "{text}");
+        assert_eq!(parse(&text).keys, keys);
+        assert!(!render(&Prefs::default()).contains("keys"));
+        assert_eq!(parse("hidden = \n").keys, crate::keys::Bindings::defaults());
     }
 
     #[test]

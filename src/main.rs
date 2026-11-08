@@ -2,6 +2,7 @@ mod anim;
 mod capture;
 mod export;
 mod hotkey;
+mod keys;
 mod live;
 mod ocr;
 mod overlay;
