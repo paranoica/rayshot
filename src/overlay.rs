@@ -230,6 +230,7 @@ struct OverlayApp {
     recent: Vec<egui::Color32>,
     bindings: crate::keys::Bindings,
     zoom: f32,
+    pan_drag: bool,
     rebinding: Option<crate::keys::Command>,
     held_after_capture: Option<KeyCode>,
     rebind_note: Option<RebindNote>,
@@ -280,6 +281,7 @@ impl OverlayApp {
             recent: prefs.recent,
             bindings: prefs.keys,
             zoom: 1.0,
+            pan_drag: false,
             rebinding: None,
             held_after_capture: None,
             rebind_note: None,
@@ -424,7 +426,14 @@ fn fit(avail: egui::Rect, view: egui::Rect) -> (f32, egui::Rect) {
     (scale, image_rect)
 }
 
+const EXPORT_MAX_PIXELS: f32 = 40_000_000.0;
+
 fn scaled_size(width: f32, height: f32, scale: f32) -> (u32, u32) {
+    let room = (EXPORT_MAX_PIXELS / (width * height).max(1.0)).sqrt();
+    if scale > 1.0 && scale > room {
+        let side = |v: f32| (v * room.max(1.0)).floor().max(1.0) as u32;
+        return (side(width), side(height));
+    }
     let side = |v: f32| (v * scale).round().max(1.0) as u32;
     (side(width), side(height))
 }
@@ -1301,6 +1310,12 @@ impl OverlayApp {
             win.view_center.unwrap_or(region.center()),
         );
         let mut view_center = win.view_center;
+        let mut pan_drag = self.pan_drag;
+        let bounds = if self.zoom > 1.0 {
+            view
+        } else {
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(f32::MAX, f32::MAX))
+        };
         let frame_tex = win.frame_texture_id;
         if frame_tex.is_none() && !live {
             return Ok(());
@@ -1381,8 +1396,12 @@ impl OverlayApp {
             let to_frame = |p: egui::Pos2| {
                 let local = (p - image_rect.min) / scale;
                 egui::pos2(
-                    (view.min.x + local.x).clamp(0.0, frame_w),
-                    (view.min.y + local.y).clamp(0.0, frame_h),
+                    (view.min.x + local.x)
+                        .clamp(bounds.min.x, bounds.max.x)
+                        .clamp(0.0, frame_w),
+                    (view.min.y + local.y)
+                        .clamp(bounds.min.y, bounds.max.y)
+                        .clamp(0.0, frame_h),
                 )
             };
             let to_screen = |fp: egui::Pos2| image_rect.min + (fp - view.min) * scale;
@@ -1401,11 +1420,13 @@ impl OverlayApp {
                 egui::Id::new("rayshot-canvas"),
                 egui::Sense::click_and_drag(),
             );
-            let middle = egui::PointerButton::Middle;
-            let panning = resp.drag_started_by(middle)
-                || resp.dragged_by(middle)
-                || resp.drag_stopped_by(middle);
-            if resp.dragged_by(middle) && zoom > 1.0 {
+            if resp.drag_started() {
+                pan_drag = ui.input(|i| {
+                    i.pointer.button_down(egui::PointerButton::Middle) && !i.pointer.primary_down()
+                });
+            }
+            let panning = pan_drag && (resp.drag_started() || resp.dragged() || resp.drag_stopped());
+            if panning && resp.dragged() && zoom > 1.0 {
                 let moved = view.center() - resp.drag_delta() / scale;
                 view_center = Some(view_rect(region, zoom, moved).center());
             }
@@ -2387,6 +2408,7 @@ impl OverlayApp {
         self.rebind_note = rebind_note;
         self.show_settings = show_settings;
         self.windows[idx].view_center = view_center;
+        self.pan_drag = pan_drag;
         self.show_colours = show_colours;
         self.picker_hsv = picker_hsv;
         self.hex_text = hex_text;
@@ -4520,6 +4542,19 @@ mod tests {
         assert_eq!(super::crop_box(past, 1920, 1080), (0, 1070, 30, 10));
         let outside = egui::Rect::from_min_max(egui::pos2(1930.0, 5.0), egui::pos2(1990.0, 50.0));
         assert_eq!(super::crop_box(outside, 1920, 1080).2, 0);
+    }
+
+    #[test]
+    fn a_huge_zoomed_export_is_capped() {
+        assert_eq!(super::scaled_size(60.0, 24.0, 4.0), (240, 96));
+        let (w, h) = super::scaled_size(3840.0, 2160.0, 4.0);
+        assert!(w as u64 * h as u64 <= 40_000_000, "{w}x{h}");
+        assert!(w > 3840 * 2, "still zoomed: {w}x{h}");
+        assert_eq!(w * 9 / 16, h, "keeps the shape: {w}x{h}");
+        assert_eq!(
+            super::size_label(3840, 2160, 4.0),
+            format!("3840 × 2160 → {w} × {h}")
+        );
     }
 
     #[test]
