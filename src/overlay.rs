@@ -198,6 +198,7 @@ struct TextDraft {
     color: egui::Color32,
     size: f32,
     replaces: Option<usize>,
+    lensed: bool,
 }
 
 struct OverlayApp {
@@ -231,7 +232,7 @@ struct OverlayApp {
     bindings: crate::keys::Bindings,
     zoom: f32,
     pan_drag: bool,
-    pan_start: egui::Vec2,
+    pan_start: (egui::Vec2, egui::Vec2),
     sel_zoom: f32,
     sel_offset: egui::Vec2,
     lens_drag: bool,
@@ -286,7 +287,7 @@ impl OverlayApp {
             bindings: prefs.keys,
             zoom: 1.0,
             pan_drag: false,
-            pan_start: egui::Vec2::ZERO,
+            pan_start: (egui::Vec2::ZERO, egui::Vec2::ZERO),
             sel_zoom: 1.0,
             sel_offset: egui::Vec2::ZERO,
             lens_drag: false,
@@ -502,6 +503,37 @@ fn resized_to(img: image::RgbaImage, size: (u32, u32)) -> image::RgbaImage {
         image::imageops::FilterType::Lanczos3
     };
     image::imageops::resize(&img, size.0, size.1, filter)
+}
+
+fn text_selection(galley: &egui::Galley, start: usize, end: usize) -> Vec<egui::Rect> {
+    if start >= end {
+        return Vec::new();
+    }
+    let a = galley.pos_from_cursor(egui::text::CCursor::new(start));
+    let b = galley.pos_from_cursor(egui::text::CCursor::new(end));
+    galley
+        .rows
+        .iter()
+        .filter_map(|row| {
+            let r = row.rect();
+            if r.max.y <= a.min.y + 0.5 || r.min.y >= b.max.y - 0.5 {
+                return None;
+            }
+            let left = if (r.min.y - a.min.y).abs() < 0.5 {
+                a.min.x
+            } else {
+                r.min.x
+            };
+            let right = if (r.min.y - b.min.y).abs() < 0.5 {
+                b.min.x
+            } else {
+                r.max.x.max(r.min.x + 4.0)
+            };
+            (right > left).then(|| {
+                egui::Rect::from_min_max(egui::pos2(left, r.min.y), egui::pos2(right, r.max.y))
+            })
+        })
+        .collect()
 }
 
 fn draws_frame(see_through: bool, zoom: f32, has_texture: bool) -> bool {
@@ -1239,6 +1271,7 @@ impl OverlayApp {
                         color: self.color,
                         size: 24.0,
                         replaces: None,
+                        lensed: false,
                     });
                 }
             }
@@ -1459,9 +1492,10 @@ impl OverlayApp {
         let mut size_toast: Option<f32> = None;
         let mut reedit_text: Option<usize> = None;
         let editing_index = self.text_edit.as_ref().and_then(|d| d.replaces);
-        let mut start_text: Option<egui::Pos2> = None;
+        let mut start_text: Option<(egui::Pos2, bool)> = None;
         let mut text_buf = self.text_edit.as_ref().map(|d| d.buf.clone());
         let text_info = self.text_edit.as_ref().map(|d| (d.pos, d.color, d.size));
+        let text_lensed = self.text_edit.as_ref().is_some_and(|d| d.lensed);
         let mut text_lost_focus = false;
         let mut text_pos_shift = egui::Vec2::ZERO;
         let text_sel_prev = self.text_sel;
@@ -1540,21 +1574,22 @@ impl OverlayApp {
                 cursor_pos.is_some_and(in_lens)
             };
             if panning && resp.drag_started() {
-                pan_start = match (lens_drag, lens) {
-                    (true, Some(l)) => l.offset(),
-                    _ => view.center().to_vec2(),
-                };
+                let lens_from = lens.filter(|_| lens_drag).map_or(egui::Vec2::ZERO, |l| l.offset());
+                pan_start = (lens_from, view.center().to_vec2());
             }
             if let (true, true, Some(from), Some(now)) =
                 (panning, resp.dragged(), press_pos, cursor_pos)
             {
-                let moved = now - from;
+                let mut moved = now - from;
                 if let (true, Some(l)) = (lens_drag, lens) {
-                    if let Some(next) = Lens::new(l.outer, l.z, pan_start - moved / (scale * l.z)) {
+                    let want = pan_start.0 - moved / (scale * l.z);
+                    if let Some(next) = Lens::new(l.outer, l.z, want) {
                         sel_offset = next.offset();
+                        moved = (next.offset() - want) * (scale * l.z);
                     }
-                } else if zoom > 1.0 {
-                    let centre = (pan_start - moved / scale).to_pos2();
+                }
+                if zoom > 1.0 {
+                    let centre = (pan_start.1 - moved / scale).to_pos2();
                     view_center = Some(view_rect(region, zoom, centre).center());
                 }
             }
@@ -1761,7 +1796,7 @@ impl OverlayApp {
                 Tool::Text => {
                     if resp.clicked() {
                         if let Some(p) = cursor_pos {
-                            start_text = Some(tool_frame(p));
+                            start_text = Some((tool_frame(p), lensed));
                         }
                     }
                 }
@@ -2230,7 +2265,7 @@ impl OverlayApp {
                     painter.circle_filled(p, 1.4, egui::Color32::from_white_alpha(235));
                 }
             }
-            let text_lens = text_info.and_then(|(pos, _, _)| lens_now.filter(|l| l.inner.contains(pos)));
+            let text_lens = lens_now.filter(|_| text_lensed && text_info.is_some());
             let text_screen =
                 |f: egui::Pos2| plain_to_screen(text_lens.map_or(f, |l| l.out_of_frame(f)));
             let tscale = text_lens.map_or(scale, |l| scale * l.z);
@@ -2242,14 +2277,9 @@ impl OverlayApp {
                     let line_h = gsize.y.max(tsize * tscale);
                     let origin = text_screen(pos);
                     if let Some((s, e, _)) = text_sel_prev {
-                        if s != e {
-                            let x0 = galley.pos_from_cursor(egui::text::CCursor::new(s)).min.x;
-                            let x1 = galley.pos_from_cursor(egui::text::CCursor::new(e)).min.x;
+                        for r in text_selection(&galley, s, e) {
                             painter.rect_filled(
-                                egui::Rect::from_min_max(
-                                    origin + egui::vec2(x0, 0.0),
-                                    origin + egui::vec2(x1, line_h),
-                                ),
+                                r.translate(origin.to_vec2()),
                                 1,
                                 egui::Color32::from_rgba_unmultiplied(80, 140, 230, 120),
                             );
@@ -2291,7 +2321,29 @@ impl OverlayApp {
                                 .layout_no_wrap(buf.clone(), font.clone(), col)
                                 .size()
                                 .x;
-                            let output = egui::TextEdit::singleline(buf)
+                            let enter = ui.input_mut(|i| {
+                                let at = i.events.iter().position(|e| {
+                                    matches!(
+                                        e,
+                                        egui::Event::Key {
+                                            key: egui::Key::Enter,
+                                            pressed: true,
+                                            modifiers,
+                                            ..
+                                        } if !modifiers.shift && !modifiers.ctrl && !modifiers.alt
+                                    )
+                                });
+                                at.map(|k| i.events.remove(k)).is_some()
+                            });
+                            if enter {
+                                text_lost_focus = true;
+                            }
+                            let output = egui::TextEdit::multiline(buf)
+                                .desired_rows(1)
+                                .return_key(Some(egui::KeyboardShortcut::new(
+                                    egui::Modifiers::SHIFT,
+                                    egui::Key::Enter,
+                                )))
                                 .frame(egui::Frame::NONE)
                                 .desired_width(tw_before + charw * 2.0 + 10.0)
                                 .font(font.clone())
@@ -2311,21 +2363,9 @@ impl OverlayApp {
 
                             if let Some(cr) = cursor_range {
                                 let range = cr.as_sorted_char_range();
-                                if range.start != range.end {
-                                    let x0 = galley
-                                        .pos_from_cursor(egui::text::CCursor::new(range.start))
-                                        .min
-                                        .x;
-                                    let x1 = galley
-                                        .pos_from_cursor(egui::text::CCursor::new(range.end))
-                                        .min
-                                        .x;
-                                    let sel = egui::Rect::from_min_max(
-                                        egui::pos2(origin.x + x0, origin.y),
-                                        egui::pos2(origin.x + x1, origin.y + line_h),
-                                    );
+                                for sel in text_selection(&galley, range.start, range.end) {
                                     ui.painter().rect_filled(
-                                        sel,
+                                        sel.translate(origin.to_vec2()),
                                         1,
                                         egui::Color32::from_rgba_unmultiplied(80, 140, 230, 120),
                                     );
@@ -2335,16 +2375,12 @@ impl OverlayApp {
                             let caret_idx = cursor_range
                                 .map(|cr| cr.primary.index)
                                 .unwrap_or_else(|| buf.chars().count());
-                            let caret_x = origin.x
-                                + galley
-                                    .pos_from_cursor(egui::text::CCursor::new(caret_idx))
-                                    .min
-                                    .x;
+                            let caret = galley
+                                .pos_from_cursor(egui::text::CCursor::new(caret_idx))
+                                .translate(origin.to_vec2());
+                            let caret_h = caret.height().max(tsize * tscale);
                             ui.painter().line_segment(
-                                [
-                                    egui::pos2(caret_x, origin.y),
-                                    egui::pos2(caret_x, origin.y + line_h),
-                                ],
+                                [caret.left_top(), caret.left_top() + egui::vec2(0.0, caret_h)],
                                 egui::Stroke::new(2.0f32, col),
                             );
                             let bb = egui::Rect::from_min_size(
@@ -2699,7 +2735,7 @@ impl OverlayApp {
         if start_text.is_some() || reedit_text.is_some() {
             self.rebinding = None;
         }
-        if let Some(pos) = start_text {
+        if let Some((pos, lensed)) = start_text {
             removed.extend(self.commit_text());
             self.text_edit = Some(TextDraft {
                 pos,
@@ -2707,6 +2743,7 @@ impl OverlayApp {
                 color,
                 size: 24.0,
                 replaces: None,
+                lensed,
             });
         }
         if let Some(i) = reedit_text {
@@ -2721,12 +2758,17 @@ impl OverlayApp {
                     size,
                 }) = self.scene.shapes().get(i).cloned()
             {
+                let lensed = self
+                    .selection
+                    .and_then(|sel| Lens::new(sel, self.sel_zoom, self.sel_offset))
+                    .is_some_and(|l| l.inner.contains(pos));
                 self.text_edit = Some(TextDraft {
                     pos,
                     buf: text,
                     color,
                     size,
                     replaces: Some(i),
+                    lensed,
                 });
                 self.selected = None;
             }
@@ -4606,6 +4648,7 @@ mod tests {
             color: egui::Color32::RED,
             size: 24.0,
             replaces,
+            lensed: false,
         }
     }
 
@@ -5069,6 +5112,33 @@ mod tests {
         );
         let moved = super::export_plan(sel, (1920, 1080), 4.0, egui::vec2(-1000.0, 0.0), 1.0);
         assert_eq!(moved.0.min, egui::pos2(100.0, 175.0));
+    }
+
+    #[test]
+    fn a_selection_across_lines_highlights_each_line() {
+        let ctx = egui::Context::default();
+        let mut rects = Vec::new();
+        let mut single = Vec::new();
+        let mut empty = vec![egui::Rect::NOTHING];
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let galley = ui.painter().layout_no_wrap(
+                "ab\ncd".into(),
+                egui::FontId::proportional(20.0),
+                egui::Color32::WHITE,
+            );
+            rects = super::text_selection(&galley, 1, 4);
+            single = super::text_selection(&galley, 0, 1);
+            empty = super::text_selection(&galley, 2, 2);
+        });
+        assert_eq!(rects.len(), 2, "{rects:?}");
+        assert!(rects[0].min.x > 0.0, "starts after the a: {rects:?}");
+        assert!(rects[1].min.y >= rects[0].max.y - 0.5, "{rects:?}");
+        assert_eq!(
+            rects[1].min.x, 0.0,
+            "the second line from its start: {rects:?}"
+        );
+        assert_eq!(single.len(), 1);
+        assert!(empty.is_empty());
     }
 
     #[test]

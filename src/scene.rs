@@ -478,8 +478,14 @@ fn dist_to_segment(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
 }
 
 fn text_box(pos: egui::Pos2, text: &str, size: f32) -> egui::Rect {
-    let w = (text.chars().count().max(1) as f32) * size * 0.55;
-    egui::Rect::from_min_size(pos, egui::vec2(w, size * 1.3))
+    let widest = text
+        .split('\n')
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines = text.split('\n').count().max(1);
+    let w = (widest.max(1) as f32) * size * 0.55;
+    egui::Rect::from_min_size(pos, egui::vec2(w, size * 1.3 * lines as f32))
 }
 
 pub fn next_counter(shapes: &[Shape]) -> u32 {
@@ -829,6 +835,29 @@ pub fn paint(
 mod tests {
     use super::*;
     use egui::{Color32, pos2};
+
+    #[test]
+    fn several_lines_of_text_are_hit_on_every_line() {
+        let shape = Shape::Text {
+            pos: egui::pos2(100.0, 100.0),
+            text: "ab\nlonger line".into(),
+            color: egui::Color32::RED,
+            size: 20.0,
+        };
+        assert!(shape_hit(std::slice::from_ref(&shape), egui::pos2(105.0, 110.0)).is_some());
+        assert!(
+            shape_hit(std::slice::from_ref(&shape), egui::pos2(200.0, 135.0)).is_some(),
+            "the long second line"
+        );
+        assert!(
+            shape_hit(std::slice::from_ref(&shape), egui::pos2(105.0, 170.0)).is_none(),
+            "below the last line"
+        );
+        assert!(
+            shape_hit(std::slice::from_ref(&shape), egui::pos2(240.0, 110.0)).is_none(),
+            "past the longest line"
+        );
+    }
 
     fn counter(number: u32) -> Shape {
         Shape::Counter {
