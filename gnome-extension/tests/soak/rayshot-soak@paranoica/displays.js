@@ -416,7 +416,8 @@ export class Displays {
                 return;
             }
             const asked = GLib.get_monotonic_time();
-            waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
+            waitFor(() => r._overlay?.shown && r._overlay.framePath &&
+                r._overlay.windows.has(global.display.focus_window), () => {
                 r._frameMonitors = original;
                 paceFrames(r._overlay);
                 sequence([
