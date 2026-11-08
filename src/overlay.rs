@@ -392,7 +392,7 @@ fn monitor_region(name: Option<&str>, rects: &[crate::live::MonitorRect]) -> Opt
     ))
 }
 
-const ZOOM_STEPS: [f32; 5] = [1.0, 1.5, 2.0, 3.0, 4.0];
+const ZOOM_STEPS: [f32; 6] = [1.0, 1.5, 2.0, 3.0, 4.0, 5.0];
 
 fn step_zoom(current: f32, up: bool) -> f32 {
     if up {
@@ -4667,17 +4667,17 @@ mod tests {
     fn zoom_steps_through_the_agreed_sizes() {
         let mut z = 1.0;
         let mut ups = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             z = super::step_zoom(z, true);
             ups.push(z);
         }
-        assert_eq!(ups, vec![1.5, 2.0, 3.0, 4.0, 4.0]);
+        assert_eq!(ups, vec![1.5, 2.0, 3.0, 4.0, 5.0, 5.0]);
         let mut downs = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             z = super::step_zoom(z, false);
             downs.push(z);
         }
-        assert_eq!(downs, vec![3.0, 2.0, 1.5, 1.0, 1.0]);
+        assert_eq!(downs, vec![4.0, 3.0, 2.0, 1.5, 1.0, 1.0]);
         assert_eq!(super::step_zoom(1.2, true), 1.5);
         assert_eq!(super::step_zoom(1.2, false), 1.0);
     }
