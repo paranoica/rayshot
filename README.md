@@ -25,7 +25,7 @@ opens on top of that picture in about 40 ms. No portal dialog, no flash.
 - **Several monitors:** select across them; the last selection is remembered.
 
 <div align="center">
-<img src="assets/demo.gif" width="720" alt="Selecting a region, then drawing an arrow and a rectangle in the rayshot editor">
+<img src="assets/demo.gif" width="720" alt="Selecting part of a painting, then drawing an arrow, a rectangle, an ellipse, numbered markers, a pen line, a highlight and text, pixelating and blurring, moving and duplicating a shape, zooming inside the selection and opening the key settings in the rayshot editor">
 </div>
 
 ## Install
