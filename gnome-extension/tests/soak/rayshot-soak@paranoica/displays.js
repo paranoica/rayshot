@@ -11,7 +11,7 @@ import {defaultSeat} from '../rayshot@paranoica/compat.js';
 
 const TICK_MS = 20;
 const STEP_MS = 30;
-const FRAME_WAIT_MS = 2000;
+const FRAME_WAIT_MS = 5000;
 const SETTLE_MS = 200;
 const SHOW_WAIT_MS = 20000;
 const MARK = 40;
