@@ -22,6 +22,7 @@ const KEY_K = 37;
 const KEY_0 = 11;
 const KEY_MINUS = 12;
 const KEY_EQUAL = 13;
+const KEY_KPPLUS = 78;
 
 const WANTS = {
     plain: [1, 1],
@@ -539,10 +540,14 @@ export class Displays {
                     then(got);
                 }, fail)), () => fail('enter did not copy')));
         }, fail);
-        run([KEY_MINUS, KEY_MINUS], [100, 50], half => run([KEY_EQUAL, KEY_EQUAL, KEY_EQUAL, KEY_0], [200, 100], full => {
-            this._d._result(name, true, `two ctrl minus gave ${half.join('x')}, ctrl zero after ctrl plus gave ${full.join('x')}`);
-            next();
-        }));
+        run([KEY_MINUS, KEY_MINUS], [100, 50], half => run([], [200, 100], fresh =>
+            run([KEY_EQUAL, KEY_EQUAL, KEY_EQUAL, KEY_0], [200, 100], full =>
+                run([KEY_KPPLUS], [300, 150], keypad => {
+                    this._d._result(name, true, `two ctrl minus gave ${half.join('x')}, ` +
+                        `the next capture ${fresh.join('x')}, ctrl zero after ctrl plus ${full.join('x')}, ` +
+                        `ctrl keypad plus ${keypad.join('x')}`);
+                    next();
+                }))));
     }
 
     _rebound(next) {
