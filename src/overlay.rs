@@ -4176,8 +4176,9 @@ fn settings_panel(
         note_row(ui, command, bindings, note);
         changed
     };
-    egui::Grid::new("rayshot-settings")
+    let grid = egui::Grid::new("rayshot-settings")
         .num_columns(4)
+        .min_col_width(0.0)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
             header(ui, "Tools");
@@ -4213,25 +4214,35 @@ fn settings_panel(
             row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ScreenZoomOut, None);
             row(ui, p::ARROWS_OUT_SIMPLE, Command::ScreenZoomReset, None);
         });
-    ui.add_space(6.0);
-    let changed = Command::ALL.iter().any(|c| !bindings.is_default(*c));
-    if ui
-        .add_enabled(changed, egui::Button::new("Reset all keys").small())
-        .clicked()
-    {
-        bindings.reset_all();
-        *rebinding = None;
-        *note = None;
-    }
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(
-                "Esc, Enter, 1–9, Ctrl+Z, Ctrl+Y, Delete, the arrows and Ctrl+D always keep their keys.",
-            )
-            .small()
-            .weak(),
-        )
-        .wrap(),
+    let width = grid.response.rect.width();
+    ui.add_space(8.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::top_down(egui::Align::Center),
+        |ui| {
+            ui.set_width(width);
+            let changed = Command::ALL.iter().any(|c| !bindings.is_default(*c));
+            if ui
+                .add_enabled(changed, egui::Button::new("Reset all keys"))
+                .clicked()
+            {
+                bindings.reset_all();
+                *rebinding = None;
+                *note = None;
+            }
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(
+                        "Esc, Enter, 1–9, Delete, the arrows, undo, redo and Ctrl+D can't be changed.",
+                    )
+                    .small()
+                    .weak(),
+                )
+                .halign(egui::Align::Center)
+                .wrap(),
+            );
+        },
     );
 }
 
@@ -4666,6 +4677,159 @@ mod tests {
         }
     }
 
+    fn render_ui(w: u32, h: u32, mut draw: impl FnMut(&egui::Context)) -> image::RgbaImage {
+        use egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = rt
+            .block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .unwrap();
+        let (device, queue) = rt
+            .block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+            .unwrap();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let extent = wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        };
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        ctx.set_fonts(fonts);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(w as f32, h as f32),
+            )),
+            ..Default::default()
+        };
+        let mut renderer = Renderer::new(&device, format, RendererOptions::default());
+        let first = ctx.run(input(), |ctx| draw(ctx));
+        for (id, delta) in &first.textures_delta.set {
+            renderer.update_texture(&device, &queue, *id, delta);
+        }
+        let out = ctx.run(input(), |ctx| draw(ctx));
+        for (id, delta) in &out.textures_delta.set {
+            renderer.update_texture(&device, &queue, *id, delta);
+        }
+        let jobs = ctx.tessellate(out.shapes, 1.0);
+        let sd = ScreenDescriptor {
+            size_in_pixels: [w, h],
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let cmds = renderer.update_buffers(&device, &queue, &mut encoder, &jobs, &sd);
+        {
+            let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.2,
+                            g: 0.3,
+                            b: 0.5,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            let mut rpass = rpass.forget_lifetime();
+            renderer.render(&mut rpass, &jobs, &sd);
+        }
+        let padded = (w * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+            * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: (padded * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            extent,
+        );
+        queue.submit(cmds.into_iter().chain(std::iter::once(encoder.finish())));
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let data = buffer.slice(..).get_mapped_range();
+        let mut px = Vec::with_capacity((w * h * 4) as usize);
+        for row in 0..h {
+            let start = (row * padded) as usize;
+            px.extend_from_slice(&data[start..start + (w * 4) as usize]);
+        }
+        image::RgbaImage::from_raw(w, h, px).unwrap()
+    }
+
+    #[test]
+    #[ignore]
+    fn show_the_toolbar_settings() {
+        let path = std::env::var("RAYSHOT_SHOT").unwrap();
+        let mut hidden = vec![crate::scene::Tool::Blur];
+        let mut hidden_buttons = Vec::new();
+        let mut bindings = crate::keys::Bindings::defaults();
+        let _ = bindings.assign(
+            crate::keys::Command::Tool(crate::scene::Tool::Pen),
+            crate::keys::Chord::parse("Q").unwrap(),
+        );
+        let mut rebinding = None;
+        let mut note = std::env::var_os("RAYSHOT_SHOT_NOTE").map(|_| super::RebindNote::Conflict {
+            target: crate::keys::Command::Tool(crate::scene::Tool::Line),
+            chord: crate::keys::Chord::parse("Ctrl+Shift+S").unwrap(),
+            other: crate::keys::Command::SaveAs,
+        });
+        let img = render_ui(560, 1000, |ctx| {
+            egui::Area::new(egui::Id::new("rayshot-settings"))
+                .fixed_pos(egui::pos2(20.0, 20.0))
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                        super::settings_panel(
+                            ui,
+                            &mut hidden,
+                            &mut hidden_buttons,
+                            &mut bindings,
+                            &mut rebinding,
+                            &mut note,
+                        );
+                    });
+                });
+        });
+        img.save(path).unwrap();
+    }
+
     #[test]
     fn every_toggle_in_the_toolbar_settings_lines_up() {
         let ctx = egui::Context::default();
@@ -4697,6 +4861,41 @@ mod tests {
         assert!(
             lefts.iter().all(|x| (x - first).abs() < 0.5),
             "toggles at {lefts:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_in_the_toolbar_settings_is_wider_than_its_rows() {
+        let ctx = egui::Context::default();
+        let mut hidden = Vec::new();
+        let mut hidden_buttons = Vec::new();
+        let mut bindings = crate::keys::Bindings::defaults();
+        let mut rebinding = None;
+        let mut note = None;
+        let mut content = egui::Rect::NOTHING;
+        let mut lefts = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                super::settings_panel(
+                    ui,
+                    &mut hidden,
+                    &mut hidden_buttons,
+                    &mut bindings,
+                    &mut rebinding,
+                    &mut note,
+                );
+                content = ui.min_rect();
+            });
+            lefts = Vec::new();
+            for clipped in &out.shapes {
+                toggle_lefts(&clipped.shape, &mut lefts);
+            }
+        }
+        let toggles_right = lefts.iter().fold(f32::MIN, |a, &b| a.max(b)) + 34.0;
+        assert!(
+            content.right() <= toggles_right + 0.5,
+            "content ends at {}, toggles at {toggles_right}",
+            content.right()
         );
     }
 

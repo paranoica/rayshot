@@ -68,12 +68,12 @@ impl Command {
             Command::CopyText => "Copy text",
             Command::Save => "Save",
             Command::SaveAs => "Save as…",
-            Command::ZoomIn => "Zoom the selection in",
-            Command::ZoomOut => "Zoom the selection out",
-            Command::ZoomReset => "Selection at 100 %",
-            Command::ScreenZoomIn => "Zoom the screen in",
-            Command::ScreenZoomOut => "Zoom the screen out",
-            Command::ScreenZoomReset => "Screen at 100 %",
+            Command::ZoomIn => "Zoom in",
+            Command::ZoomOut => "Zoom out",
+            Command::ZoomReset => "Zoom 100 %",
+            Command::ScreenZoomIn => "Screen zoom in",
+            Command::ScreenZoomOut => "Screen zoom out",
+            Command::ScreenZoomReset => "Screen 100 %",
         }
     }
 
