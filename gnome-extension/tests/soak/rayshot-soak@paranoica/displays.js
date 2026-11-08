@@ -551,8 +551,17 @@ export class Displays {
         const dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'rayshot']);
         const conf = GLib.build_filenamev([dir, 'editor.conf']);
         GLib.mkdir_with_parents(dir, 0o755);
+        let saved = null;
+        try {
+            saved = GLib.file_get_contents(conf)[1];
+        } catch {}
         GLib.file_set_contents(conf, 'keys = copy:Ctrl+K\n');
-        const restore = () => GLib.unlink(conf);
+        const restore = () => {
+            if (saved)
+                GLib.file_set_contents(conf, saved);
+            else
+                GLib.unlink(conf);
+        };
         const marker = 'rayshot-soak-marker';
         const clipboard = St.Clipboard.get_default();
         const k = this._d._keyboard;
