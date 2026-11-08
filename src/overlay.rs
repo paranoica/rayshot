@@ -1138,7 +1138,10 @@ impl OverlayApp {
             }
 
             let egui_ctx = egui::Context::default();
-            egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+            egui_ctx.options_mut(|o| {
+                o.zoom_with_keyboard = false;
+                o.input_options.max_click_duration = CLICK_HOLD_SECS;
+            });
             let mut fonts = egui::FontDefinitions::default();
             egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
             egui_ctx.set_fonts(fonts);
@@ -1563,6 +1566,18 @@ impl OverlayApp {
             }
             let panning = pan_drag && (resp.drag_started() || resp.dragged() || resp.drag_stopped());
             let cursor_pos = raw_cursor.or_else(|| resp.interact_pointer_pos());
+            let release_pos = ui.input(|i| {
+                i.events.iter().rev().find_map(|e| match e {
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        ..
+                    } => Some(*pos),
+                    _ => None,
+                })
+            });
+            let click_pos = release_pos.or(cursor_pos);
             let press_pos = ui.input(|i| i.pointer.press_origin()).or(cursor_pos);
             let hit = |fp: egui::Pos2| {
                 crate::scene::shape_hit(shapes, fp).filter(|&i| Some(i) != editing_index)
@@ -1588,7 +1603,7 @@ impl OverlayApp {
             let lensed = if dragging {
                 lens_drag
             } else {
-                cursor_pos.is_some_and(in_lens)
+                click_pos.is_some_and(in_lens)
             };
             if panning && resp.drag_started() {
                 let lens_from = lens.filter(|_| lens_drag).map_or(egui::Vec2::ZERO, |l| l.offset());
@@ -1633,7 +1648,7 @@ impl OverlayApp {
                 _ if panning => {}
                 Tool::Select => {
                     if resp.clicked()
-                        && let Some(p) = cursor_pos
+                        && let Some(p) = click_pos
                     {
                         selected = hit(tool_frame(p)).or_else(|| inside_selected(p));
                     }
@@ -1785,7 +1800,7 @@ impl OverlayApp {
                 }
                 Tool::Counter => {
                     if (resp.clicked() || resp.drag_stopped())
-                        && let Some(p) = cursor_pos
+                        && let Some(p) = click_pos
                     {
                         committed = Some(Shape::Counter {
                             center: tool_frame(p),
@@ -1797,7 +1812,7 @@ impl OverlayApp {
                 }
                 Tool::Picker => {
                     if (resp.clicked() || resp.drag_stopped())
-                        && let (Some(p), Some(frame)) = (cursor_pos, frame_px.as_deref())
+                        && let (Some(p), Some(frame)) = (click_pos, frame_px.as_deref())
                         && let Some(c) = pixel_color(frame, tool_frame(p))
                     {
                         picked = Some(c);
@@ -1805,7 +1820,7 @@ impl OverlayApp {
                 }
                 Tool::Text => {
                     if resp.clicked() {
-                        if let Some(p) = cursor_pos {
+                        if let Some(p) = click_pos {
                             start_text = Some((tool_frame(p), lensed));
                         }
                     }
@@ -3610,6 +3625,8 @@ fn counter_radius(width: f32) -> f32 {
 
 const TEXT_SIZE_RANGE: (f32, f32) = (10.0, 120.0);
 const TEXT_SIZE_STEP: f32 = 2.0;
+const CLICK_HOLD_SECS: f64 = 3.0;
+
 const DUPLICATE_OFFSET: egui::Vec2 = egui::vec2(16.0, 16.0);
 
 fn scrolled_text_size(size: f32, acc: &mut f32, delta: f32) -> f32 {
