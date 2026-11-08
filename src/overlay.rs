@@ -2342,12 +2342,14 @@ impl OverlayApp {
                                 });
                                 at.map(|k| i.events.remove(k)).is_some()
                             });
-                            if enter {
+                            let esc = ui.input(|i| i.key_pressed(egui::Key::Escape));
+                            if enter || esc {
                                 text_lost_focus = true;
                             }
                             let edit_id = egui::Id::new("rayshot-text-input");
                             let grip_id = egui::Id::new("rayshot-text-grip");
                             if !enter
+                                && !esc
                                 && !ui.ctx().is_being_dragged(grip_id)
                                 && !ui.memory(|m| m.has_focus(edit_id))
                             {
@@ -2366,7 +2368,7 @@ impl OverlayApp {
                                 .text_color(egui::Color32::TRANSPARENT)
                                 .show(ui);
                             let r = output.response.clone();
-                            if enter {
+                            if enter || esc {
                                 r.surrender_focus();
                             }
                             let cursor_range = output.cursor_range;
@@ -4162,14 +4164,17 @@ fn settings_width(ui: &egui::Ui) -> f32 {
         + 3.0 * ui.spacing().item_spacing.x
 }
 
+const SETTINGS_RESET_W: f32 = 22.0;
+
 fn key_cell(
     ui: &mut egui::Ui,
     command: crate::keys::Command,
     bindings: &mut crate::keys::Bindings,
     rebinding: &mut Option<crate::keys::Command>,
     note: &mut Option<RebindNote>,
-) {
+) -> (egui::Rect, Option<egui::Rect>) {
     settings_cell(ui, SETTINGS_KEY_W, |ui| {
+        let left = ui.max_rect().left();
         let capturing = *rebinding == Some(command);
         let text = if capturing {
             "Press a key…".to_string()
@@ -4177,29 +4182,49 @@ fn key_cell(
             bindings.chord(command).label()
         };
         let label = egui::RichText::new(text).monospace().small();
-        let custom = !bindings.is_default(command);
-        if ui
-            .add(egui::Button::selectable(capturing, label).truncate())
+        let custom = !bindings.is_default(command) && !capturing;
+        let room = if custom {
+            SETTINGS_KEY_W - SETTINGS_RESET_W - ui.spacing().item_spacing.x
+        } else {
+            SETTINGS_KEY_W
+        };
+        let key = ui
+            .allocate_ui_with_layout(
+                egui::vec2(room, SETTINGS_ROW_H),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_max_width(room);
+                    ui.add(egui::Button::selectable(capturing, label).truncate())
+                },
+            )
+            .inner;
+        let key_rect = key.rect;
+        if key
             .on_hover_text("Click, then press the new key. Esc cancels.")
             .clicked()
         {
             *rebinding = (!capturing).then_some(command);
             *note = None;
         }
-        if custom {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)
-                    .on_hover_text("Back to the default key")
-                    .clicked()
-                {
-                    bindings.reset(command);
-                    *rebinding = None;
-                    *note = None;
-                }
-            });
-        }
-    });
+        let reset = custom.then(|| {
+            let gap = left + room + ui.spacing().item_spacing.x - ui.cursor().left();
+            ui.add_space(gap.max(0.0));
+            let r = ui.add_sized(
+                egui::vec2(SETTINGS_RESET_W, SETTINGS_ROW_H),
+                egui::Button::new(
+                    egui::RichText::new(egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE).small(),
+                ),
+            );
+            let rect = r.rect;
+            if r.on_hover_text("Back to the default key").clicked() {
+                bindings.reset(command);
+                *rebinding = None;
+                *note = None;
+            }
+            rect
+        });
+        (key_rect, reset)
+    })
 }
 
 fn note_row(
@@ -4308,7 +4333,7 @@ fn settings_panel(
                 settings_cell(ui, SETTINGS_LABEL_W, |ui| {
                     ui.add(egui::Label::new(command.label()).truncate());
                 });
-                key_cell(ui, command, bindings, rebinding, note);
+                let _ = key_cell(ui, command, bindings, rebinding, note);
                 settings_cell(ui, SETTINGS_TOGGLE_W, |ui| match on {
                     Some(on) => {
                         toggle(ui, on, egui::Id::new(("rayshot-toggle", command.name()))).changed()
@@ -4882,6 +4907,40 @@ mod tests {
     }
 
     #[test]
+    fn the_reset_arrow_never_covers_a_long_key() {
+        use crate::keys::{Bindings, Chord, Command};
+        use crate::scene::Tool;
+        let ctx = egui::Context::default();
+        let mut bindings = Bindings::defaults();
+        let _ = bindings.assign(
+            Command::Tool(Tool::Pen),
+            Chord::parse("Ctrl+Alt+Shift+F12").unwrap(),
+        );
+        let mut rects = (egui::Rect::NOTHING, None);
+        for _ in 0..2 {
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                rects = super::key_cell(
+                    ui,
+                    Command::Tool(Tool::Pen),
+                    &mut bindings,
+                    &mut None,
+                    &mut None,
+                );
+            });
+        }
+        let (key, reset) = rects;
+        let reset = reset.expect("a custom key has a reset arrow");
+        assert!(
+            key.right() <= reset.left() + 0.5,
+            "key {key:?} reset {reset:?}"
+        );
+        assert!(
+            reset.right() <= key.left() + super::SETTINGS_KEY_W + 0.5,
+            "{reset:?}"
+        );
+    }
+
+    #[test]
     fn toggles_do_not_replay_their_animation_when_a_note_appears() {
         use crate::keys::{Bindings, Chord, Command};
         use crate::scene::Tool;
@@ -5051,7 +5110,8 @@ mod tests {
         let mut bindings = crate::keys::Bindings::defaults();
         let _ = bindings.assign(
             crate::keys::Command::Tool(crate::scene::Tool::Pen),
-            crate::keys::Chord::parse("Q").unwrap(),
+            crate::keys::Chord::parse(&std::env::var("RAYSHOT_SHOT_KEY").unwrap_or("Q".into()))
+                .unwrap(),
         );
         let mut rebinding = None;
         let mut note = std::env::var_os("RAYSHOT_SHOT_NOTE").map(|_| super::RebindNote::Conflict {
