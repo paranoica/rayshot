@@ -1319,8 +1319,15 @@ export class Displays {
                     next();
                     return;
                 }
-                this._d._result(name, true, 'the editor stayed open');
-                this._d._endSession(next);
+                sequence([() => tap(Clutter.KEY_Return)], () => waitFor(() => !r._busy,
+                    () => later(400, () => readPng(pb => {
+                        const text = colourBounds(pb, isRed);
+                        this._d._result(name, text !== null, text
+                            ? 'the editor stayed open, the next enter copied the text'
+                            : 'the editor stayed open but the copy has no text');
+                        next();
+                    }, fail)),
+                    () => fail('the editor stayed open but the next enter did not copy, so the text never ended')));
             }));
         }, fail);
     }
