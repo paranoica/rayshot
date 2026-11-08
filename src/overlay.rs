@@ -3572,11 +3572,16 @@ fn settings_panel(
         ui.end_row();
         changed
     };
-    ui.label(egui::RichText::new("Tools").strong());
-    egui::Grid::new("rayshot-settings-tools")
+    let header = |ui: &mut egui::Ui, title: &str| {
+        ui.label("");
+        ui.label(egui::RichText::new(title).strong());
+        ui.end_row();
+    };
+    egui::Grid::new("rayshot-settings")
         .num_columns(4)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
+            header(ui, "Tools");
             for t in Tool::ALL {
                 let mut on = !hidden.contains(&t);
                 if row(ui, t.icon(), t.label(), t.key(), &mut on) {
@@ -3587,13 +3592,8 @@ fn settings_panel(
                     }
                 }
             }
-        });
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("Actions").strong());
-    egui::Grid::new("rayshot-settings-actions")
-        .num_columns(4)
-        .spacing([10.0, 6.0])
-        .show(ui, |ui| {
+            ui.end_row();
+            header(ui, "Actions");
             for b in Button::ALL {
                 let (icon, label, key) = button_meta(b);
                 let mut on = !hidden_buttons.contains(&b);
@@ -4023,6 +4023,44 @@ mod tests {
         assert_eq!(super::monitor_region(Some("HDMI-1"), &rects), None);
         assert_eq!(super::monitor_region(None, &rects), None);
         assert_eq!(super::monitor_region(Some("DP-1"), &[]), None);
+    }
+
+    fn toggle_lefts(shape: &egui::Shape, out: &mut Vec<f32>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| toggle_lefts(s, out)),
+            egui::Shape::Rect(r)
+                if (r.rect.width() - 34.0).abs() < 0.5
+                    && (r.rect.height() - 18.0).abs() < 0.5
+                    && r.corner_radius.nw == 9 =>
+            {
+                out.push(r.rect.left())
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn every_toggle_in_the_toolbar_settings_lines_up() {
+        let ctx = egui::Context::default();
+        let mut hidden = Vec::new();
+        let mut hidden_buttons = Vec::new();
+        let mut lefts = Vec::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                super::settings_panel(ui, &mut hidden, &mut hidden_buttons);
+            });
+            lefts = Vec::new();
+            for clipped in &out.shapes {
+                toggle_lefts(&clipped.shape, &mut lefts);
+            }
+        }
+        let rows = crate::scene::Tool::ALL.len() + crate::prefs::Button::ALL.len();
+        assert_eq!(lefts.len(), rows, "one toggle per row");
+        let first = lefts[0];
+        assert!(
+            lefts.iter().all(|x| (x - first).abs() < 0.5),
+            "toggles at {lefts:?}"
+        );
     }
 
     #[test]
