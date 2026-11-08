@@ -86,7 +86,8 @@ picture then comes out at that zoom: a 60 × 24 button copied at 200 % is
 its dashed frame, or drag a round handle to resize it. While it is selected,
 colours and the wheel change that shape, `Delete` removes it, the arrow keys
 nudge it, `Ctrl+D` duplicates it and `Esc` or `Enter` lets go; the next
-`Enter` copies. Double-click text to edit it.
+`Enter` copies. Double-click text to edit it; in text, `Shift+Enter` starts a
+new line and `Enter` finishes.
 
 **Copying text** closes the editor at once and reads the selection in the
 background; a notice shows the first line when it is on the clipboard. Your
