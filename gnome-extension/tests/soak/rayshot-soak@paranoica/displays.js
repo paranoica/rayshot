@@ -11,6 +11,9 @@ import {defaultSeat} from '../rayshot@paranoica/compat.js';
 
 const TICK_MS = 20;
 const STEP_MS = 30;
+const FRAME_WAIT_MS = 2000;
+const SETTLE_MS = 200;
+const SHOW_WAIT_MS = 20000;
 const MARK = 40;
 const PAD = 40;
 const EDGE = 3;
@@ -56,14 +59,80 @@ function later(ms, then) {
     });
 }
 
+let pacer = null;
+let stalls = 0;
+
+function paceFrames(overlay) {
+    pacer?.stop();
+    const p = {frames: 0, lastFrame: 0, live: 0, gone: false, links: []};
+    const drop = actor => {
+        p.links = p.links.filter(([a]) => a !== actor);
+        p.live--;
+        p.gone = p.live <= 0;
+    };
+    for (const w of overlay.windows.keys()) {
+        const actor = w.get_compositor_private();
+        if (!actor)
+            continue;
+        p.live++;
+        p.links.push([actor, actor.connect('damaged', () => {
+            p.frames++;
+            p.lastFrame = GLib.get_monotonic_time();
+        })]);
+        p.links.push([actor, actor.connect('destroy', () => drop(actor))]);
+    }
+    p.gone = p.live === 0;
+    p.stop = () => {
+        for (const [actor, id] of p.links)
+            actor.disconnect(id);
+        p.links = [];
+        p.gone = true;
+    };
+    pacer = p;
+}
+
+function nextFrame(before, then) {
+    const p = pacer;
+    const started = GLib.get_monotonic_time();
+    let firstFrame = 0;
+    const settled = () => {
+        if (!p || p.gone)
+            return true;
+        const now = GLib.get_monotonic_time();
+        if (p.frames > before) {
+            firstFrame ||= now;
+            if (now - p.lastFrame >= TICK_MS * 1000 || now - firstFrame >= SETTLE_MS * 1000)
+                return true;
+        }
+        if (now - started > FRAME_WAIT_MS * 1000) {
+            stalls++;
+            return true;
+        }
+        return false;
+    };
+    later(STEP_MS, () => {
+        if (settled()) {
+            then();
+            return;
+        }
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, TICK_MS, () => {
+            if (!settled())
+                return GLib.SOURCE_CONTINUE;
+            then();
+            return GLib.SOURCE_REMOVE;
+        });
+    });
+}
+
 function sequence(steps, done) {
     const run = i => {
         if (i === steps.length) {
             done();
             return;
         }
+        const before = pacer?.frames ?? 0;
         steps[i]();
-        later(STEP_MS, () => run(i + 1));
+        nextFrame(before, () => run(i + 1));
     };
     run(0);
 }
@@ -172,7 +241,12 @@ export class Displays {
     steps() {
         this._device();
         const cases = (GLib.getenv('RAYSHOT_SOAK_CASES') ?? 'plain').split(',').filter(Boolean);
-        return cases.map(kind => next => {
+        stalls = 0;
+        const stallCheck = next => {
+            this._d._result('input steps the overlay never drew a frame for', stalls === 0, `${stalls}  (limit 0)`);
+            next();
+        };
+        return [...cases.map(kind => next => {
             try {
                 if (kind === 'russian')
                     this._russian(next);
@@ -193,7 +267,7 @@ export class Displays {
             } catch (e) {
                 this._fail(kind, `the scenario threw: ${e.message}`, next);
             }
-        });
+        }), stallCheck];
     }
 
     _r() {
@@ -265,17 +339,18 @@ export class Displays {
                 fail(`the capture threw: ${e.message}`);
                 return;
             }
+            const asked = GLib.get_monotonic_time();
             waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
                 r._frameMonitors = original;
-                this._point({x: at.x + 1, y: at.y});
-                later(STEP_MS, () => {
-                    this._point(at);
-                    later(STEP_MS, () => then(r._overlay));
-                });
+                paceFrames(r._overlay);
+                sequence([
+                    () => this._point({x: at.x + 1, y: at.y}),
+                    () => this._point(at),
+                ], () => then(r._overlay));
             }, () => {
                 r._frameMonitors = original;
-                fail('the overlay did not show');
-            });
+                fail(`the overlay did not show in ${Math.round((GLib.get_monotonic_time() - asked) / 1000)} ms`);
+            }, SHOW_WAIT_MS);
         }), () => fail('no warm spare in time'));
     }
 
@@ -530,7 +605,7 @@ export class Displays {
             St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, 'rayshot-soak-marker');
             const scale = overlay.texture.get_width() / global.stage.width;
             const target = want.map(v => Math.max(1, Math.round(v * scale)));
-            sequence([...keys.map(code => () => ctrl(code)), enter], () => waitFor(() => !r._busy,
+            sequence([() => {}, ...keys.map(code => () => ctrl(code)), enter], () => waitFor(() => !r._busy,
                 () => later(400, () => readPng(pb => {
                     const got = [pb.get_width(), pb.get_height()];
                     if (got[0] !== target[0] || got[1] !== target[1]) {
@@ -655,6 +730,7 @@ export class Displays {
             const release = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
             const move = at => p.notify_absolute_motion(now(), at.x, at.y);
             sequence([
+                () => {},
                 () => tap(Clutter.KEY_r),
                 () => move(from),
                 press,
@@ -723,6 +799,7 @@ export class Displays {
             }
             const p = this._device();
             sequence([
+                () => {},
                 () => tap(Clutter.KEY_t),
                 () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
                 () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED),
