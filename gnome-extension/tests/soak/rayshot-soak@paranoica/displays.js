@@ -715,10 +715,10 @@ export class Displays {
             const wrong = pan ? right + pan.x * s : 600 * s;
             sequence([
                 () => {},
+                () => tap(Clutter.KEY_r),
                 () => ctrl(KEY_EQUAL),
                 () => ctrl(KEY_EQUAL),
                 ...panning,
-                () => tap(Clutter.KEY_r),
                 () => move(anchor),
                 () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
                 () => move({x: 400, y: 350}),
@@ -873,9 +873,9 @@ export class Displays {
             const move = at => p.notify_absolute_motion(now(), at.x, at.y);
             sequence([
                 () => {},
-                plus,
-                plus,
                 () => tap(Clutter.KEY_r),
+                plus,
+                plus,
                 () => move({x: 400, y: 300}),
                 () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
                 () => move({x: 450, y: 325}),
@@ -921,9 +921,9 @@ export class Displays {
             const release = () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
             sequence([
                 () => {},
-                plus,
-                plus,
                 () => tap(Clutter.KEY_r),
+                plus,
+                plus,
                 () => move({x: 500, y: 300}),
                 press,
                 () => move({x: 580, y: 340}),
@@ -931,8 +931,10 @@ export class Displays {
                 release,
                 () => tap(Clutter.KEY_s),
                 () => move({x: 500, y: 340}),
-                press,
-                release,
+                () => {
+                    press();
+                    release();
+                },
                 () => move({x: 650, y: 340}),
                 press,
                 () => move({x: 675, y: 340}),
@@ -1129,8 +1131,10 @@ export class Displays {
             sequence([
                 () => {},
                 () => tap(Clutter.KEY_t),
-                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
-                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED),
+                () => {
+                    p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED);
+                    p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED);
+                },
                 () => tap(Clutter.KEY_a),
                 () => tap(Clutter.KEY_b),
                 () => {
