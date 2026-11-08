@@ -223,6 +223,26 @@ function pixel(pb, x, y) {
     return [data[at], data[at + 1], data[at + 2]];
 }
 
+function redBox(pb) {
+    const data = pb.get_pixels();
+    const stride = pb.get_rowstride();
+    const n = pb.get_n_channels();
+    let box = null;
+    for (let y = 0; y < pb.get_height(); y++) {
+        for (let x = 0; x < pb.get_width(); x++) {
+            const at = y * stride + x * n;
+            if (data[at] > 180 && data[at + 1] < 120 && data[at + 2] < 120) {
+                box ??= {x0: x, y0: y, x1: x, y1: y};
+                box.x0 = Math.min(box.x0, x);
+                box.y0 = Math.min(box.y0, y);
+                box.x1 = Math.max(box.x1, x);
+                box.y1 = Math.max(box.y1, y);
+            }
+        }
+    }
+    return box ? `red at ${box.x0},${box.y0}..${box.x1},${box.y1}` : 'no red';
+}
+
 function near(a, b) {
     return a !== null && a.every((v, i) => Math.abs(v - b[i]) <= 40);
 }
@@ -262,6 +282,10 @@ export class Displays {
                     this._zoomDraw({middle: true}, next);
                 else if (kind === 'zoom-seam')
                     this._zoomSeam(next);
+                else if (kind === 'lens-export')
+                    this._lensExport(next);
+                else if (kind === 'lens-draw')
+                    this._lensDraw(next);
                 else if (kind === 'rebound')
                     this._rebound(next);
                 else if (kind === 'shape-enter')
@@ -587,14 +611,16 @@ export class Displays {
     }
 
     _zoomExport(next) {
-        const name = 'the zoom sets the exported size';
+        const name = 'the screen zoom sets the exported size';
         const r = this._r();
         const k = this._d._keyboard;
         const now = () => GLib.get_monotonic_time();
         const ctrl = code => {
             k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), KEY_LEFTSHIFT, Clutter.KeyState.PRESSED);
             k.notify_key(now(), code, Clutter.KeyState.PRESSED);
             k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+            k.notify_key(now(), KEY_LEFTSHIFT, Clutter.KeyState.RELEASED);
             k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
         };
         const enter = () => {
@@ -650,8 +676,10 @@ export class Displays {
         };
         const ctrl = code => {
             k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), KEY_LEFTSHIFT, Clutter.KeyState.PRESSED);
             k.notify_key(now(), code, Clutter.KeyState.PRESSED);
             k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+            k.notify_key(now(), KEY_LEFTSHIFT, Clutter.KeyState.RELEASED);
             k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
         };
         const anchor = {x: 300, y: 300};
@@ -714,7 +742,7 @@ export class Displays {
                 this._d._result(name, ok, ok
                     ? `png ${pb.get_width()}x${pb.get_height()}, right and bottom edges where they were drawn`
                     : `right edge ${hex(edgeAt)}, bottom edge ${hex(bottomAt)}, inside ${hex(inside)}, ` +
-                      `where a wrong edge would be ${hex(elsewhere)}`);
+                      `where a wrong edge would be ${hex(elsewhere)}; ${redBox(pb)}`);
                 next();
             }, fail)), () => fail('enter did not copy')));
         }, fail);
@@ -732,8 +760,10 @@ export class Displays {
         };
         const ctrl = code => {
             k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), KEY_LEFTSHIFT, Clutter.KeyState.PRESSED);
             k.notify_key(now(), code, Clutter.KeyState.PRESSED);
             k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+            k.notify_key(now(), KEY_LEFTSHIFT, Clutter.KeyState.RELEASED);
             k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
         };
         const anchor = {x: 300, y: 300};
@@ -762,6 +792,102 @@ export class Displays {
                 this._d._result(name, ok, ok
                     ? `png ${got.join('x')}, the edge stayed at the view`
                     : `png ${got.join('x')}, want ${want.join('x')}`);
+                next();
+            }, fail)), () => fail('enter did not copy')));
+        }, fail);
+    }
+
+    _lensKeys() {
+        const k = this._d._keyboard;
+        const now = () => GLib.get_monotonic_time();
+        return {
+            tap: v => {
+                k.notify_keyval(now(), v, Clutter.KeyState.PRESSED);
+                k.notify_keyval(now(), v, Clutter.KeyState.RELEASED);
+            },
+            plus: () => {
+                k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+                k.notify_key(now(), KEY_EQUAL, Clutter.KeyState.PRESSED);
+                k.notify_key(now(), KEY_EQUAL, Clutter.KeyState.RELEASED);
+                k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
+            },
+        };
+    }
+
+    _lensExport(next) {
+        const name = 'a zoomed selection exports its magnified middle';
+        const r = this._r();
+        const fail = why => {
+            this._clearMarks();
+            this._fail(name, why, next);
+        };
+        const {tap, plus} = this._lensKeys();
+        this._mark(400, 300, COLOURS[1]);
+        this._capture({x: 100, y: 100}, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            try {
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${overlay.session} 200 200 600 400\n`), null);
+            } catch (e) {
+                fail(`cannot select: ${e.message}`);
+                return;
+            }
+            sequence([() => {}, plus, plus, () => tap(Clutter.KEY_Return)],
+                () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                    this._clearMarks();
+                    const want = [400 * s, 200 * s].map(Math.round);
+                    const got = [pb.get_width(), pb.get_height()];
+                    const mark = pixel(pb, 240 * s, 140 * s);
+                    const before = pixel(pb, 180 * s, 140 * s);
+                    const ok = got[0] === want[0] && got[1] === want[1] &&
+                        near(mark, COLOURS[1]) && !near(before, COLOURS[1]);
+                    this._d._result(name, ok, ok
+                        ? `png ${got.join('x')}, the 40 px mark fills 80 px in the middle`
+                        : `png ${got.join('x')} (want ${want.join('x')}), mark ${hex(mark)}, left of it ${hex(before)}`);
+                    next();
+                }, fail)), () => fail('enter did not copy')));
+        }, fail);
+    }
+
+    _lensDraw(next) {
+        const name = 'a rectangle drawn in a zoomed selection lands where it was drawn';
+        const r = this._r();
+        const fail = why => this._fail(name, why, next);
+        const {tap, plus} = this._lensKeys();
+        const now = () => GLib.get_monotonic_time();
+        this._capture({x: 100, y: 100}, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            try {
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${overlay.session} 200 200 600 400\n`), null);
+            } catch (e) {
+                fail(`cannot select: ${e.message}`);
+                return;
+            }
+            const p = this._device();
+            const move = at => p.notify_absolute_motion(now(), at.x, at.y);
+            sequence([
+                () => {},
+                plus,
+                plus,
+                () => tap(Clutter.KEY_r),
+                () => move({x: 400, y: 300}),
+                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
+                () => move({x: 450, y: 325}),
+                () => move({x: 500, y: 350}),
+                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED),
+                () => tap(Clutter.KEY_Return),
+            ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                const red = c => c !== null && c[0] > 180 && c[1] < 120 && c[2] < 120;
+                const edge = pixel(pb, 300 * s - 2, 125 * s);
+                const bottom = pixel(pb, 250 * s, 150 * s - 2);
+                const inside = pixel(pb, 250 * s, 125 * s);
+                const unlensed = pixel(pb, 400 * s - 2, 125 * s);
+                const ok = red(edge) && red(bottom) && !red(inside) && !red(unlensed);
+                this._d._result(name, ok, ok
+                    ? `png ${pb.get_width()}x${pb.get_height()}, right and bottom edges where they were drawn`
+                    : `right edge ${hex(edge)}, bottom edge ${hex(bottom)}, inside ${hex(inside)}, ` +
+                      `where an unzoomed edge would be ${hex(unlensed)}; ${redBox(pb)}`);
                 next();
             }, fail)), () => fail('enter did not copy')));
         }, fail);
