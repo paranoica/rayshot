@@ -230,6 +230,7 @@ struct OverlayApp {
     recent: Vec<egui::Color32>,
     bindings: crate::keys::Bindings,
     export_scale: f32,
+    loupe_on: bool,
     rebinding: Option<crate::keys::Command>,
     rebind_note: Option<RebindNote>,
     show_settings: bool,
@@ -279,6 +280,7 @@ impl OverlayApp {
             recent: prefs.recent,
             bindings: prefs.keys,
             export_scale: 1.0,
+            loupe_on: true,
             rebinding: None,
             rebind_note: None,
             show_settings: false,
@@ -380,6 +382,37 @@ fn monitor_region(name: Option<&str>, rects: &[crate::live::MonitorRect]) -> Opt
         egui::pos2(m.x as f32, m.y as f32),
         egui::vec2(m.width as f32, m.height as f32),
     ))
+}
+
+const LOUPE_CELLS: usize = 15;
+const LOUPE_ZOOM: f32 = 8.0;
+const LOUPE_GAP: f32 = 24.0;
+
+fn loupe_cells(frame: &Frame, center: egui::Pos2, n: usize) -> Vec<Option<egui::Color32>> {
+    let (cx, cy) = (center.x.floor() as i64, center.y.floor() as i64);
+    let half = (n / 2) as i64;
+    (0..n as i64)
+        .flat_map(|j| (0..n as i64).map(move |i| (cx - half + i, cy - half + j)))
+        .map(|(x, y)| {
+            if x < 0 || y < 0 {
+                None
+            } else {
+                pixel_color(frame, egui::pos2(x as f32, y as f32))
+            }
+        })
+        .collect()
+}
+
+fn loupe_origin(cursor: egui::Pos2, size: egui::Vec2, bounds: egui::Rect) -> egui::Pos2 {
+    let mut x = cursor.x + LOUPE_GAP;
+    if x + size.x > bounds.right() {
+        x = cursor.x - LOUPE_GAP - size.x;
+    }
+    let mut y = cursor.y + LOUPE_GAP;
+    if y + size.y > bounds.bottom() {
+        y = cursor.y - LOUPE_GAP - size.y;
+    }
+    egui::pos2(x.max(bounds.left()), y.max(bounds.top()))
 }
 
 const EXPORT_SCALES: [f32; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
@@ -1266,6 +1299,7 @@ impl OverlayApp {
         let mut hidden = self.hidden.clone();
         let mut hidden_buttons = self.hidden_buttons.clone();
         let export_scale = self.export_scale;
+        let loupe_on = self.loupe_on;
         let mut bindings = self.bindings.clone();
         let mut rebinding = self.rebinding;
         let mut rebind_note = self.rebind_note.clone();
@@ -2263,8 +2297,64 @@ impl OverlayApp {
                 }
                 painter.galley(rect.min + pad + egui::vec2(sw, 0.0), galley, egui::Color32::WHITE);
             };
+            let over_handle = selection.zip(raw_cursor).is_some_and(|(sel, p)| {
+                let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+                let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
+                hit_handle(s, p, hr).is_some()
+            });
+            let precise = tool == Tool::Select
+                && loupe_on
+                && shape_drag.is_none()
+                && (selection.is_none()
+                    || matches!(sel_mode, Some(SelMode::New) | Some(SelMode::Resize(_)))
+                    || over_handle);
+            let mut loupe_box = None;
+            if precise && let (Some(p), Some(frame)) = (raw_cursor, frame_px.as_deref()) {
+                let n = LOUPE_CELLS;
+                let grid = LOUPE_ZOOM * n as f32;
+                let size = egui::vec2(grid, grid + 22.0);
+                let origin = loupe_origin(p, size, avail);
+                loupe_box = Some(egui::Rect::from_min_size(origin, size));
+                let field = egui::Rect::from_min_size(origin, egui::vec2(grid, grid));
+                painter.rect_filled(field.expand(2.0), 4, egui::Color32::from_black_alpha(220));
+                let fp = to_frame(p);
+                for (k, c) in loupe_cells(frame, fp, n).into_iter().enumerate() {
+                    let at = origin + egui::vec2((k % n) as f32, (k / n) as f32) * LOUPE_ZOOM;
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(at, egui::vec2(LOUPE_ZOOM, LOUPE_ZOOM)),
+                        0,
+                        c.unwrap_or(egui::Color32::from_gray(24)),
+                    );
+                }
+                let mid = egui::Rect::from_min_size(
+                    origin + egui::vec2((n / 2) as f32, (n / 2) as f32) * LOUPE_ZOOM,
+                    egui::vec2(LOUPE_ZOOM, LOUPE_ZOOM),
+                );
+                painter.rect_stroke(
+                    mid,
+                    0,
+                    egui::Stroke::new(2.0f32, egui::Color32::from_black_alpha(200)),
+                    egui::StrokeKind::Outside,
+                );
+                painter.rect_stroke(
+                    mid,
+                    0,
+                    egui::Stroke::new(1.0f32, egui::Color32::WHITE),
+                    egui::StrokeKind::Inside,
+                );
+                painter.text(
+                    egui::pos2(field.center().x, field.bottom() + 6.0),
+                    egui::Align2::CENTER_TOP,
+                    format!("{}, {}", fp.x as i32, fp.y as i32),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
             if let Some(p) = raw_cursor {
-                let at = p + egui::vec2(18.0, 18.0);
+                let at = match loupe_box {
+                    Some(b) => b.left_bottom() + egui::vec2(0.0, 6.0),
+                    None => p + egui::vec2(18.0, 18.0),
+                };
                 if let Some(text) = &toast {
                     label(painter, at, text, None);
                 } else if tool == Tool::Picker
@@ -2937,7 +3027,12 @@ impl OverlayApp {
                 self.toast = Some((format!("Export {percent} %"), std::time::Instant::now()));
                 self.request_redraw_all();
             }
-            Command::Loupe => {}
+            Command::Loupe => {
+                self.loupe_on = !self.loupe_on;
+                let state = if self.loupe_on { "on" } else { "off" };
+                self.toast = Some((format!("Loupe {state}"), std::time::Instant::now()));
+                self.request_redraw_all();
+            }
         }
     }
 
@@ -4382,6 +4477,54 @@ mod tests {
             half.get_pixel(25, 12).0,
             [10, 20, 30, 255],
             "a flat colour stays flat"
+        );
+    }
+
+    #[test]
+    fn the_loupe_samples_the_pixels_around_the_cursor() {
+        let mut rgba = Vec::new();
+        for y in 0..10u8 {
+            for x in 0..10u8 {
+                rgba.extend_from_slice(&[x, y, 0, 255]);
+            }
+        }
+        let frame = Frame {
+            width: 10,
+            height: 10,
+            rgba,
+        };
+        let cells = super::loupe_cells(&frame, egui::pos2(5.5, 5.5), 3);
+        assert_eq!(cells.len(), 9);
+        assert_eq!(cells[0], Some(egui::Color32::from_rgb(4, 4, 0)));
+        assert_eq!(
+            cells[4],
+            Some(egui::Color32::from_rgb(5, 5, 0)),
+            "the centre is under the cursor"
+        );
+        assert_eq!(cells[8], Some(egui::Color32::from_rgb(6, 6, 0)));
+        let edge = super::loupe_cells(&frame, egui::pos2(0.2, 9.9), 3);
+        assert_eq!(edge[0], None, "left of the frame");
+        assert_eq!(edge[4], Some(egui::Color32::from_rgb(0, 9, 0)));
+        assert_eq!(edge[7], None, "below the frame");
+    }
+
+    #[test]
+    fn the_loupe_sits_beside_the_cursor_and_stays_on_screen() {
+        let bounds = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let size = egui::vec2(120.0, 140.0);
+        assert_eq!(
+            super::loupe_origin(egui::pos2(100.0, 100.0), size, bounds),
+            egui::pos2(124.0, 124.0)
+        );
+        assert_eq!(
+            super::loupe_origin(egui::pos2(790.0, 100.0), size, bounds),
+            egui::pos2(790.0 - 24.0 - 120.0, 124.0),
+            "flips left at the right edge"
+        );
+        assert_eq!(
+            super::loupe_origin(egui::pos2(100.0, 590.0), size, bounds),
+            egui::pos2(124.0, 590.0 - 24.0 - 140.0),
+            "flips up at the bottom edge"
         );
     }
 
