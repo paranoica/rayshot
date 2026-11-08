@@ -18,6 +18,7 @@ const COLOURS = [[255, 0, 0], [0, 255, 0], [0, 0, 255]];
 const KEY_LEFTCTRL = 29;
 const KEY_LEFTSHIFT = 42;
 const KEY_C = 46;
+const KEY_K = 37;
 
 const WANTS = {
     plain: [1, 1],
@@ -173,6 +174,8 @@ export class Displays {
                     this._russian(next);
                 else if (kind === 'fullscreen')
                     this._fullscreen(next);
+                else if (kind === 'rebound')
+                    this._rebound(next);
                 else if (kind === 'shape-enter')
                     this._shapeEnter(next);
                 else if (kind === 'text-enter' || kind === 'text-escape')
@@ -492,6 +495,68 @@ export class Displays {
                     `want ${hex(fill)}`);
             }, fail)), fail);
         }), () => fail('the helper window never went fullscreen'));
+    }
+
+    _rebound(next) {
+        const name = 'a rebound copy key copies and the old one does not';
+        const r = this._r();
+        const dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'rayshot']);
+        const conf = GLib.build_filenamev([dir, 'editor.conf']);
+        GLib.mkdir_with_parents(dir, 0o755);
+        GLib.file_set_contents(conf, 'keys = copy:Ctrl+K\n');
+        const restore = () => GLib.unlink(conf);
+        const marker = 'rayshot-soak-marker';
+        const clipboard = St.Clipboard.get_default();
+        const k = this._d._keyboard;
+        const now = () => GLib.get_monotonic_time();
+        const ctrl = code => {
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
+        };
+        const fail = why => {
+            restore();
+            this._fail(name, why, next);
+        };
+        this._capture({x: 300, y: 300}, overlay => {
+            try {
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${overlay.session} 200 200 500 400\n`), null);
+            } catch (e) {
+                fail(`cannot select: ${e.message}`);
+                return;
+            }
+            clipboard.set_text(St.ClipboardType.CLIPBOARD, marker);
+            later(300, () => {
+                ctrl(KEY_C);
+                later(800, () => clipboard.get_text(St.ClipboardType.CLIPBOARD, (_c, text) => {
+                    if (!r._busy || text !== marker) {
+                        restore();
+                        this._d._result(name, false, 'the old ctrl+c still copied');
+                        if (r._busy)
+                            this._d._endSession(next);
+                        else
+                            next();
+                        return;
+                    }
+                    ctrl(KEY_K);
+                    waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                        restore();
+                        this._d._result(name, true, `ctrl+k copied a ${pb.get_width()}x${pb.get_height()} png, ctrl+c did nothing`);
+                        next();
+                    }, why => {
+                        restore();
+                        this._d._result(name, false, `ctrl+k: ${why}`);
+                        next();
+                    })), () => {
+                        restore();
+                        this._d._result(name, false, 'ctrl+k did not copy');
+                        this._d._endSession(next);
+                    });
+                }));
+            });
+        }, fail);
     }
 
     _shapeEnter(next) {
