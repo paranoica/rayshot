@@ -63,18 +63,24 @@ and Ubuntu, `tesseract` and `tesseract-langpack-rus` on Fedora.
 | `E` | ellipse | | `Esc` | cancel |
 | `N` | numbered markers | | mouse wheel | line width |
 | `M` | highlighter | | `1`–`9` | colours |
-| `T` | text | | `Ctrl+=` / `Ctrl+-` | zoom in / out |
-| `X` / `B` | pixelate / blur | | `Ctrl+0` | actual size |
-| `I` | colour picker, copies `#RRGGBB` | | middle drag | move around while zoomed |
+| `T` | text | | `Ctrl+=` / `Ctrl+-` | zoom the selection in / out |
+| `X` / `B` | pixelate / blur | | `Ctrl+Shift+=` / `Ctrl+Shift+-` | zoom the screen in / out |
+| `I` | colour picker, copies `#RRGGBB` | | middle drag | move what is zoomed |
 
 Hold **Shift** while drawing for straight lines at 45° steps, squares and circles.
 
-**Zoom.** `Ctrl+=` zooms the frozen screen in around the cursor, through 150,
-200, 300 and 400 %; `Ctrl+-` steps back and `Ctrl+0` returns to 100 %. Drag
-with the middle mouse button to move around. You select and draw on the zoomed
-view, and the picture comes out at the zoom you see: a 60 × 24 button copied at
-200 % is 120 × 48, and the size label says `60 × 24 → 120 × 48`. Each capture
-starts at 100 %.
+**Zoom.** With an area selected, `Ctrl+=` zooms in on the middle of the
+selection like a camera, through 150, 200, 300, 400 and 500 %, while the frame
+and the rest of the screen stay put. Drag inside the frame with the middle
+mouse button to choose what is magnified. What the frame shows is what you get,
+at the frame's size, and you can draw on it. `Ctrl+-` steps back, `Ctrl+0`
+returns to 100 %, and a new selection starts at 100 %.
+
+`Ctrl+Shift+=` zooms the whole frozen screen around the cursor instead, and the
+picture then comes out at that zoom: a 60 × 24 button copied at 200 % is
+120 × 48. `Ctrl+Shift+-` and `Ctrl+Shift+0` step back. On a US layout press the
+`=` key itself for the selection zoom, since `Ctrl` and `+` is
+`Ctrl+Shift+=`; the keypad `+` works too.
 
 **Editing what you drew.** With `S`, click a shape: drag it from anywhere in
 its dashed frame, or drag a round handle to resize it. While it is selected,
