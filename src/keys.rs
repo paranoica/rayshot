@@ -10,10 +10,13 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    ScreenZoomIn,
+    ScreenZoomOut,
+    ScreenZoomReset,
 }
 
 impl Command {
-    pub const ALL: [Command; 19] = [
+    pub const ALL: [Command; 22] = [
         Command::Tool(Tool::ALL[0]),
         Command::Tool(Tool::ALL[1]),
         Command::Tool(Tool::ALL[2]),
@@ -33,6 +36,9 @@ impl Command {
         Command::ZoomIn,
         Command::ZoomOut,
         Command::ZoomReset,
+        Command::ScreenZoomIn,
+        Command::ScreenZoomOut,
+        Command::ScreenZoomReset,
     ];
 
     pub fn name(self) -> String {
@@ -45,6 +51,9 @@ impl Command {
             Command::ZoomIn => "zoom-in".into(),
             Command::ZoomOut => "zoom-out".into(),
             Command::ZoomReset => "zoom-reset".into(),
+            Command::ScreenZoomIn => "screen-zoom-in".into(),
+            Command::ScreenZoomOut => "screen-zoom-out".into(),
+            Command::ScreenZoomReset => "screen-zoom-reset".into(),
         }
     }
 
@@ -59,9 +68,12 @@ impl Command {
             Command::CopyText => "Copy text",
             Command::Save => "Save",
             Command::SaveAs => "Save as…",
-            Command::ZoomIn => "Zoom in",
-            Command::ZoomOut => "Zoom out",
-            Command::ZoomReset => "Actual size",
+            Command::ZoomIn => "Zoom the selection in",
+            Command::ZoomOut => "Zoom the selection out",
+            Command::ZoomReset => "Selection at 100 %",
+            Command::ScreenZoomIn => "Zoom the screen in",
+            Command::ScreenZoomOut => "Zoom the screen out",
+            Command::ScreenZoomReset => "Screen at 100 %",
         }
     }
 
@@ -75,6 +87,9 @@ impl Command {
             Command::ZoomIn => "Ctrl+=",
             Command::ZoomOut => "Ctrl+-",
             Command::ZoomReset => "Ctrl+0",
+            Command::ScreenZoomIn => "Ctrl+Shift+=",
+            Command::ScreenZoomOut => "Ctrl+Shift+-",
+            Command::ScreenZoomReset => "Ctrl+Shift+0",
         };
         Chord::parse(text).expect("default chords parse")
     }
@@ -672,13 +687,28 @@ mod tests {
     }
 
     #[test]
-    fn plus_and_the_keypad_zoom_the_export() {
+    fn plus_zooms_the_selection_and_shift_plus_the_screen() {
         use winit::keyboard::KeyCode;
         let b = Bindings::defaults();
         assert_eq!(
+            b.resolve(true, false, false, KeyCode::Equal),
+            Some(Command::ZoomIn)
+        );
+        assert_eq!(
             b.resolve(true, true, false, KeyCode::Equal),
-            Some(Command::ZoomIn),
-            "Ctrl+Shift+= is Ctrl++"
+            Some(Command::ScreenZoomIn)
+        );
+        assert_eq!(
+            b.resolve(true, true, false, KeyCode::Minus),
+            Some(Command::ScreenZoomOut)
+        );
+        assert_eq!(
+            b.resolve(true, true, false, KeyCode::Digit0),
+            Some(Command::ScreenZoomReset)
+        );
+        assert_eq!(
+            b.resolve(true, true, false, KeyCode::NumpadAdd),
+            Some(Command::ScreenZoomIn)
         );
         assert_eq!(
             b.resolve(true, false, false, KeyCode::NumpadAdd),

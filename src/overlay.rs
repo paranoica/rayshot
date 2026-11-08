@@ -231,6 +231,9 @@ struct OverlayApp {
     bindings: crate::keys::Bindings,
     zoom: f32,
     pan_drag: bool,
+    sel_zoom: f32,
+    sel_offset: egui::Vec2,
+    lens_drag: bool,
     rebinding: Option<crate::keys::Command>,
     held_after_capture: Option<KeyCode>,
     rebind_note: Option<RebindNote>,
@@ -282,6 +285,9 @@ impl OverlayApp {
             bindings: prefs.keys,
             zoom: 1.0,
             pan_drag: false,
+            sel_zoom: 1.0,
+            sel_offset: egui::Vec2::ZERO,
+            lens_drag: false,
             rebinding: None,
             held_after_capture: None,
             rebind_note: None,
@@ -420,6 +426,73 @@ fn zoom_center(region: egui::Rect, view: egui::Rect, anchor: egui::Pos2, zoom: f
     min + size / 2.0
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Lens {
+    outer: egui::Rect,
+    inner: egui::Rect,
+    z: f32,
+}
+
+impl Lens {
+    fn new(outer: egui::Rect, z: f32, offset: egui::Vec2) -> Option<Lens> {
+        if z <= 1.0 + 1e-3 {
+            return None;
+        }
+        let size = outer.size() / z;
+        let half = size / 2.0;
+        let want = outer.center() + offset;
+        let c = egui::pos2(
+            want.x.clamp(outer.min.x + half.x, outer.max.x - half.x),
+            want.y.clamp(outer.min.y + half.y, outer.max.y - half.y),
+        );
+        Some(Lens {
+            outer,
+            inner: egui::Rect::from_center_size(c, size),
+            z,
+        })
+    }
+
+    fn into_frame(&self, q: egui::Pos2) -> egui::Pos2 {
+        self.inner.min + (q - self.outer.min) / self.z
+    }
+
+    fn out_of_frame(&self, f: egui::Pos2) -> egui::Pos2 {
+        self.outer.min + (f - self.inner.min) * self.z
+    }
+
+    fn offset(&self) -> egui::Vec2 {
+        self.inner.center() - self.outer.center()
+    }
+}
+
+fn export_plan(
+    sel: egui::Rect,
+    dims: (u32, u32),
+    sel_zoom: f32,
+    offset: egui::Vec2,
+    zoom: f32,
+) -> (egui::Rect, (u32, u32)) {
+    let (_, _, cw, ch) = crop_box(sel, dims.0, dims.1);
+    let area = Lens::new(sel, sel_zoom, offset).map_or(sel, |l| l.inner);
+    (area, scaled_size(cw as f32, ch as f32, zoom))
+}
+
+fn resized_to(img: image::RgbaImage, size: (u32, u32)) -> image::RgbaImage {
+    if img.dimensions() == size {
+        return img;
+    }
+    let filter = if size.0 >= img.width() {
+        image::imageops::FilterType::CatmullRom
+    } else {
+        image::imageops::FilterType::Lanczos3
+    };
+    image::imageops::resize(&img, size.0, size.1, filter)
+}
+
+fn draws_frame(see_through: bool, zoom: f32, has_texture: bool) -> bool {
+    has_texture && (!see_through || zoom > 1.0)
+}
+
 fn fit(avail: egui::Rect, view: egui::Rect) -> (f32, egui::Rect) {
     let scale = (avail.width() / view.width()).min(avail.height() / view.height());
     let image_rect = egui::Rect::from_center_size(avail.center(), view.size() * scale);
@@ -459,19 +532,6 @@ fn size_label(width: u32, height: u32, scale: f32) -> String {
     }
     let (w, h) = scaled_size(width as f32, height as f32, scale);
     format!("{base} → {w} × {h}")
-}
-
-fn scaled(img: image::RgbaImage, scale: f32) -> image::RgbaImage {
-    if (scale - 1.0).abs() < 1e-3 {
-        return img;
-    }
-    let (w, h) = scaled_size(img.width() as f32, img.height() as f32, scale);
-    let filter = if scale < 1.0 {
-        image::imageops::FilterType::Lanczos3
-    } else {
-        image::imageops::FilterType::CatmullRom
-    };
-    image::imageops::resize(&img, w, h, filter)
 }
 
 fn spawn_detached(command: &str, file: &std::path::Path) -> std::io::Result<()> {
@@ -1311,12 +1371,19 @@ impl OverlayApp {
         );
         let mut view_center = win.view_center;
         let mut pan_drag = self.pan_drag;
+        let mut sel_zoom = self.sel_zoom;
+        let mut sel_offset = self.sel_offset;
+        let mut lens_drag = self.lens_drag;
+        let lens = self
+            .selection
+            .and_then(|sel| Lens::new(sel, sel_zoom, sel_offset));
         let bounds = if self.zoom > 1.0 {
             view
         } else {
             egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(f32::MAX, f32::MAX))
         };
         let frame_tex = win.frame_texture_id;
+        let see_through = see_through && !draws_frame(see_through, self.zoom, frame_tex.is_some());
         if frame_tex.is_none() && !live {
             return Ok(());
         }
@@ -1393,7 +1460,7 @@ impl OverlayApp {
 
             let (scale, image_rect) = fit(avail, view);
 
-            let to_frame = |p: egui::Pos2| {
+            let plain_to_frame = |p: egui::Pos2| {
                 let local = (p - image_rect.min) / scale;
                 egui::pos2(
                     (view.min.x + local.x)
@@ -1404,7 +1471,7 @@ impl OverlayApp {
                         .clamp(0.0, frame_h),
                 )
             };
-            let to_screen = |fp: egui::Pos2| image_rect.min + (fp - view.min) * scale;
+            let plain_to_screen = |fp: egui::Pos2| image_rect.min + (fp - view.min) * scale;
 
             let uv = egui::Rect::from_min_max(
                 egui::pos2(view.min.x / frame_w, view.min.y / frame_h),
@@ -1426,10 +1493,6 @@ impl OverlayApp {
                 });
             }
             let panning = pan_drag && (resp.drag_started() || resp.dragged() || resp.drag_stopped());
-            if panning && resp.dragged() && zoom > 1.0 {
-                let moved = view.center() - resp.drag_delta() / scale;
-                view_center = Some(view_rect(region, zoom, moved).center());
-            }
             let cursor_pos = raw_cursor.or_else(|| resp.interact_pointer_pos());
             let press_pos = ui.input(|i| i.pointer.press_origin()).or(cursor_pos);
             let hit = |fp: egui::Pos2| {
@@ -1439,15 +1502,48 @@ impl OverlayApp {
             let capture_before = selection;
             let on_capture_handle = |p: egui::Pos2| {
                 capture_before.is_some_and(|sel| {
-                    let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+                    let s = egui::Rect::from_min_max(plain_to_screen(sel.min), plain_to_screen(sel.max));
                     let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
                     hit_handle(s, p, hr).is_some()
                 })
             };
+            let lens_area = lens.map(|l| {
+                egui::Rect::from_min_max(plain_to_screen(l.outer.min), plain_to_screen(l.outer.max))
+            });
+            let in_lens =
+                |p: egui::Pos2| lens_area.is_some_and(|r| r.contains(p)) && !on_capture_handle(p);
+            if resp.drag_started() {
+                lens_drag = press_pos.is_some_and(in_lens);
+            }
+            let dragging = resp.drag_started() || resp.dragged() || resp.drag_stopped();
+            let lensed = if dragging {
+                lens_drag
+            } else {
+                cursor_pos.is_some_and(in_lens)
+            };
+            if panning && resp.dragged() {
+                if let (true, Some(l)) = (lens_drag, lens) {
+                    let shifted = l.offset() - resp.drag_delta() / (scale * l.z);
+                    if let Some(moved) = Lens::new(l.outer, l.z, shifted) {
+                        sel_offset = moved.offset();
+                    }
+                } else if zoom > 1.0 {
+                    let moved = view.center() - resp.drag_delta() / scale;
+                    view_center = Some(view_rect(region, zoom, moved).center());
+                }
+            }
+            let active_lens = lens.filter(|_| lensed);
+            let tool_frame = |p: egui::Pos2| {
+                let q = plain_to_frame(p);
+                active_lens.map_or(q, |l| l.into_frame(q))
+            };
+            let tool_screen =
+                |f: egui::Pos2| plain_to_screen(active_lens.map_or(f, |l| l.out_of_frame(f)));
+            let tool_scale = active_lens.map_or(scale, |l| scale * l.z);
             let inside_selected = |p: egui::Pos2| {
                 selected_before.filter(|&i| {
                     !on_capture_handle(p)
-                        && selection_outline(&shapes[i], &to_screen, scale)
+                        && selection_outline(&shapes[i], &tool_screen, tool_scale)
                             .is_some_and(|r| r.contains(p))
                 })
             };
@@ -1457,7 +1553,7 @@ impl OverlayApp {
                     if resp.clicked()
                         && let Some(p) = cursor_pos
                     {
-                        selected = hit(to_frame(p)).or_else(|| inside_selected(p));
+                        selected = hit(tool_frame(p)).or_else(|| inside_selected(p));
                     }
                     if resp.double_clicked()
                         && let Some(i) = selected
@@ -1467,12 +1563,12 @@ impl OverlayApp {
                     }
                     if resp.drag_started() {
                         if let Some(p) = press_pos {
-                            let fp = to_frame(p);
+                            let fp = tool_frame(p);
                             drag_start = Some(fp);
                             let grip = selected.and_then(|i| {
                                 crate::scene::grips(&shapes[i])
                                     .into_iter()
-                                    .find(|(_, at)| (to_screen(*at) - p).length() <= GRIP_REACH)
+                                    .find(|(_, at)| (tool_screen(*at) - p).length() <= GRIP_REACH)
                                     .map(|(g, _)| (i, g))
                             });
                             if let Some((i, g)) = grip {
@@ -1484,20 +1580,24 @@ impl OverlayApp {
                                 sel_mode = None;
                             } else if let Some(sel) = selection {
                                 selected = None;
+                                drag_start = Some(plain_to_frame(p));
+                                lens_drag = false;
                                 let s = egui::Rect::from_min_max(
-                                    to_screen(sel.min),
-                                    to_screen(sel.max),
+                                    plain_to_screen(sel.min),
+                                    plain_to_screen(sel.max),
                                 );
                                 let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
                                 if let Some(h) = hit_handle(s, p, hr) {
                                     sel_mode = Some(SelMode::Resize(h));
                                     sel_ref = sel;
-                                } else if sel.contains(fp) {
+                                } else if sel.contains(plain_to_frame(p)) {
                                     sel_mode = Some(SelMode::Move);
                                     sel_ref = sel;
                                 } else {
                                     sel_mode = Some(SelMode::New);
                                     clear_scene = true;
+                                    sel_zoom = 1.0;
+                                    sel_offset = egui::Vec2::ZERO;
                                 }
                             } else {
                                 sel_mode = Some(SelMode::New);
@@ -1506,7 +1606,7 @@ impl OverlayApp {
                     }
                     if resp.dragged() || resp.drag_stopped() {
                         if let (Some(start), Some(p)) = (drag_start, cursor_pos) {
-                            let fp = to_frame(p);
+                            let fp = tool_frame(p);
                             if let Some((i, grip, orig)) = &shape_drag {
                                 let moved = match grip {
                                     None => crate::scene::translated(orig, fp - start),
@@ -1514,6 +1614,7 @@ impl OverlayApp {
                                 };
                                 drag_apply = Some((*i, moved));
                             } else {
+                                let fp = plain_to_frame(p);
                                 match sel_mode {
                                     Some(SelMode::New) => {
                                         selection = Some(egui::Rect::from_two_pos(start, fp));
@@ -1555,7 +1656,7 @@ impl OverlayApp {
                         selected.and_then(|i| {
                             crate::scene::grips(&shapes[i])
                                 .into_iter()
-                                .find(|(_, at)| (to_screen(*at) - p).length() <= GRIP_REACH)
+                                .find(|(_, at)| (tool_screen(*at) - p).length() <= GRIP_REACH)
                                 .map(|(g, _)| g)
                         })
                     };
@@ -1565,12 +1666,13 @@ impl OverlayApp {
                         grip_cursor(Some(g), false)
                     } else if sel_mode.is_none()
                         && hover.is_some_and(|p| {
-                            inside_selected(p).is_some() || hit(to_frame(p)).is_some()
+                            inside_selected(p).is_some() || hit(tool_frame(p)).is_some()
                         })
                     {
                         egui::CursorIcon::Move
                     } else if let Some(sel) = selection {
-                        let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+                        let s =
+                            egui::Rect::from_min_max(plain_to_screen(sel.min), plain_to_screen(sel.max));
                         let hr = 12.0_f32.min(s.width().min(s.height()) / 3.0);
                         match sel_mode {
                             Some(SelMode::Resize(h)) => handle_cursor(h),
@@ -1593,7 +1695,7 @@ impl OverlayApp {
                         && let Some(p) = cursor_pos
                     {
                         committed = Some(Shape::Counter {
-                            center: to_frame(p),
+                            center: tool_frame(p),
                             number: crate::scene::next_counter(shapes),
                             color,
                             radius: counter_radius(stroke_width),
@@ -1603,7 +1705,7 @@ impl OverlayApp {
                 Tool::Picker => {
                     if (resp.clicked() || resp.drag_stopped())
                         && let (Some(p), Some(frame)) = (cursor_pos, frame_px.as_deref())
-                        && let Some(c) = pixel_color(frame, to_frame(p))
+                        && let Some(c) = pixel_color(frame, tool_frame(p))
                     {
                         picked = Some(c);
                     }
@@ -1611,14 +1713,14 @@ impl OverlayApp {
                 Tool::Text => {
                     if resp.clicked() {
                         if let Some(p) = cursor_pos {
-                            start_text = Some(to_frame(p));
+                            start_text = Some(tool_frame(p));
                         }
                     }
                 }
                 _ => {
                     if resp.drag_started() {
                         if let Some(p) = press_pos {
-                            let fp = to_frame(p);
+                            let fp = tool_frame(p);
                             draft_start = Some(fp);
                             straight_from = None;
                             match tool {
@@ -1667,7 +1769,7 @@ impl OverlayApp {
                     }
                     if resp.dragged() || resp.drag_stopped() {
                         if let Some(p) = cursor_pos {
-                            let fp = to_frame(p);
+                            let fp = tool_frame(p);
                             match tool {
                                 Tool::Rect => {
                                     if let Some(st) = draft_start {
@@ -1847,14 +1949,50 @@ impl OverlayApp {
             };
             let dim = egui::Color32::from_black_alpha(dim_alpha);
 
+            let chrome = |p: &egui::Painter, s_true: egui::Rect| {
+                let corners = [
+                    s_true.left_top(),
+                    s_true.right_top(),
+                    s_true.right_bottom(),
+                    s_true.left_bottom(),
+                    s_true.left_top(),
+                ];
+                p.extend(egui::Shape::dashed_line(
+                    &corners,
+                    egui::Stroke::new(1.5f32, egui::Color32::WHITE),
+                    6.0,
+                    4.0,
+                ));
+                let hsz = 7.0;
+                for c in [
+                    s_true.left_top(),
+                    s_true.center_top(),
+                    s_true.right_top(),
+                    s_true.right_center(),
+                    s_true.right_bottom(),
+                    s_true.center_bottom(),
+                    s_true.left_bottom(),
+                    s_true.left_center(),
+                ] {
+                    let hr = egui::Rect::from_center_size(c, egui::vec2(hsz, hsz));
+                    p.rect_filled(hr, 1, egui::Color32::WHITE);
+                    p.rect_stroke(
+                        hr,
+                        1,
+                        egui::Stroke::new(1.0f32, egui::Color32::from_gray(70)),
+                        egui::StrokeKind::Outside,
+                    );
+                }
+            };
+
             let visible = selection.and_then(|sel| {
                 let v = sel.intersect(region);
                 (v.width() > 0.5 && v.height() > 0.5).then_some((sel, v))
             });
 
             if let Some((sel, vis)) = visible {
-                let s = egui::Rect::from_min_max(to_screen(vis.min), to_screen(vis.max));
-                let s_true = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+                let s = egui::Rect::from_min_max(plain_to_screen(vis.min), plain_to_screen(vis.max));
+                let s_true = egui::Rect::from_min_max(plain_to_screen(sel.min), plain_to_screen(sel.max));
                 painter.rect_filled(
                     egui::Rect::from_min_max(
                         image_rect.min,
@@ -1887,42 +2025,15 @@ impl OverlayApp {
                     0,
                     dim,
                 );
-                let corners = [
-                    s_true.left_top(),
-                    s_true.right_top(),
-                    s_true.right_bottom(),
-                    s_true.left_bottom(),
-                    s_true.left_top(),
-                ];
-                painter.extend(egui::Shape::dashed_line(
-                    &corners,
-                    egui::Stroke::new(1.5f32, egui::Color32::WHITE),
-                    6.0,
-                    4.0,
-                ));
-                let hsz = 7.0;
-                for c in [
-                    s_true.left_top(),
-                    s_true.center_top(),
-                    s_true.right_top(),
-                    s_true.right_center(),
-                    s_true.right_bottom(),
-                    s_true.center_bottom(),
-                    s_true.left_bottom(),
-                    s_true.left_center(),
-                ] {
-                    let hr = egui::Rect::from_center_size(c, egui::vec2(hsz, hsz));
-                    painter.rect_filled(hr, 1, egui::Color32::WHITE);
-                    painter.rect_stroke(
-                        hr,
-                        1,
-                        egui::Stroke::new(1.0f32, egui::Color32::from_gray(70)),
-                        egui::StrokeKind::Outside,
-                    );
-                }
+                chrome(painter, s_true);
                 if region.contains(sel.min) {
                     let (_, _, cw, ch) = crop_box(sel, frame_dims.0, frame_dims.1);
                     let label = size_label(cw, ch, zoom);
+                    let label = if sel_zoom > 1.0 {
+                        format!("{label} · {} %", (sel_zoom * 100.0).round())
+                    } else {
+                        label
+                    };
                     let galley = painter.layout_no_wrap(
                         label,
                         egui::FontId::proportional(12.0),
@@ -1952,7 +2063,7 @@ impl OverlayApp {
                 (tex, _) => crate::scene::paint(
                     painter,
                     shape,
-                    &to_screen,
+                    &plain_to_screen,
                     scale,
                     tex.unwrap_or_default(),
                     frame_w,
@@ -1977,10 +2088,54 @@ impl OverlayApp {
             if let Some(c) = &committed {
                 paint_shape(c);
             }
+            let lens_now = selection.and_then(|sel| Lens::new(sel, sel_zoom, sel_offset));
+            if let (Some(l), Some(tex)) = (lens_now, frame_tex) {
+                let r = egui::Rect::from_min_max(
+                    plain_to_screen(l.outer.min),
+                    plain_to_screen(l.outer.max),
+                );
+                let lp = painter.with_clip_rect(r.intersect(avail));
+                let luv = egui::Rect::from_min_max(
+                    egui::pos2(l.inner.min.x / frame_w, l.inner.min.y / frame_h),
+                    egui::pos2(l.inner.max.x / frame_w, l.inner.max.y / frame_h),
+                );
+                lp.image(tex, r, luv, egui::Color32::WHITE);
+                let ls = |f: egui::Pos2| plain_to_screen(l.out_of_frame(f));
+                let paint_lensed = |shape: &Shape| match (blur_tex, shape) {
+                    (None, Shape::Blur { .. }) => {}
+                    (tex, _) => crate::scene::paint(
+                        &lp,
+                        shape,
+                        &ls,
+                        scale * l.z,
+                        tex.unwrap_or_default(),
+                        frame_w,
+                        frame_h,
+                    ),
+                };
+                for i in 0..shapes.len() {
+                    if Some(i) != editing_index {
+                        paint_lensed(shape_now(i));
+                    }
+                }
+                if let Some(d) = &draft {
+                    paint_lensed(d);
+                }
+                if let Some(c) = &committed {
+                    paint_lensed(c);
+                }
+                chrome(painter, r);
+            }
             if let Some(i) = selected.filter(|&i| tool == Tool::Select && Some(i) != editing_index)
             {
                 let shape = shape_now(i);
-                if let Some(r) = selection_outline(shape, &to_screen, scale) {
+                let owner = lens_now.filter(|l| {
+                    selection_outline(shape, &|f: egui::Pos2| f, 1.0)
+                        .is_some_and(|r| l.inner.contains(r.center()))
+                });
+                let os = |f: egui::Pos2| plain_to_screen(owner.map_or(f, |l| l.out_of_frame(f)));
+                let oscale = owner.map_or(scale, |l| scale * l.z);
+                if let Some(r) = selection_outline(shape, &os, oscale) {
                     let outline = [
                         r.left_top(),
                         r.right_top(),
@@ -2002,7 +2157,7 @@ impl OverlayApp {
                     ));
                 }
                 for (_, at) in crate::scene::grips(shape) {
-                    let c = to_screen(at);
+                    let c = os(at);
                     painter.circle_filled(c, 5.0, egui::Color32::WHITE);
                     painter.circle_stroke(
                         c,
@@ -2013,7 +2168,7 @@ impl OverlayApp {
             }
             if let (Some(r), Some(p)) = (brush_ring, raw_cursor) {
                 if brush_active {
-                    let rs = r * scale;
+                    let rs = r * tool_scale;
                     painter.circle_stroke(
                         p,
                         rs,
@@ -2027,13 +2182,17 @@ impl OverlayApp {
                     painter.circle_filled(p, 1.4, egui::Color32::from_white_alpha(235));
                 }
             }
+            let text_lens = text_info.and_then(|(pos, _, _)| lens_now.filter(|l| l.inner.contains(pos)));
+            let text_screen =
+                |f: egui::Pos2| plain_to_screen(text_lens.map_or(f, |l| l.out_of_frame(f)));
+            let tscale = text_lens.map_or(scale, |l| scale * l.z);
             if let (Some(buf), Some((pos, col, tsize))) = (&text_buf, text_info) {
                 if !region.contains(pos) {
-                    let font = egui::FontId::proportional(tsize * scale);
+                    let font = egui::FontId::proportional(tsize * tscale);
                     let galley = painter.layout_no_wrap(buf.clone(), font, col);
                     let gsize = galley.size();
-                    let line_h = gsize.y.max(tsize * scale);
-                    let origin = to_screen(pos);
+                    let line_h = gsize.y.max(tsize * tscale);
+                    let origin = text_screen(pos);
                     if let Some((s, e, _)) = text_sel_prev {
                         if s != e {
                             let x0 = galley.pos_from_cursor(egui::text::CCursor::new(s)).min.x;
@@ -2071,14 +2230,14 @@ impl OverlayApp {
             if let (Some(buf), Some((pos, col, tsize))) = (text_buf.as_mut(), text_info) {
                 if region.contains(pos) {
                     egui::Area::new(egui::Id::new("rayshot-text-edit"))
-                        .fixed_pos(to_screen(pos))
+                        .fixed_pos(text_screen(pos))
                         .constrain(false)
                         .show(ui.ctx(), |ui| {
                             ui.style_mut().visuals.text_cursor.stroke = egui::Stroke::NONE;
                             ui.style_mut().visuals.selection.bg_fill = egui::Color32::TRANSPARENT;
                             ui.style_mut().visuals.selection.stroke = egui::Stroke::NONE;
-                            let font = egui::FontId::proportional(tsize * scale);
-                            let charw = (tsize * scale * 0.6).max(6.0);
+                            let font = egui::FontId::proportional(tsize * tscale);
+                            let charw = (tsize * tscale * 0.6).max(6.0);
                             let tw_before = ui
                                 .painter()
                                 .layout_no_wrap(buf.clone(), font.clone(), col)
@@ -2099,7 +2258,7 @@ impl OverlayApp {
 
                             let galley = ui.painter().layout_no_wrap(buf.clone(), font, col);
                             let gsize = galley.size();
-                            let line_h = gsize.y.max(tsize * scale);
+                            let line_h = gsize.y.max(tsize * tscale);
                             let origin = r.rect.min;
 
                             if let Some(cr) = cursor_range {
@@ -2177,7 +2336,7 @@ impl OverlayApp {
                                 ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
                             }
                             if gh.dragged() {
-                                text_pos_shift += gh.drag_delta() / scale;
+                                text_pos_shift += gh.drag_delta() / tscale;
                             }
                             if !r.has_focus() && !r.lost_focus() && !gh.dragged() {
                                 r.request_focus();
@@ -2191,7 +2350,7 @@ impl OverlayApp {
 
             if let Some((sel, _vis)) = visible {
                 if region.contains(sel.max) && sel_mode.is_none() {
-                    let s = egui::Rect::from_min_max(to_screen(sel.min), to_screen(sel.max));
+                    let s = egui::Rect::from_min_max(plain_to_screen(sel.min), plain_to_screen(sel.max));
 
                     let tools_id = egui::Id::new("rayshot-tools");
                     let actions_id = egui::Id::new("rayshot-actions");
@@ -2371,7 +2530,7 @@ impl OverlayApp {
                 if let Some(text) = &toast {
                     label(painter, at, text, None);
                 } else if tool == Tool::Picker
-                    && let Some(c) = frame_px.as_deref().and_then(|f| pixel_color(f, to_frame(p)))
+                    && let Some(c) = frame_px.as_deref().and_then(|f| pixel_color(f, tool_frame(p)))
                 {
                     label(painter, at, &hex(c), Some(c));
                 }
@@ -2409,6 +2568,9 @@ impl OverlayApp {
         self.show_settings = show_settings;
         self.windows[idx].view_center = view_center;
         self.pan_drag = pan_drag;
+        self.sel_offset = sel_offset;
+        self.sel_zoom = sel_zoom;
+        self.lens_drag = lens_drag;
         self.show_colours = show_colours;
         self.picker_hsv = picker_hsv;
         self.hex_text = hex_text;
@@ -2635,8 +2797,19 @@ impl OverlayApp {
         Ok(())
     }
 
-    fn cropped_image(&self) -> Option<image::RgbaImage> {
+    fn export_area(&self) -> Option<egui::Rect> {
         let sel = self.selection?;
+        Some(Lens::new(sel, self.sel_zoom, self.sel_offset).map_or(sel, |l| l.inner))
+    }
+
+    fn export_size(&self) -> Option<(u32, u32)> {
+        let sel = self.selection?;
+        let dims = self.frame_dims()?;
+        Some(export_plan(sel, dims, self.sel_zoom, self.sel_offset, self.zoom).1)
+    }
+
+    fn cropped_image(&self) -> Option<image::RgbaImage> {
+        let sel = self.export_area()?;
         let frame = self.frame.as_ref()?;
         let (x, y, w, h) = crop_box(sel, frame.width, frame.height);
         if w == 0 || h == 0 {
@@ -2649,7 +2822,7 @@ impl OverlayApp {
     fn render_selection_to_image(&self, redactions_only: bool) -> Result<Option<image::RgbaImage>> {
         let shared = self.shared.as_ref().context("gpu not initialized")?;
         let frame = self.frame.as_ref().context("frame not captured")?;
-        let Some(sel) = self.selection else {
+        let Some(sel) = self.export_area() else {
             return Ok(None);
         };
 
@@ -2828,9 +3001,12 @@ impl OverlayApp {
     }
 
     fn export_image(&self) -> Result<Option<image::RgbaImage>> {
+        let Some(size) = self.export_size() else {
+            return Ok(None);
+        };
         Ok(self
             .render_selection_to_image(false)?
-            .map(|img| scaled(img, self.zoom)))
+            .map(|img| resized_to(img, size)))
     }
 
     fn finish(&self) -> Result<Option<std::path::PathBuf>> {
@@ -2840,9 +3016,9 @@ impl OverlayApp {
             Ok(None) => return Ok(None),
             Err(e) => {
                 eprintln!("[rayshot] annotated export failed ({e:#}); using raw crop");
-                match self.cropped_image() {
-                    Some(img) => scaled(img, self.zoom),
-                    None => return Ok(None),
+                match (self.cropped_image(), self.export_size()) {
+                    (Some(img), Some(size)) => resized_to(img, size),
+                    _ => return Ok(None),
                 }
             }
         };
@@ -3031,14 +3207,31 @@ impl OverlayApp {
             Command::Save => self.run_action(event_loop, Action::Save),
             Command::SaveAs => self.run_action(event_loop, Action::SaveAs),
             Command::ZoomIn | Command::ZoomOut | Command::ZoomReset => {
+                let text = if self.selection.is_some() {
+                    self.sel_zoom = match command {
+                        Command::ZoomIn => step_zoom(self.sel_zoom, true),
+                        Command::ZoomOut => step_zoom(self.sel_zoom, false),
+                        _ => 1.0,
+                    };
+                    if self.sel_zoom <= 1.0 {
+                        self.sel_offset = egui::Vec2::ZERO;
+                    }
+                    format!("Selection {} %", (self.sel_zoom * 100.0).round())
+                } else {
+                    "Select an area first".to_string()
+                };
+                self.toast = Some((text, std::time::Instant::now()));
+                self.request_redraw_all();
+            }
+            Command::ScreenZoomIn | Command::ScreenZoomOut | Command::ScreenZoomReset => {
                 let next = match command {
-                    Command::ZoomIn => step_zoom(self.zoom, true),
-                    Command::ZoomOut => step_zoom(self.zoom, false),
+                    Command::ScreenZoomIn => step_zoom(self.zoom, true),
+                    Command::ScreenZoomOut => step_zoom(self.zoom, false),
                     _ => 1.0,
                 };
                 self.set_zoom(next);
                 let percent = (self.zoom * 100.0).round();
-                self.toast = Some((format!("Zoom {percent} %"), std::time::Instant::now()));
+                self.toast = Some((format!("Screen {percent} %"), std::time::Instant::now()));
                 self.request_redraw_all();
             }
         }
@@ -3979,6 +4172,9 @@ fn settings_panel(
             row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ZoomIn, None);
             row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ZoomOut, None);
             row(ui, p::ARROWS_OUT_SIMPLE, Command::ZoomReset, None);
+            row(ui, p::MAGNIFYING_GLASS_PLUS, Command::ScreenZoomIn, None);
+            row(ui, p::MAGNIFYING_GLASS_MINUS, Command::ScreenZoomOut, None);
+            row(ui, p::ARROWS_OUT_SIMPLE, Command::ScreenZoomReset, None);
         });
     ui.add_space(6.0);
     let changed = Command::ALL.iter().any(|c| !bindings.is_default(*c));
@@ -4545,6 +4741,77 @@ mod tests {
     }
 
     #[test]
+    fn the_lens_shows_the_middle_of_the_selection_magnified() {
+        let outer = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(500.0, 400.0));
+        assert!(super::Lens::new(outer, 1.0, egui::Vec2::ZERO).is_none());
+        let lens = super::Lens::new(outer, 2.0, egui::Vec2::ZERO).unwrap();
+        assert_eq!(
+            lens.inner,
+            egui::Rect::from_min_max(egui::pos2(200.0, 175.0), egui::pos2(400.0, 325.0))
+        );
+        assert_eq!(lens.into_frame(outer.min), lens.inner.min);
+        assert_eq!(lens.into_frame(outer.max), lens.inner.max);
+        assert_eq!(
+            lens.into_frame(egui::pos2(300.0, 250.0)),
+            egui::pos2(300.0, 250.0)
+        );
+        assert_eq!(
+            lens.out_of_frame(egui::pos2(250.0, 200.0)),
+            egui::pos2(200.0, 150.0)
+        );
+        let q = egui::pos2(137.0, 333.0);
+        assert_eq!(lens.out_of_frame(lens.into_frame(q)), q);
+    }
+
+    #[test]
+    fn the_lens_can_be_moved_but_not_past_the_selection() {
+        let outer = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(500.0, 400.0));
+        let moved = super::Lens::new(outer, 2.0, egui::vec2(-50.0, 30.0)).unwrap();
+        assert_eq!(moved.inner.center(), egui::pos2(250.0, 280.0));
+        let pushed = super::Lens::new(outer, 4.0, egui::vec2(1000.0, -1000.0)).unwrap();
+        assert_eq!(
+            pushed.inner,
+            egui::Rect::from_min_max(egui::pos2(400.0, 100.0), egui::pos2(500.0, 175.0))
+        );
+        assert_eq!(pushed.offset(), egui::vec2(150.0, -112.5));
+    }
+
+    #[test]
+    fn a_zoomed_selection_exports_its_middle_at_the_selection_size() {
+        let sel = egui::Rect::from_min_max(egui::pos2(100.0, 100.0), egui::pos2(500.0, 300.0));
+        let plain = super::export_plan(sel, (1920, 1080), 1.0, egui::Vec2::ZERO, 1.0);
+        assert_eq!(plain, (sel, (400, 200)));
+        let lens = super::export_plan(sel, (1920, 1080), 2.0, egui::Vec2::ZERO, 1.0);
+        assert_eq!(
+            lens,
+            (
+                egui::Rect::from_min_max(egui::pos2(200.0, 150.0), egui::pos2(400.0, 250.0)),
+                (400, 200)
+            )
+        );
+        let both = super::export_plan(sel, (1920, 1080), 2.0, egui::Vec2::ZERO, 2.0);
+        assert_eq!(
+            both.1,
+            (800, 400),
+            "a zoomed screen still doubles the picture"
+        );
+        let moved = super::export_plan(sel, (1920, 1080), 4.0, egui::vec2(-1000.0, 0.0), 1.0);
+        assert_eq!(moved.0.min, egui::pos2(100.0, 175.0));
+    }
+
+    #[test]
+    fn a_zoomed_view_draws_the_frame_itself() {
+        assert!(
+            !super::draws_frame(true, 1.0, true),
+            "the shell freeze shows through"
+        );
+        assert!(super::draws_frame(true, 2.0, true));
+        assert!(!super::draws_frame(true, 2.0, false), "nothing to draw yet");
+        assert!(super::draws_frame(false, 1.0, true));
+        assert!(!super::draws_frame(false, 1.0, false));
+    }
+
+    #[test]
     fn a_huge_zoomed_export_is_capped() {
         assert_eq!(super::scaled_size(60.0, 24.0, 4.0), (240, 96));
         let (w, h) = super::scaled_size(3840.0, 2160.0, 4.0);
@@ -4569,15 +4836,19 @@ mod tests {
     }
 
     #[test]
-    fn the_export_is_resized_by_the_scale() {
+    fn the_export_is_resized_to_the_planned_size() {
         let img = image::RgbaImage::from_pixel(100, 50, image::Rgba([10, 20, 30, 255]));
-        assert_eq!(super::scaled(img.clone(), 0.5).dimensions(), (50, 25));
-        assert_eq!(super::scaled(img.clone(), 2.0).dimensions(), (200, 100));
-        let same = super::scaled(img.clone(), 1.0);
+        assert_eq!(
+            super::resized_to(img.clone(), (50, 25)).dimensions(),
+            (50, 25)
+        );
+        assert_eq!(
+            super::resized_to(img.clone(), (200, 100)).dimensions(),
+            (200, 100)
+        );
+        let same = super::resized_to(img.clone(), (100, 50));
         assert_eq!(same, img);
-        let tiny = image::RgbaImage::new(3, 3);
-        assert_eq!(super::scaled(tiny, 0.25).dimensions(), (1, 1));
-        let half = super::scaled(img, 0.5);
+        let half = super::resized_to(img, (50, 25));
         assert_eq!(
             half.get_pixel(25, 12).0,
             [10, 20, 30, 255],
