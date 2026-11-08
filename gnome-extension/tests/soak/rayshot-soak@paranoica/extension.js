@@ -117,14 +117,19 @@ export default class SoakDriver extends Extension {
 
     disable() {}
 
-    _start() {
+    _start(waited = 0) {
         this._rayshot = Main.extensionManager.lookup('rayshot@paranoica')?.stateObj;
+        if (!this._rayshot && waited < 20000) {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 250, () => {
+                this._start(waited + 250);
+                return GLib.SOURCE_REMOVE;
+            });
+            return;
+        }
         if (!this._rayshot) {
             this._finish('rayshot extension not loaded');
             return;
         }
-        // The NVIDIA driver now and then segfaults while a spare opens its
-        // windows; such a session falls back to one-shot and is counted.
         const onServerExit = this._rayshot._onServerExit.bind(this._rayshot);
         this._rayshot._onServerExit = (server, epoch) => {
             if (server.proc.get_if_signaled() && server.proc.get_term_sig() === 11) {
