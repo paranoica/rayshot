@@ -19,6 +19,9 @@ const KEY_LEFTCTRL = 29;
 const KEY_LEFTSHIFT = 42;
 const KEY_C = 46;
 const KEY_K = 37;
+const KEY_0 = 11;
+const KEY_MINUS = 12;
+const KEY_EQUAL = 13;
 
 const WANTS = {
     plain: [1, 1],
@@ -174,6 +177,8 @@ export class Displays {
                     this._russian(next);
                 else if (kind === 'fullscreen')
                     this._fullscreen(next);
+                else if (kind === 'export-scale')
+                    this._exportScale(next);
                 else if (kind === 'rebound')
                     this._rebound(next);
                 else if (kind === 'shape-enter')
@@ -495,6 +500,49 @@ export class Displays {
                     `want ${hex(fill)}`);
             }, fail)), fail);
         }), () => fail('the helper window never went fullscreen'));
+    }
+
+    _exportScale(next) {
+        const name = 'ctrl minus and ctrl zero set the exported size';
+        const r = this._r();
+        const k = this._d._keyboard;
+        const now = () => GLib.get_monotonic_time();
+        const ctrl = code => {
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
+        };
+        const enter = () => {
+            k.notify_keyval(now(), Clutter.KEY_Return, Clutter.KeyState.PRESSED);
+            k.notify_keyval(now(), Clutter.KEY_Return, Clutter.KeyState.RELEASED);
+        };
+        const fail = why => this._fail(name, why, next);
+        const run = (keys, want, then) => this._capture({x: 300, y: 300}, overlay => {
+            try {
+                overlay.proc.get_stdin_pipe().write_all(
+                    new TextEncoder().encode(`select ${overlay.session} 200 200 400 300\n`), null);
+            } catch (e) {
+                fail(`cannot select: ${e.message}`);
+                return;
+            }
+            St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, 'rayshot-soak-marker');
+            const scale = overlay.texture.get_width() / global.stage.width;
+            const target = want.map(v => Math.max(1, Math.round(v * scale)));
+            sequence([...keys.map(code => () => ctrl(code)), enter], () => waitFor(() => !r._busy,
+                () => later(400, () => readPng(pb => {
+                    const got = [pb.get_width(), pb.get_height()];
+                    if (got[0] !== target[0] || got[1] !== target[1]) {
+                        fail(`after ${keys.length} keys the png is ${got.join('x')}, want ${target.join('x')}`);
+                        return;
+                    }
+                    then(got);
+                }, fail)), () => fail('enter did not copy')));
+        }, fail);
+        run([KEY_MINUS, KEY_MINUS], [100, 50], half => run([KEY_EQUAL, KEY_EQUAL, KEY_EQUAL, KEY_0], [200, 100], full => {
+            this._d._result(name, true, `two ctrl minus gave ${half.join('x')}, ctrl zero after ctrl plus gave ${full.join('x')}`);
+            next();
+        }));
     }
 
     _rebound(next) {
