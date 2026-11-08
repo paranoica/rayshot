@@ -252,12 +252,16 @@ export class Displays {
                     this._russian(next);
                 else if (kind === 'fullscreen')
                     this._fullscreen(next);
-                else if (kind === 'export-scale')
-                    this._exportScale(next);
+                else if (kind === 'zoom-export')
+                    this._zoomExport(next);
                 else if (kind === 'zoom-draw')
-                    this._zoomDraw(null, next);
+                    this._zoomDraw({}, next);
                 else if (kind === 'zoom-pan')
-                    this._zoomDraw({x: -100, y: -50}, next);
+                    this._zoomDraw({pan: {x: -100, y: -50}}, next);
+                else if (kind === 'zoom-middle')
+                    this._zoomDraw({middle: true}, next);
+                else if (kind === 'zoom-seam')
+                    this._zoomSeam(next);
                 else if (kind === 'rebound')
                     this._rebound(next);
                 else if (kind === 'shape-enter')
@@ -582,7 +586,7 @@ export class Displays {
         }), () => fail('the helper window never went fullscreen'));
     }
 
-    _exportScale(next) {
+    _zoomExport(next) {
         const name = 'the zoom sets the exported size';
         const r = this._r();
         const k = this._d._keyboard;
@@ -630,10 +634,12 @@ export class Displays {
                     })))));
     }
 
-    _zoomDraw(pan, next) {
+    _zoomDraw({pan = null, middle = false}, next) {
         const name = pan
             ? 'a rectangle drawn at 200 % after a middle drag lands where it was drawn'
-            : 'a rectangle drawn at 200 % lands where it was drawn';
+            : middle
+                ? 'a middle press while drawing at 200 % does not move the view'
+                : 'a rectangle drawn at 200 % lands where it was drawn';
         const r = this._r();
         const fail = why => this._fail(name, why, next);
         const k = this._d._keyboard;
@@ -661,13 +667,13 @@ export class Displays {
             }
             const p = this._device();
             const move = at => p.notify_absolute_motion(now(), at.x, at.y);
-            const middle = state => p.notify_button(now(), Clutter.BUTTON_MIDDLE, state);
+            const wheel = state => p.notify_button(now(), Clutter.BUTTON_MIDDLE, state);
             const grab = {x: 1000, y: 700};
             const panning = pan ? [
                 () => move(grab),
-                () => middle(Clutter.ButtonState.PRESSED),
+                () => wheel(Clutter.ButtonState.PRESSED),
                 ...[1, 2, 3, 4].map(i => () => move({x: grab.x + pan.x * i / 4, y: grab.y + pan.y * i / 4})),
-                () => middle(Clutter.ButtonState.RELEASED),
+                () => wheel(Clutter.ButtonState.RELEASED),
             ] : [];
             const shift = pan ?? {x: 0, y: 0};
             const view = {x: 150 - shift.x / 2, y: 150 - shift.y / 2};
@@ -676,7 +682,7 @@ export class Displays {
             const bottom = out(to.y, 'y');
             const left = out(anchor.x, 'x');
             const top = out(anchor.y, 'y');
-            const wrong = pan ? out(to.x, 'x') - pan.x : 600 * s;
+            const wrong = pan ? right + pan.x * s : 600 * s;
             sequence([
                 () => {},
                 () => ctrl(KEY_EQUAL),
@@ -686,7 +692,9 @@ export class Displays {
                 () => move(anchor),
                 () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
                 () => move({x: 400, y: 350}),
+                ...middle ? [() => wheel(Clutter.ButtonState.PRESSED), () => move({x: 450, y: 380})] : [],
                 () => move(to),
+                ...middle ? [() => wheel(Clutter.ButtonState.RELEASED)] : [],
                 () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED),
                 () => tap(Clutter.KEY_Return),
             ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
@@ -707,6 +715,53 @@ export class Displays {
                     ? `png ${pb.get_width()}x${pb.get_height()}, right and bottom edges where they were drawn`
                     : `right edge ${hex(edgeAt)}, bottom edge ${hex(bottomAt)}, inside ${hex(inside)}, ` +
                       `where a wrong edge would be ${hex(elsewhere)}`);
+                next();
+            }, fail)), () => fail('enter did not copy')));
+        }, fail);
+    }
+
+    _zoomSeam(next) {
+        const name = 'a zoomed selection stops at the edge of the zoomed view';
+        const r = this._r();
+        const fail = why => this._fail(name, why, next);
+        const k = this._d._keyboard;
+        const now = () => GLib.get_monotonic_time();
+        const tap = v => {
+            k.notify_keyval(now(), v, Clutter.KeyState.PRESSED);
+            k.notify_keyval(now(), v, Clutter.KeyState.RELEASED);
+        };
+        const ctrl = code => {
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.PRESSED);
+            k.notify_key(now(), code, Clutter.KeyState.RELEASED);
+            k.notify_key(now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED);
+        };
+        const anchor = {x: 300, y: 300};
+        const width = global.display.get_monitor_geometry(0).width;
+        this._capture(anchor, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            const p = this._device();
+            const move = at => p.notify_absolute_motion(now(), at.x, at.y);
+            const viewRight = 300 - 300 / width * (width / 2) + width / 2;
+            sequence([
+                () => {},
+                () => ctrl(KEY_EQUAL),
+                () => ctrl(KEY_EQUAL),
+                () => tap(Clutter.KEY_s),
+                () => move({x: 400, y: 400}),
+                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.PRESSED),
+                () => move({x: 1000, y: 500}),
+                () => move({x: width - 20, y: 550}),
+                () => move({x: width + 180, y: 600}),
+                () => p.notify_button(now(), Clutter.BUTTON_PRIMARY, Clutter.ButtonState.RELEASED),
+                () => tap(Clutter.KEY_Return),
+            ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                const want = [Math.round((viewRight - 350) * 2 * s), Math.round(100 * 2 * s)];
+                const got = [pb.get_width(), pb.get_height()];
+                const ok = Math.abs(got[0] - want[0]) <= 2 && Math.abs(got[1] - want[1]) <= 2;
+                this._d._result(name, ok, ok
+                    ? `png ${got.join('x')}, the edge stayed at the view`
+                    : `png ${got.join('x')}, want ${want.join('x')}`);
                 next();
             }, fail)), () => fail('enter did not copy')));
         }, fail);
