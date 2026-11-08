@@ -4102,9 +4102,10 @@ fn colour_panel(
     chosen
 }
 
-fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
+fn toggle(ui: &mut egui::Ui, on: &mut bool, id: egui::Id) -> egui::Response {
     let size = egui::vec2(34.0, 18.0);
-    let (rect, mut resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let mut resp = ui.interact(rect, id, egui::Sense::click());
     if resp.clicked() {
         *on = !*on;
         resp.mark_changed();
@@ -4207,44 +4208,74 @@ fn note_row(
     bindings: &mut crate::keys::Bindings,
     note: &mut Option<RebindNote>,
 ) {
-    let warn = ui.visuals().warn_fg_color;
-    let indent = SETTINGS_ICON_W + ui.spacing().item_spacing.x;
-    let width = settings_width(ui) - indent;
-    let text = match note.clone() {
+    let (lead, rest, swap) = match note.clone() {
         Some(RebindNote::Conflict {
             target,
             chord,
             other,
-        }) if target == command => Some((
-            format!("{} is used by {}", chord.label(), other.label()),
+        }) if target == command => (
+            Some(chord.label()),
+            format!("is taken by {}", other.label()),
             Some((target, other)),
-        )),
-        Some(RebindNote::Refused { target, why }) if target == command => Some((why, None)),
-        _ => None,
+        ),
+        Some(RebindNote::Refused { target, why }) if target == command => (None, why, None),
+        _ => return,
     };
-    let Some((text, swap)) = text else {
-        return;
-    };
+    let warn = ui.visuals().warn_fg_color;
+    let indent = SETTINGS_ICON_W + ui.spacing().item_spacing.x;
+    let inner = settings_width(ui) - indent - 2.0 * 8.0 - 2.0;
+    ui.add_space(2.0);
     ui.horizontal(|ui| {
         ui.add_space(indent);
-        ui.allocate_ui_with_layout(
-            egui::vec2(width, 0.0),
-            egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
-            |ui| {
-                ui.set_width(width);
-                ui.add(egui::Label::new(egui::RichText::new(text).small().color(warn)).wrap());
-                if let Some((target, other)) = swap {
-                    if ui.small_button("Swap").clicked() {
-                        bindings.swap(target, other);
-                        *note = None;
+        egui::Frame::new()
+            .fill(warn.gamma_multiply(0.12))
+            .stroke(egui::Stroke::new(1.0, warn.gamma_multiply(0.45)))
+            .corner_radius(6)
+            .inner_margin(egui::Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_width(inner);
+                ui.vertical(|ui| {
+                    ui.set_width(inner);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if let Some(lead) = lead {
+                            ui.label(egui::RichText::new(lead).monospace().strong().color(warn));
+                        }
+                        ui.label(egui::RichText::new(rest).color(warn));
+                    });
+                    if let Some((target, other)) = swap {
+                        ui.add_space(4.0);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(inner, 22.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let swap = egui::Button::new("Swap")
+                                    .fill(ui.visuals().selection.bg_fill)
+                                    .min_size(egui::vec2(64.0, 22.0));
+                                if ui
+                                    .add(swap)
+                                    .on_hover_text("Give each command the other's key")
+                                    .clicked()
+                                {
+                                    bindings.swap(target, other);
+                                    *note = None;
+                                }
+                                if ui
+                                    .add(
+                                        egui::Button::new("Cancel")
+                                            .min_size(egui::vec2(64.0, 22.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    *note = None;
+                                }
+                            },
+                        );
                     }
-                    if ui.small_button("Cancel").clicked() {
-                        *note = None;
-                    }
-                }
-            },
-        );
+                });
+            });
     });
+    ui.add_space(2.0);
 }
 
 fn settings_panel(
@@ -4279,7 +4310,9 @@ fn settings_panel(
                 });
                 key_cell(ui, command, bindings, rebinding, note);
                 settings_cell(ui, SETTINGS_TOGGLE_W, |ui| match on {
-                    Some(on) => toggle(ui, on).changed(),
+                    Some(on) => {
+                        toggle(ui, on, egui::Id::new(("rayshot-toggle", command.name()))).changed()
+                    }
                     None => false,
                 })
             })
@@ -4322,10 +4355,10 @@ fn settings_panel(
                 ui.label(if open { p::CARET_DOWN } else { p::CARET_RIGHT });
             });
             ui.add(
-                egui::Button::new(egui::RichText::new("Zoom keys").strong())
-                    .frame(false)
-                    .min_size(egui::vec2(SETTINGS_LABEL_W, SETTINGS_ROW_H)),
+                egui::Label::new(egui::RichText::new("Zoom keys").strong())
+                    .sense(egui::Sense::click()),
             )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         })
         .inner;
@@ -4832,6 +4865,63 @@ mod tests {
                 out.push(r.rect.left())
             }
             _ => {}
+        }
+    }
+
+    fn toggle_parts(shape: &egui::Shape, tracks: &mut Vec<egui::Rect>, knobs: &mut Vec<f32>) {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| toggle_parts(s, tracks, knobs)),
+            egui::Shape::Rect(r)
+                if (r.rect.width() - 34.0).abs() < 0.5 && (r.rect.height() - 18.0).abs() < 0.5 =>
+            {
+                tracks.push(r.rect)
+            }
+            egui::Shape::Circle(c) if (c.radius - 6.0).abs() < 0.01 => knobs.push(c.center.x),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn toggles_do_not_replay_their_animation_when_a_note_appears() {
+        use crate::keys::{Bindings, Chord, Command};
+        use crate::scene::Tool;
+        let ctx = egui::Context::default();
+        let mut hidden = vec![Tool::Text];
+        let mut hidden_buttons = Vec::new();
+        let mut bindings = Bindings::defaults();
+        let mut rebinding = None;
+        let mut note = None;
+        let mut frame = |note: &mut Option<super::RebindNote>, bindings: &mut Bindings| {
+            let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                super::settings_panel(
+                    ui,
+                    &mut hidden,
+                    &mut hidden_buttons,
+                    bindings,
+                    &mut rebinding,
+                    note,
+                );
+            });
+            let (mut tracks, mut knobs) = (Vec::new(), Vec::new());
+            for clipped in &out.shapes {
+                toggle_parts(&clipped.shape, &mut tracks, &mut knobs);
+            }
+            (tracks, knobs)
+        };
+        for _ in 0..30 {
+            frame(&mut note, &mut bindings);
+        }
+        note = Some(super::RebindNote::Conflict {
+            target: Command::Tool(Tool::Pen),
+            chord: Chord::parse("Ctrl+S").unwrap(),
+            other: Command::Save,
+        });
+        let _ = bindings.assign(Command::Tool(Tool::Line), Chord::parse("Q").unwrap());
+        let (tracks, knobs) = frame(&mut note, &mut bindings);
+        assert_eq!(tracks.len(), knobs.len());
+        for (t, k) in tracks.iter().zip(&knobs) {
+            let at_end = (k - (t.left() + 9.0)).abs() < 0.5 || (k - (t.right() - 9.0)).abs() < 0.5;
+            assert!(at_end, "knob at {k} in {t:?}");
         }
     }
 
