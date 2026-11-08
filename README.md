@@ -63,11 +63,19 @@ and Ubuntu, `tesseract` and `tesseract-langpack-rus` on Fedora.
 | `E` | ellipse | | `Esc` | cancel |
 | `N` | numbered markers | | mouse wheel | line width |
 | `M` | highlighter | | `1`–`9` | colours |
-| `T` | text | | | |
-| `X` / `B` | pixelate / blur | | | |
-| `I` | colour picker, copies `#RRGGBB` | | | |
+| `T` | text | | `Ctrl+=` / `Ctrl+-` | export larger / smaller |
+| `X` / `B` | pixelate / blur | | `Ctrl+0` | export at 100 % |
+| `I` | colour picker, copies `#RRGGBB` | | `Z` | loupe on / off |
 
 Hold **Shift** while drawing for straight lines at 45° steps, squares and circles.
+
+**Export size.** `Ctrl+=` and `Ctrl+-` step the copied or saved picture through
+25, 50, 75, 100, 150 and 200 %; the size label shows what you will get, for
+example `1920 × 1080 → 960 × 540`. Each capture starts at 100 %.
+
+**Loupe.** While you drag or resize the selection, a magnified view of the
+pixels under the cursor shows next to it, with their coordinates. `Z` hides or
+shows it for the current capture.
 
 **Editing what you drew.** With `S`, click a shape: drag it from anywhere in
 its dashed frame, or drag a round handle to resize it. While it is selected,
@@ -81,7 +89,9 @@ drawings are left out, but blur and pixelate are applied first, so hidden text
 stays hidden.
 
 The gear on the toolbar picks which tools and buttons are shown; hidden ones
-keep their keys. Colour, width and that choice are remembered.
+keep their keys. Click a key there to change it: if another command already has
+it, you can swap the two. `Esc`, `Enter`, `1`–`9`, undo, redo and `Ctrl+D` stay
+fixed. Colour, width, keys and that choice are remembered.
 
 **Where files go.** Copying keeps a temporary copy in `$XDG_RUNTIME_DIR/rayshot/`
 (in RAM, pruned after a day). Saving writes `rayshot-DD-MM-YYYY-HH-MM-SS.png`
