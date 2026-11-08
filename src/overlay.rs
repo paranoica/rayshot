@@ -232,7 +232,7 @@ struct OverlayApp {
     bindings: crate::keys::Bindings,
     zoom: f32,
     pan_drag: bool,
-    pan_start: (egui::Vec2, egui::Vec2),
+    pan_start: (egui::Vec2, egui::Vec2, egui::Pos2),
     sel_zoom: f32,
     sel_offset: egui::Vec2,
     lens_drag: bool,
@@ -287,7 +287,7 @@ impl OverlayApp {
             bindings: prefs.keys,
             zoom: 1.0,
             pan_drag: false,
-            pan_start: (egui::Vec2::ZERO, egui::Vec2::ZERO),
+            pan_start: (egui::Vec2::ZERO, egui::Vec2::ZERO, egui::Pos2::ZERO),
             sel_zoom: 1.0,
             sel_offset: egui::Vec2::ZERO,
             lens_drag: false,
@@ -355,9 +355,10 @@ enum TextOutcome {
 }
 
 fn apply_text(scene: &mut crate::scene::Scene, d: TextDraft) -> TextOutcome {
-    let text = (!d.buf.trim().is_empty()).then_some(crate::scene::Shape::Text {
+    let kept = d.buf.trim_end_matches(['\n', '\r']).to_string();
+    let text = (!kept.trim().is_empty()).then_some(crate::scene::Shape::Text {
         pos: d.pos,
-        text: d.buf,
+        text: kept,
         color: d.color,
         size: d.size,
     });
@@ -534,6 +535,14 @@ fn text_selection(galley: &egui::Galley, start: usize, end: usize) -> Vec<egui::
             })
         })
         .collect()
+}
+
+fn lens_owns(lens: &Lens, shape: &crate::scene::Shape) -> bool {
+    match shape {
+        crate::scene::Shape::Text { pos, .. } => lens.inner.contains(*pos),
+        _ => selection_outline(shape, &|f: egui::Pos2| f, 1.0)
+            .is_some_and(|r| lens.inner.contains(r.center())),
+    }
 }
 
 fn draws_frame(see_through: bool, zoom: f32, has_texture: bool) -> bool {
@@ -821,10 +830,15 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             }
         }
 
-        if let WindowEvent::MouseInput {
-            state: ElementState::Released,
-            ..
-        } = event
+        let key = matches!(event, WindowEvent::KeyboardInput { .. });
+        if (key
+            || matches!(
+                event,
+                WindowEvent::MouseInput {
+                    state: ElementState::Released,
+                    ..
+                }
+            ))
             && self.windows[idx].unrendered_input
         {
             if let Err(e) = self.render_window(idx) {
@@ -832,6 +846,7 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             }
             self.windows[idx].unrendered_input = false;
         }
+        let typing_key = key && self.text_edit.is_some();
 
         {
             let win = &mut self.windows[idx];
@@ -839,12 +854,14 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             if resp.repaint {
                 win.window.request_redraw();
             }
-            if matches!(
-                event,
-                WindowEvent::CursorMoved { .. }
-                    | WindowEvent::MouseInput { .. }
-                    | WindowEvent::MouseWheel { .. }
-            ) {
+            if typing_key
+                || matches!(
+                    event,
+                    WindowEvent::CursorMoved { .. }
+                        | WindowEvent::MouseInput { .. }
+                        | WindowEvent::MouseWheel { .. }
+                )
+            {
                 win.unrendered_input = true;
             }
         }
@@ -1575,12 +1592,10 @@ impl OverlayApp {
             };
             if panning && resp.drag_started() {
                 let lens_from = lens.filter(|_| lens_drag).map_or(egui::Vec2::ZERO, |l| l.offset());
-                pan_start = (lens_from, view.center().to_vec2());
+                pan_start = (lens_from, view.center().to_vec2(), press_pos.unwrap_or_default());
             }
-            if let (true, true, Some(from), Some(now)) =
-                (panning, resp.dragged(), press_pos, cursor_pos)
-            {
-                let mut moved = now - from;
+            if let (true, true, Some(now)) = (panning, resp.dragged(), cursor_pos) {
+                let mut moved = now - pan_start.2;
                 if let (true, Some(l)) = (lens_drag, lens) {
                     let want = pan_start.0 - moved / (scale * l.z);
                     if let Some(next) = Lens::new(l.outer, l.z, want) {
@@ -1599,12 +1614,7 @@ impl OverlayApp {
                 active_lens.map_or(q, |l| l.into_frame(q))
             };
             let tool_scale = active_lens.map_or(scale, |l| scale * l.z);
-            let owner_of = |i: usize| {
-                lens.filter(|l| {
-                    selection_outline(&shapes[i], &|f: egui::Pos2| f, 1.0)
-                        .is_some_and(|r| l.inner.contains(r.center()))
-                })
-            };
+            let owner_of = |i: usize| lens.filter(|l| lens_owns(l, &shapes[i]));
             let owner_screen =
                 |i: usize, f: egui::Pos2| plain_to_screen(owner_of(i).map_or(f, |l| l.out_of_frame(f)));
             let through = |p: egui::Pos2, lensed: bool| {
@@ -2212,10 +2222,7 @@ impl OverlayApp {
             if let Some(i) = selected.filter(|&i| tool == Tool::Select && Some(i) != editing_index)
             {
                 let shape = shape_now(i);
-                let owner = lens_now.filter(|l| {
-                    selection_outline(shape, &|f: egui::Pos2| f, 1.0)
-                        .is_some_and(|r| l.inner.contains(r.center()))
-                });
+                let owner = lens_now.filter(|l| lens_owns(l, shape));
                 let os = |f: egui::Pos2| plain_to_screen(owner.map_or(f, |l| l.out_of_frame(f)));
                 let oscale = owner.map_or(scale, |l| scale * l.z);
                 if let Some(r) = selection_outline(shape, &os, oscale) {
@@ -2330,7 +2337,7 @@ impl OverlayApp {
                                             pressed: true,
                                             modifiers,
                                             ..
-                                        } if !modifiers.shift && !modifiers.ctrl && !modifiers.alt
+                                        } if !modifiers.shift
                                     )
                                 });
                                 at.map(|k| i.events.remove(k)).is_some()
@@ -2338,7 +2345,16 @@ impl OverlayApp {
                             if enter {
                                 text_lost_focus = true;
                             }
+                            let edit_id = egui::Id::new("rayshot-text-input");
+                            let grip_id = egui::Id::new("rayshot-text-grip");
+                            if !enter
+                                && !ui.ctx().is_being_dragged(grip_id)
+                                && !ui.memory(|m| m.has_focus(edit_id))
+                            {
+                                ui.memory_mut(|m| m.request_focus(edit_id));
+                            }
                             let output = egui::TextEdit::multiline(buf)
+                                .id(edit_id)
                                 .desired_rows(1)
                                 .return_key(Some(egui::KeyboardShortcut::new(
                                     egui::Modifiers::SHIFT,
@@ -2350,6 +2366,9 @@ impl OverlayApp {
                                 .text_color(egui::Color32::TRANSPARENT)
                                 .show(ui);
                             let r = output.response.clone();
+                            if enter {
+                                r.surrender_focus();
+                            }
                             let cursor_range = output.cursor_range;
                             owner_text_sel = cursor_range.map(|cr| {
                                 let rg = cr.as_sorted_char_range();
@@ -2403,11 +2422,7 @@ impl OverlayApp {
                             ));
                             let grip =
                                 egui::Rect::from_center_size(bb.left_top(), egui::vec2(12.0, 12.0));
-                            let gh = ui.interact(
-                                grip,
-                                egui::Id::new("rayshot-text-grip"),
-                                egui::Sense::drag(),
-                            );
+                            let gh = ui.interact(grip, grip_id, egui::Sense::drag());
                             ui.painter()
                                 .rect_filled(grip, 2, egui::Color32::from_white_alpha(210));
                             ui.painter().rect_stroke(
@@ -2421,9 +2436,6 @@ impl OverlayApp {
                             }
                             if gh.dragged() {
                                 text_pos_shift += gh.drag_delta() / tscale;
-                            }
-                            if !r.has_focus() && !r.lost_focus() && !gh.dragged() {
-                                r.request_focus();
                             }
                             if r.lost_focus() {
                                 text_lost_focus = true;
@@ -4705,6 +4717,42 @@ mod tests {
             replaces,
             lensed: false,
         }
+    }
+
+    #[test]
+    fn trailing_empty_lines_are_dropped_from_committed_text() {
+        let mut scene = crate::scene::Scene::default();
+        super::apply_text(&mut scene, draft("ab\n\ncd\n\n", None));
+        match &scene.shapes()[0] {
+            crate::scene::Shape::Text { text, .. } => assert_eq!(text, "ab\n\ncd"),
+            other => panic!("{other:?}"),
+        }
+        let mut empty = crate::scene::Scene::default();
+        super::apply_text(&mut empty, draft("\n\n", None));
+        assert!(empty.shapes().is_empty());
+    }
+
+    #[test]
+    fn text_belongs_to_the_lens_by_where_it_starts() {
+        let outer = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(400.0, 400.0));
+        let lens = super::Lens::new(outer, 2.0, egui::Vec2::ZERO).unwrap();
+        let text = |x: f32, y: f32, t: &str| crate::scene::Shape::Text {
+            pos: egui::pos2(x, y),
+            text: t.into(),
+            color: egui::Color32::RED,
+            size: 24.0,
+        };
+        assert!(super::lens_owns(&lens, &text(110.0, 280.0, "a\nb\nc\nd")));
+        assert!(!super::lens_owns(
+            &lens,
+            &text(95.0, 150.0, "wide enough to reach in")
+        ));
+        let rect = crate::scene::Shape::Rect {
+            rect: egui::Rect::from_min_max(egui::pos2(150.0, 150.0), egui::pos2(250.0, 250.0)),
+            color: egui::Color32::RED,
+            width: 4.0,
+        };
+        assert!(super::lens_owns(&lens, &rect));
     }
 
     #[test]
