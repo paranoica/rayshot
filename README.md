@@ -96,8 +96,8 @@ stays hidden.
 
 The gear on the toolbar picks which tools and buttons are shown; hidden ones
 keep their keys. Click a key there to change it: if another command already has
-it, you can swap the two. `Esc`, `Enter`, `1`–`9`, undo, redo and `Ctrl+D` stay
-fixed. Colour, width, keys and that choice are remembered.
+it, you can swap the two. `Esc`, `Enter`, `1`–`9`, `Delete`, the arrows, undo,
+redo and `Ctrl+D` stay fixed. Colour, width, keys and that choice are remembered.
 
 **Where files go.** Copying keeps a temporary copy in `$XDG_RUNTIME_DIR/rayshot/`
 (in RAM, pruned after a day). Saving writes `rayshot-DD-MM-YYYY-HH-MM-SS.png`
