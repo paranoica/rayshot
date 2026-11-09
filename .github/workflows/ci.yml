@@ -7,11 +7,13 @@ on:
       - '**.md'
       - 'docs/**'
       - 'assets/**'
+      - 'packaging/**'
   pull_request:
     paths-ignore:
       - '**.md'
       - 'docs/**'
       - 'assets/**'
+      - 'packaging/**'
 
 permissions:
   contents: read
