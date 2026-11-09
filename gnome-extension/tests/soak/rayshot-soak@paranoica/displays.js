@@ -1322,10 +1322,8 @@ export class Displays {
                 },
                 () => tap(Clutter.KEY_a),
                 () => tap(Clutter.KEY_b),
-                () => {
-                    p.notify_absolute_motion(now(), spot.x + 3, spot.y + 3);
-                    later(1, () => tap(keyval));
-                },
+                () => p.notify_absolute_motion(now(), spot.x + 3, spot.y + 3),
+                () => tap(keyval),
             ], () => later(800, () => {
                 if (!r._busy) {
                     this._d._result(name, false, 'the editor closed');
