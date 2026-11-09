@@ -485,7 +485,8 @@ fn text_box(pos: egui::Pos2, text: &str, size: f32) -> egui::Rect {
         .unwrap_or(0);
     let lines = text.split('\n').count().max(1);
     let w = (widest.max(1) as f32) * size * 0.55;
-    egui::Rect::from_min_size(pos, egui::vec2(w, size * 1.3 * lines as f32))
+    let line = (size * 1.15).round();
+    egui::Rect::from_min_size(pos, egui::vec2(w, line * lines as f32 + size * 0.15))
 }
 
 pub fn next_counter(shapes: &[Shape]) -> u32 {
@@ -835,6 +836,32 @@ pub fn paint(
 mod tests {
     use super::*;
     use egui::{Color32, pos2};
+
+    #[test]
+    fn the_text_hit_box_fits_the_drawn_lines() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for size in [16.0f32, 20.0, 24.0, 48.0] {
+                for n in [1usize, 2, 5] {
+                    let text = vec!["Hg"; n].join("\n");
+                    let drawn = ui
+                        .painter()
+                        .layout_no_wrap(
+                            text.clone(),
+                            egui::FontId::proportional(size),
+                            Color32::WHITE,
+                        )
+                        .size()
+                        .y;
+                    let hit = text_box(pos2(0.0, 0.0), &text, size).height();
+                    assert!(
+                        hit >= drawn && hit <= drawn + size * 0.2,
+                        "size {size}, {n} lines: hit {hit}, drawn {drawn}"
+                    );
+                }
+            }
+        });
+    }
 
     #[test]
     fn several_lines_of_text_are_hit_on_every_line() {
