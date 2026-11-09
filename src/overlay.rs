@@ -238,6 +238,9 @@ struct OverlayApp {
     lens_drag: bool,
     rebinding: Option<crate::keys::Command>,
     held_after_capture: Option<KeyCode>,
+    wheel_acc: f32,
+    wheel_mods: (bool, bool, bool),
+    wheel_quiet_until: Option<std::time::Instant>,
     rebind_note: Option<RebindNote>,
     show_settings: bool,
     show_colours: bool,
@@ -293,6 +296,9 @@ impl OverlayApp {
             lens_drag: false,
             rebinding: None,
             held_after_capture: None,
+            wheel_acc: 0.0,
+            wheel_mods: (false, false, false),
+            wheel_quiet_until: None,
             rebind_note: None,
             show_settings: false,
             show_colours: false,
@@ -828,6 +834,12 @@ impl ApplicationHandler<UserEvent> for OverlayApp {
             } else {
                 self.held_after_capture = None;
             }
+        }
+
+        if let WindowEvent::MouseWheel { delta, .. } = &event
+            && self.wheel_hotkey(event_loop, idx, *delta)
+        {
+            return;
         }
 
         let key = matches!(event, WindowEvent::KeyboardInput { .. });
@@ -3374,6 +3386,99 @@ impl OverlayApp {
         self.zoom = next;
     }
 
+    fn wheel_hotkey(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        idx: usize,
+        delta: winit::event::MouseScrollDelta,
+    ) -> bool {
+        let dy = match delta {
+            winit::event::MouseScrollDelta::LineDelta(_, y) => y * SCROLL_STEP,
+            winit::event::MouseScrollDelta::PixelDelta(p) => {
+                (p.y / self.windows[idx].window.scale_factor()) as f32
+            }
+        };
+        if dy == 0.0 {
+            return false;
+        }
+        if self.text_edit.is_some() || self.text_has_keyboard() {
+            self.wheel_acc = 0.0;
+            self.rebinding = None;
+            return false;
+        }
+        let (ctrl, shift, alt) = (
+            self.modifiers.control_key(),
+            self.modifiers.shift_key(),
+            self.modifiers.alt_key(),
+        );
+        if let Some(target) = self.rebinding {
+            self.capture_wheel(target, dy > 0.0);
+            return true;
+        }
+        if self
+            .wheel_quiet_until
+            .is_some_and(|t| std::time::Instant::now() < t)
+        {
+            self.wheel_acc = 0.0;
+            return true;
+        }
+        if self.bindings.wheel(ctrl, shift, alt, dy > 0.0).is_none() {
+            self.wheel_acc = 0.0;
+            return false;
+        }
+        if self.wheel_mods != (ctrl, shift, alt) {
+            self.wheel_acc = 0.0;
+            self.wheel_mods = (ctrl, shift, alt);
+        }
+        let notches = wheel_notches(&mut self.wheel_acc, dy);
+        if let Some(command) = self.bindings.wheel(ctrl, shift, alt, notches > 0) {
+            for _ in 0..notches.unsigned_abs() {
+                self.run_command(event_loop, command);
+            }
+        }
+        self.request_redraw_all();
+        true
+    }
+
+    fn capture_wheel(&mut self, target: crate::keys::Command, up: bool) {
+        use crate::keys::{Assign, Chord, Key as Bindable};
+        self.request_redraw_all();
+        let chord = Chord {
+            ctrl: self.modifiers.control_key(),
+            shift: self.modifiers.shift_key(),
+            alt: self.modifiers.alt_key(),
+            key: if up {
+                Bindable::WheelUp
+            } else {
+                Bindable::WheelDown
+            },
+        };
+        let quiet = Some(std::time::Instant::now() + WHEEL_QUIET);
+        self.wheel_acc = 0.0;
+        match self.bindings.assign(target, chord) {
+            Assign::Done => {
+                self.rebinding = None;
+                self.rebind_note = None;
+                self.wheel_quiet_until = quiet;
+            }
+            Assign::Conflict(other) => {
+                self.rebinding = None;
+                self.wheel_quiet_until = quiet;
+                self.rebind_note = Some(RebindNote::Conflict {
+                    target,
+                    chord,
+                    other,
+                });
+            }
+            Assign::Reserved(why) => {
+                self.rebind_note = Some(RebindNote::Refused {
+                    target,
+                    why: why.into(),
+                });
+            }
+        }
+    }
+
     fn capture_rebind(&mut self, target: crate::keys::Command, event: &winit::event::KeyEvent) {
         use crate::keys::{Assign, Chord, Key as Bindable};
         self.request_redraw_all();
@@ -3591,6 +3696,20 @@ use crate::prefs::{Button, WIDTH_RANGE, hex};
 const TOAST_FOR: std::time::Duration = std::time::Duration::from_millis(1500);
 
 const SCROLL_STEP: f32 = 30.0;
+const WHEEL_QUIET: std::time::Duration = std::time::Duration::from_millis(400);
+
+fn wheel_notches(acc: &mut f32, delta: f32) -> i32 {
+    if delta == 0.0 {
+        return 0;
+    }
+    if *acc != 0.0 && acc.signum() != delta.signum() {
+        *acc = 0.0;
+    }
+    *acc += delta;
+    let notches = (*acc / SCROLL_STEP).trunc();
+    *acc -= notches * SCROLL_STEP;
+    notches as i32
+}
 
 fn scrolled_width(width: f32, acc: &mut f32, delta: f32) -> f32 {
     *acc += delta;
@@ -4205,7 +4324,9 @@ fn key_cell(
             .inner;
         let key_rect = key.rect;
         if key
-            .on_hover_text("Click, then press the new key. Esc cancels.")
+            .on_hover_text(
+                "Click, then press the new key or turn the wheel with Ctrl, Shift or Alt. Esc cancels.",
+            )
             .clicked()
         {
             *rebinding = (!capturing).then_some(command);
@@ -5467,6 +5588,42 @@ mod tests {
         );
         assert_eq!(single.len(), 1);
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn wheel_turns_add_up_to_whole_notches() {
+        let mut acc = 0.0;
+        assert_eq!(
+            super::wheel_notches(&mut acc, super::SCROLL_STEP),
+            1,
+            "one mouse notch"
+        );
+        assert_eq!(super::wheel_notches(&mut acc, -super::SCROLL_STEP), -1);
+        let mut acc = 0.0;
+        let step = super::SCROLL_STEP;
+        assert_eq!(
+            super::wheel_notches(&mut acc, step * 0.4),
+            0,
+            "a touchpad sliver"
+        );
+        assert_eq!(super::wheel_notches(&mut acc, step * 0.4), 0);
+        assert_eq!(
+            super::wheel_notches(&mut acc, step * 0.4),
+            1,
+            "slivers add up"
+        );
+        assert_eq!(
+            super::wheel_notches(&mut acc, -step * 0.6),
+            0,
+            "a turn back starts over"
+        );
+        assert_eq!(super::wheel_notches(&mut acc, -step * 0.6), -1);
+        assert_eq!(
+            super::wheel_notches(&mut acc, step * 3.0),
+            3,
+            "a fast flick"
+        );
+        assert_eq!(super::wheel_notches(&mut acc, 0.0), 0);
     }
 
     #[test]

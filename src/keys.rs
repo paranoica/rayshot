@@ -112,6 +112,8 @@ pub enum Key {
     Backslash,
     Backquote,
     Space,
+    WheelUp,
+    WheelDown,
 }
 
 const SYMBOLS: [(Key, &str); 11] = [
@@ -134,10 +136,20 @@ impl Key {
             Key::Letter(c) | Key::Digit(c) => (c as char).to_string(),
             Key::F(n) => format!("F{n}"),
             Key::Space => "Space".into(),
+            Key::WheelUp => "WheelUp".into(),
+            Key::WheelDown => "WheelDown".into(),
             other => SYMBOLS
                 .iter()
                 .find(|(k, _)| *k == other)
                 .map_or(String::new(), |(_, t)| t.to_string()),
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Key::WheelUp => "Wheel↑".into(),
+            Key::WheelDown => "Wheel↓".into(),
+            other => other.text(),
         }
     }
 
@@ -149,8 +161,11 @@ impl Key {
             [c] if c.is_ascii_digit() => return Some(Key::Digit(*c)),
             _ => {}
         }
-        if upper == "SPACE" {
-            return Some(Key::Space);
+        match upper.as_str() {
+            "SPACE" => return Some(Key::Space),
+            "WHEELUP" => return Some(Key::WheelUp),
+            "WHEELDOWN" => return Some(Key::WheelDown),
+            _ => {}
         }
         if let Some(n) = upper.strip_prefix('F').and_then(|n| n.parse::<u8>().ok()) {
             return (1..=12).contains(&n).then_some(Key::F(n));
@@ -270,7 +285,7 @@ impl Chord {
         Some(chord)
     }
 
-    fn parts(self) -> Vec<String> {
+    fn parts(self, label: bool) -> Vec<String> {
         let mut out = Vec::new();
         if self.ctrl {
             out.push("Ctrl".to_string());
@@ -281,16 +296,20 @@ impl Chord {
         if self.alt {
             out.push("Alt".to_string());
         }
-        out.push(self.key.text());
+        out.push(if label {
+            self.key.label()
+        } else {
+            self.key.text()
+        });
         out
     }
 
     pub fn text(self) -> String {
-        self.parts().join("+")
+        self.parts(false).join("+")
     }
 
     pub fn label(self) -> String {
-        self.parts().join(" ")
+        self.parts(true).join(" ")
     }
 }
 
@@ -298,6 +317,7 @@ pub fn reserved(chord: Chord) -> Option<&'static str> {
     let plain = !chord.ctrl && !chord.shift && !chord.alt;
     match chord.key {
         Key::Digit(d) if plain && d != b'0' => Some("1–9 pick colours"),
+        Key::WheelUp | Key::WheelDown if plain => Some("The wheel alone sets the width"),
         Key::Letter(b'Z') if chord.ctrl => Some("Ctrl+Z undoes and redoes"),
         Key::Letter(b'Y') if chord.ctrl => Some("Ctrl+Y redoes"),
         Key::Letter(b'D') if chord.ctrl => Some("Ctrl+D duplicates a shape"),
@@ -374,6 +394,15 @@ impl Bindings {
                 Command::Tool(_) | Command::ZoomIn | Command::ZoomOut
             ))
         .then_some(unshifted)
+    }
+
+    pub fn wheel(&self, ctrl: bool, shift: bool, alt: bool, up: bool) -> Option<Command> {
+        self.command(Chord {
+            ctrl,
+            shift,
+            alt,
+            key: if up { Key::WheelUp } else { Key::WheelDown },
+        })
     }
 
     fn set(&mut self, command: Command, chord: Chord) {
@@ -742,5 +771,65 @@ mod tests {
         let mut rebound = Bindings::defaults();
         assert_eq!(rebound.assign(Command::Copy, chord("Ctrl+K")), Assign::Done);
         assert_eq!(rebound.resolve(true, true, false, KeyCode::KeyK), None);
+    }
+
+    #[test]
+    fn a_wheel_turn_with_a_modifier_is_a_chord() {
+        let up = chord("Ctrl+WheelUp");
+        assert_eq!(up.key, Key::WheelUp);
+        assert!(up.ctrl && !up.shift && !up.alt);
+        assert_eq!(up.text(), "Ctrl+WheelUp");
+        assert_eq!(up.label(), "Ctrl Wheel↑");
+        let down = chord("Ctrl+Shift+WheelDown");
+        assert_eq!(down.text(), "Ctrl+Shift+WheelDown");
+        assert_eq!(down.label(), "Ctrl Shift Wheel↓");
+        assert_eq!(Chord::parse("ctrl+wheelup"), Some(up));
+    }
+
+    #[test]
+    fn the_wheel_alone_stays_the_width() {
+        assert!(reserved(chord("WheelUp")).is_some());
+        assert!(reserved(chord("WheelDown")).is_some());
+        assert_eq!(reserved(chord("Ctrl+WheelUp")), None);
+        assert_eq!(reserved(chord("Alt+WheelDown")), None);
+        let mut b = Bindings::defaults();
+        assert!(matches!(
+            b.assign(Command::ZoomIn, chord("WheelUp")),
+            Assign::Reserved(_)
+        ));
+    }
+
+    #[test]
+    fn no_command_sits_on_the_wheel_by_default() {
+        let b = Bindings::defaults();
+        for ctrl in [false, true] {
+            for shift in [false, true] {
+                for alt in [false, true] {
+                    for up in [false, true] {
+                        assert_eq!(b.wheel(ctrl, shift, alt, up), None);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_wheel_binding_is_found_saved_and_loaded() {
+        let mut b = Bindings::defaults();
+        assert_eq!(
+            b.assign(Command::ZoomIn, chord("Ctrl+WheelUp")),
+            Assign::Done
+        );
+        assert_eq!(b.wheel(true, false, false, true), Some(Command::ZoomIn));
+        assert_eq!(b.wheel(true, false, false, false), None);
+        assert_eq!(b.wheel(false, false, false, true), None);
+        assert_eq!(
+            b.resolve(true, false, false, winit::keyboard::KeyCode::Equal),
+            None,
+            "the old key is free again"
+        );
+        let saved = b.to_pref();
+        assert!(saved.contains("zoom-in:Ctrl+WheelUp"), "{saved}");
+        assert_eq!(Bindings::from_pref(&saved), b);
     }
 }
