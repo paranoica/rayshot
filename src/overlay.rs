@@ -3154,8 +3154,6 @@ impl OverlayApp {
             Ok(()) => eprintln!("[rayshot] copied to clipboard"),
             Err(e) => {
                 eprintln!("[rayshot] clipboard copy failed: {e:#}");
-                // A notification from this process would vanish with it, so the
-                // extension tells the user.
                 reply(&format!("copy-failed {}", path.display()));
             }
         }
@@ -3276,8 +3274,6 @@ impl OverlayApp {
         }
     }
 
-    // One process serves one session: exiting releases every window, surface and
-    // GPU resource at once, and the extension keeps the next process warm.
     fn end_session(&mut self, end: SessionEnd) -> ! {
         if let Some(id) = self.session.take() {
             let word = match end {
@@ -3806,7 +3802,6 @@ fn extend_stroke(
     points.push(constrain(tool, points[at], to, true, bounds));
 }
 
-/// The selection a drag made over the freeze before the overlay appeared.
 fn forwarded_selection(
     from: (f32, f32),
     to: (f32, f32),
@@ -3819,8 +3814,6 @@ fn forwarded_selection(
     (rect.width() >= MIN_SELECTION && rect.height() >= MIN_SELECTION).then_some(rect)
 }
 
-/// What the selection becomes after a forwarded drag update: a drag that
-/// shrinks back to a click clears the selection it made.
 fn next_selection(
     current: Option<egui::Rect>,
     forwarded: bool,
@@ -3833,19 +3826,14 @@ fn next_selection(
     }
 }
 
-// Once per window: a driver that reports every frame as suboptimal would
-// otherwise rebuild the swapchain on each one.
 fn reconfigure_after_suboptimal(suboptimal: bool, done_before: bool) -> bool {
     suboptimal && !done_before
 }
 
-// Wayland repeats the same size on every configure; rebuilding the swapchain
-// for it is wasted work and one more trip through a driver call that has crashed.
 fn surface_needs_configure(configured: bool, current: (u32, u32), new: (u32, u32)) -> bool {
     new.0 > 0 && new.1 > 0 && (!configured || current != new)
 }
 
-// egui-wgpu blends into premultiplied RGB, so only PreMultiplied composites correctly.
 fn see_through_alpha(modes: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
     let mode = wgpu::CompositeAlphaMode::PreMultiplied;
     modes.contains(&mode).then_some(mode)

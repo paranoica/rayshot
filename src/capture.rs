@@ -29,7 +29,6 @@ fn decode_strided(data: &[u8]) -> Result<Frame> {
             "strided frame stride {stride} below row size {row}"
         ));
     }
-    // The last row may be unpadded, as GdkPixbuf leaves it.
     let needed = (height as usize - 1)
         .checked_mul(stride)
         .and_then(|n| n.checked_add(row))

@@ -1,4 +1,3 @@
-# Headless GNOME Shell with software rendering, for the soak test.
 ARG BASE=ubuntu:24.04
 FROM ${BASE}
 ENV DEBIAN_FRONTEND=noninteractive

@@ -72,7 +72,6 @@ pub fn cleanup_old(dir: &Path, max_age: Duration) {
         };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        // Only screenshot copies: lock files and frames share this folder.
         if !(meta.is_file() && name.starts_with("rayshot-") && name.ends_with(".png")) {
             continue;
         }
@@ -134,9 +133,6 @@ pub fn save_to_scratch(png: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The folder from `user-dirs.dirs`, which is localized (`~/Изображения`,
-/// `~/Bilder`). Values are double-quoted shell strings; "$HOME" alone means
-/// the user turned the folder off.
 fn configured_pictures_dir(home: &Path, user_dirs: &str) -> Option<PathBuf> {
     let raw = user_dirs
         .lines()
@@ -164,8 +160,6 @@ fn configured_pictures_dir(home: &Path, user_dirs: &str) -> Option<PathBuf> {
     usable.then_some(dir)
 }
 
-/// Configured folder, then ~/Pictures, then /tmp. Only a folder inside the
-/// home is created; elsewhere it could land on an unmounted drive.
 fn pictures_dir(
     home: Option<&Path>,
     user_dirs: Option<&str>,
@@ -240,8 +234,6 @@ pub fn copy_png_to_clipboard(png: &[u8]) -> Result<()> {
         .context("wl-copy stdin unavailable")?
         .write_all(png)
         .context("failed to write image to wl-copy")?;
-    // Without a data-control protocol wl-copy needs the keyboard focus, and
-    // an unbounded wait would leave the overlay and the freeze up for good.
     let status = wait_bounded(&mut child, std::time::Duration::from_secs(3))
         .context("wl-copy did not finish")?;
     if !status.success() {

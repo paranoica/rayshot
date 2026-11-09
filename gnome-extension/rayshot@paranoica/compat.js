@@ -17,7 +17,6 @@ export function readyVersion(line) {
     return m ? Number(m[1]) : null;
 }
 
-// GNOME 47 moved unredirect control from the display onto the compositor.
 export function unredirect(compositor, display, Meta, enabled) {
     if (typeof compositor?.disable_unredirect === 'function') {
         if (enabled)
@@ -31,14 +30,11 @@ export function unredirect(compositor, display, Meta, enabled) {
     }
 }
 
-// GNOME 46 has no stage context and keeps the backend behind Clutter.
 export function defaultSeat(stage, Clutter) {
     const backend = stage.context?.get_backend() ?? Clutter.get_default_backend();
     return backend.get_default_seat();
 }
 
-// A notice that stays in the tray after its banner. GNOME 46 rewrote the
-// notification API around a shared system source.
 export function persistentNotice(MessageTray, tray, title, body) {
     if (typeof MessageTray.getSystemSource === 'function') {
         const source = MessageTray.getSystemSource();

@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-/// Bumped whenever the extension and the binary would misread each other.
 pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -105,8 +104,6 @@ pub fn parse_command(line: &str) -> Option<Command> {
     })
 }
 
-/// A crash is reported to the extension only once the kernel has finished the
-/// core dump, which for a GPU process takes long enough to hold the freeze up.
 pub fn skip_core_dumps() {
     let mut lim = libc::rlimit {
         rlim_cur: 0,

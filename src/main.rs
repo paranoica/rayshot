@@ -134,7 +134,6 @@ fn main() -> Result<()> {
                 .context("failed to build tokio runtime")?;
             return overlay::run_live(width, height, monitors, rt.handle().clone());
         }
-        // `trigger` was the old daemon hotkey command; it now just captures.
         Some(cmd) if !matches!(cmd, "trigger" | "shot") => {
             anyhow::bail!("unknown command {cmd:?}");
         }

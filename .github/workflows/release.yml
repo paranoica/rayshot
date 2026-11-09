@@ -14,7 +14,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Debian 12's old glibc, so the binary also runs on older distributions.
       - name: Build in Debian 12
         run: |
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -e CARGO_HOME=/tmp/cargo -v "$PWD:/src" -w /src \

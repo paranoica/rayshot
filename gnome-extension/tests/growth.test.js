@@ -27,8 +27,6 @@ check('warmup longer than the run uses the previous sample',
     growth(s(100, 150, 180), 'v', 9), 30);
 check('warmup zero uses the first sample', growth(s(100, 150, 180), 'v', 0), 80);
 
-// Software rendering keeps textures in RAM and frees them in bursts, so the
-// shell saws up and down; only a rising floor is a leak.
 check('sawtooth that returns to its floor is not growth',
     growth(s(300, 360, 430, 300, 440, 310, 450), 'v', 1) <= 0, true);
 check('sawtooth with a rising floor is growth',
@@ -36,8 +34,6 @@ check('sawtooth with a rising floor is growth',
 check('a steady leak counts over the whole run',
     growth(s(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110), 'v', 0), 110);
 
-// The verdict must judge warm and cold sessions apart: a leak that starts in
-// the cold phase would hide behind flat warm samples in one combined series.
 const GLib = imports.gi.GLib;
 const here = GLib.path_get_dirname(GLib.filename_from_uri(import.meta.url)[0]);
 const result = {

@@ -5,8 +5,6 @@ use std::process::Command;
 pub const SCHEMA: &str = "org.gnome.shell.extensions.rayshot";
 const KEY: &str = "warm-overlay";
 
-/// The installed extension's schema directory: the user copy wins over a
-/// system-wide one, as GNOME Shell itself prefers it.
 pub fn schema_dir() -> Result<PathBuf> {
     let env_dir = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty());
     let user = env_dir("XDG_DATA_HOME")

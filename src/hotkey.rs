@@ -56,8 +56,6 @@ fn format_paths(paths: &[String]) -> String {
     }
 }
 
-/// The custom-keybindings list without the old daemon hotkey, or None when
-/// it is not there and nothing needs to change.
 fn without_rayshot_binding(list: &str) -> Option<String> {
     let paths = parse_paths(list);
     if !paths.iter().any(|p| p == KB_PATH) {
@@ -67,13 +65,11 @@ fn without_rayshot_binding(list: &str) -> Option<String> {
     Some(format_paths(&kept))
 }
 
-/// A one-element GVariant string array for gsettings.
 fn gvariant_strv(item: &str) -> String {
     let escaped = item.replace('\\', "\\\\").replace('\'', "\\'");
     format!("['{escaped}']")
 }
 
-/// A key name is required after any `<Modifier>` prefixes.
 fn valid_binding(binding: &str) -> bool {
     let key = binding.rsplit('>').next().unwrap_or_default();
     let balanced = binding.matches('<').count() == binding.matches('>').count();
@@ -84,7 +80,6 @@ fn valid_binding(binding: &str) -> bool {
         && !binding.chars().any(char::is_whitespace)
 }
 
-/// Pids of old `rayshot daemon` processes, never including `me`.
 fn daemon_pids(procs: &[(u32, Vec<String>)], me: u32) -> Vec<u32> {
     procs
         .iter()
@@ -123,8 +118,6 @@ fn own_processes() -> Vec<(u32, Vec<String>)> {
     .collect()
 }
 
-/// Removes everything the pre-extension setup left behind: the media-keys
-/// hotkey, the daemon autostart entry and any daemon still running.
 fn retire_old_setup() {
     let _ = std::fs::remove_file(autostart_path());
     for pid in daemon_pids(&own_processes(), std::process::id()) {
@@ -163,8 +156,6 @@ fn extension_listed(filter: &[&str]) -> bool {
         .is_some_and(|out| out.lines().any(|l| l.trim() == EXTENSION))
 }
 
-/// Enables the extension for the next login when the running shell has not
-/// scanned it yet, which `gnome-extensions enable` cannot do.
 fn enable_on_next_login() {
     let list = gget("org.gnome.shell", "enabled-extensions").unwrap_or_default();
     let mut uuids = parse_paths(&list);
@@ -187,8 +178,6 @@ fn is_gnome() -> bool {
     current_desktop().to_ascii_uppercase().contains("GNOME")
 }
 
-/// Runs once at login for users of the old daemon, from its autostart entry,
-/// which is removed here; nobody reads stderr there, so they get a notice.
 pub fn retire_daemon() -> Result<()> {
     let had_autostart = std::fs::remove_file(autostart_path()).is_ok();
     eprintln!("rayshot: the background daemon was removed in favour of the GNOME extension.");
@@ -274,7 +263,6 @@ pub fn install(binding: &str, daemon: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Everything that can fail runs before the old hotkey is taken away.
     if !valid_binding(binding) {
         bail!("{binding:?} is not a key binding, try Print or <Control>Print");
     }
@@ -292,7 +280,6 @@ pub fn install(binding: &str, daemon: bool) -> Result<()> {
     if !gnome_extensions(&["enable", EXTENSION]) {
         bail!("could not enable the {EXTENSION} GNOME extension");
     }
-    // GNOME Shell enables an extension from an idle callback, not at once.
     let active = (0..20).any(|attempt| {
         if attempt > 0 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -419,7 +406,6 @@ mod tests {
 
     #[test]
     fn escapes_quotes_and_backslashes() {
-        // one quote becomes backslash-quote, one backslash becomes two
         assert_eq!(gvariant_strv("a'b"), "['a\\'b']");
         assert_eq!(gvariant_strv("a\\"), "['a\\\\']");
         assert_eq!(gvariant_strv("\\'"), "['\\\\\\'']");

@@ -2,8 +2,6 @@ import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Gtk from 'gi://Gtk?version=4.0';
 
-// With RAYSHOT_SOAK_HELPER_LOG set, every key and focus change is appended to
-// that file, so the soak can tell whether a key was left pressed.
 const logPath = GLib.getenv('RAYSHOT_SOAK_HELPER_LOG');
 function note(line) {
     if (!logPath)

@@ -1,7 +1,4 @@
 #!/bin/sh
-# Leak soak: runs rayshot captures in a headless nested GNOME Shell and
-# fails if the overlay server or the shell keeps growing.
-# Usage: gnome-extension/tests/soak.sh [warm_sessions] [cold_sessions]
 set -eu
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,8 +20,6 @@ descendants() {
     done
 }
 
-# Session services started through D-Bus activation leave the process tree,
-# so they are found by the tag every nested process inherits.
 tagged() {
     for pid in $(pgrep -u "$(id -u)"); do
         if tr '\0' '\n' 2>/dev/null <"/proc/$pid/environ" | grep -qx "RAYSHOT_NESTED_TAG=$TAG"; then
@@ -51,7 +46,6 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT HUP TERM
 
-# RAYSHOT_SOAK_BIN tests a binary built elsewhere, such as in a container.
 BIN="${RAYSHOT_SOAK_BIN:-$REPO/target/release/rayshot}"
 if [ ! -x "$BIN" ]; then
     echo "soak: build first, $BIN is missing" >&2
@@ -74,8 +68,6 @@ cp -r "$REPO/gnome-extension/rayshot@paranoica" "$EXT/"
 cp -r "$HERE/soak/rayshot-soak@paranoica" "$EXT/"
 glib-compile-schemas "$EXT/rayshot@paranoica/schemas"
 
-# wl-copy that reads the image and then never finishes, as when it cannot get
-# the focus; armed per scenario by creating the flag file.
 mkdir -p "$WORK/bin"
 REAL_WL_COPY=$(command -v wl-copy) || { echo "soak: wl-copy is not installed" >&2; exit 1; }
 cat >"$WORK/bin/wl-copy" <<WLCOPY
@@ -86,7 +78,6 @@ WLCOPY
 chmod +x "$WORK/bin/wl-copy"
 export PATH="$WORK/bin:$PATH" RAYSHOT_SOAK_WLCOPY_HANG="$WORK/wl-copy-hang"
 
-# RAYSHOT_SOAK_ANY_SHELL=1 loads the extensions on shells they do not list.
 ANY_SHELL=false
 [ -n "${RAYSHOT_SOAK_ANY_SHELL:-}" ] && ANY_SHELL=true
 

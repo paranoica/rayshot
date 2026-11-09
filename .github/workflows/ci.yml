@@ -51,7 +51,6 @@ jobs:
       - name: Test extension compatibility helpers
         run: gjs -m gnome-extension/tests/compat.test.js
 
-  # Debian 12's old glibc, so one binary runs in every image below.
   portable-build:
     runs-on: ubuntu-latest
     timeout-minutes: 20

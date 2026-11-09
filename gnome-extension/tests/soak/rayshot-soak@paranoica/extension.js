@@ -40,7 +40,6 @@ function vramMib(pid) {
 function serveProcesses() {
     const shell = `${new TextDecoder().decode(GLib.file_get_contents('/proc/self/stat')[1]).split(' ')[0]}`;
     let count = 0;
-    // GLib.Dir is not usable from GJS on GNOME 45.
     const dir = Gio.File.new_for_path('/proc')
         .enumerate_children('standard::name', Gio.FileQueryInfoFlags.NONE, null);
     for (let info; (info = dir.next_file(null));) {
@@ -59,7 +58,6 @@ function serveProcesses() {
     return count;
 }
 
-// GNOME 45 keeps the body in bannerBodyText.
 function noticeText(n) {
     return `${n.title} ${n.body ?? n.bannerBodyText ?? ''}`;
 }
@@ -97,8 +95,6 @@ function waitFor(cond, then, fail, timeoutMs = STEP_TIMEOUT_MS) {
 
 export default class SoakDriver extends Extension {
     enable() {
-        // GNOME re-enables later extensions when an earlier one is disabled,
-        // as on lock; the run must not start over.
         if (this._started)
             return;
         this._started = true;
@@ -170,7 +166,6 @@ export default class SoakDriver extends Extension {
                 () => this._finish(`${phase} ${i}: no warm spare in time`));
             return;
         }
-        // Cold runs are short, so they are sampled more often.
         if (i % (phase === 'cold' ? 5 : 10) === 0 || i === total)
             this._sample(phase, i);
         if (i === total) {
@@ -232,7 +227,6 @@ export default class SoakDriver extends Extension {
     _scenarios() {
         const r = this._rayshot;
         r._settings.set_boolean('warm-overlay', true);
-        // A virtual device drops events sent right after it is created.
         this._keyboard = defaultSeat(global.stage, Clutter)
             .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         const steps = GLib.getenv('RAYSHOT_SOAK_SUITE') === 'displays' ? new Displays(this).steps() : [
@@ -283,8 +277,6 @@ export default class SoakDriver extends Extension {
         waitFor(() => !r._busy, then, () => this._finish('session did not end'));
     }
 
-    // Enter in the overlay copies through wl-copy, which needs the focus for a
-    // moment on compositors without a data-control protocol.
     _coldCopies(next) {
         const r = this._rayshot;
         r._settings.set_boolean('warm-overlay', false);
@@ -295,8 +287,6 @@ export default class SoakDriver extends Extension {
         () => this._finish('warm off did not stop the spare'));
     }
 
-    // wl-copy that never finishes must not leave the freeze up, and the user
-    // has to learn that the clipboard is empty.
     _coldCopyFails(next) {
         const r = this._rayshot;
         r._settings.set_boolean('warm-overlay', false);
@@ -493,8 +483,6 @@ export default class SoakDriver extends Extension {
         }, () => this._finish(`${name}: overlay did not show`));
     }
 
-    // A spare that dies while opening its windows, as the NVIDIA driver does
-    // now and then, must be replaced before the freeze feels stuck.
     _spareCrashes(next) {
         const r = this._rayshot;
         const name = 'spare crashes while opening its windows';
@@ -504,8 +492,6 @@ export default class SoakDriver extends Extension {
             if (killedAt || !server || !r._isOverlay(win))
                 return;
             killedAt = GLib.get_monotonic_time();
-            // SIGABRT dumps core like a real crash; a sent SIGSEGV only resets
-            // Rust's stack-overflow handler and the process lives on.
             server.proc.send_signal(6);
         });
         r._capture();
@@ -521,8 +507,6 @@ export default class SoakDriver extends Extension {
         });
     }
 
-    // Stands in for a stray click that focuses and raises an app hidden under
-    // the freeze.
     _focusStolen(next) {
         const r = this._rayshot;
         const name = 'app takes the focus from an open overlay';
@@ -536,8 +520,6 @@ export default class SoakDriver extends Extension {
             this._finish(`cannot start the helper window: ${e.message}`);
             return;
         }
-        // A window activated before it is ready to take the focus is passed
-        // over, so the helper has to hold it once before the capture.
         waitFor(() => {
             const helper = helperWindow();
             if (!helper?.get_compositor_private())
@@ -550,8 +532,6 @@ export default class SoakDriver extends Extension {
             r._capture();
             waitFor(() => r._overlay?.shown && r._overlay.framePath, () => {
                 const overlays = [...r._overlay.windows.keys()];
-                // The guard may take the focus back before this code runs again,
-                // so the helper's turn is caught as it happens.
                 let helperFocused = false;
                 const focusId = global.display.connect('notify::focus-window', () => {
                     if (global.display.focus_window === helper)
@@ -574,8 +554,6 @@ export default class SoakDriver extends Extension {
         }, () => this._finish(`${name}: helper window did not show`));
     }
 
-    // Esc on the freeze races the overlay's first frame; a cancelled capture
-    // must not show, focus or click anything when that frame arrives.
     _cancelBeforeFirstFrame(next, i, stats) {
         const r = this._rayshot;
         const name = 'first frame after cancelling';
@@ -616,9 +594,6 @@ export default class SoakDriver extends Extension {
         }, () => this._finish(`${name}: session did not end`));
     }
 
-    // Users of the old daemon still have its autostart entry, which runs
-    // `rayshot daemon` at login; that is the one chance to tell them to finish
-    // the update.
     _oldAutostart(next) {
         const name = 'old daemon autostart at login';
         const home = GLib.build_filenamev([GLib.path_get_dirname(this._out), 'old-home']);
@@ -654,9 +629,6 @@ export default class SoakDriver extends Extension {
         return GLib.build_filenamev([GLib.path_get_dirname(this._out), 'helper-keys.log']);
     }
 
-    // A key held down when Print is pressed has its release land on the
-    // freeze. If the capture is cancelled, the app must still learn the key
-    // is up, or it keeps repeating it.
     _heldKey(next) {
         const r = this._rayshot;
         const name = 'key held through a cancelled capture';
@@ -695,7 +667,6 @@ export default class SoakDriver extends Extension {
                 waitFor(() => r._frozen, () => key(Clutter.KeyState.RELEASED, () => {
                     atCancel = read().length;
                     r._cancelCapture();
-                    // Long enough for the app's own key repeat to show a stuck key.
                     waitFor(() => !r._busy, () => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
                         const after = read();
                         const repeats = after.slice(atCancel).filter(l => l === `press ${Clutter.KEY_a}`).length;
@@ -711,7 +682,6 @@ export default class SoakDriver extends Extension {
         }, () => this._finish(`${name}: the helper never got the focus`));
     }
 
-    // One capture, then `check(overlay)` while it is shown; `then` once it ended.
     _captureAndCheck(name, check, then) {
         const r = this._rayshot;
         r._capture();
@@ -721,8 +691,6 @@ export default class SoakDriver extends Extension {
         }, () => this._finish(`${name}: overlay did not show`));
     }
 
-    // The old daemon could hand out a picture from before the screens slept;
-    // every capture must show what is on screen right now.
     _freshFrames(next) {
         const r = this._rayshot;
         const name = 'each capture shows the screen as it is now';
@@ -740,7 +708,6 @@ export default class SoakDriver extends Extension {
             this._result(name, ok, detail);
             next();
         };
-        // A capture takes the last painted frame, so the square must be drawn first.
         const painted = then => {
             const id = global.stage.connect('after-paint', () => {
                 global.stage.disconnect(id);
@@ -757,8 +724,6 @@ export default class SoakDriver extends Extension {
         }));
     }
 
-    // A monitor that is unplugged or switched off while the spare waits must
-    // not leave the spare drawing on a layout that no longer exists.
     _layoutChanges(next) {
         const r = this._rayshot;
         const name = 'monitors change while the spare waits';
@@ -822,13 +787,10 @@ export default class SoakDriver extends Extension {
         }));
     }
 
-    // GNOME disables extensions on lock, which also happens on suspend, and
-    // enables them again on unlock.
     _lockUnlock(next) {
         const r = this._rayshot;
         const name = 'capture after lock and unlock';
         const fail = why => this._finish(`${name}: ${why}`);
-        // A few failures short of giving up must not follow the user past a lock.
         r._serverFailures = MAX_FAILURES - 1;
         Main.sessionMode.pushMode('unlock-dialog');
         waitFor(() => !r._settings, () => {
@@ -863,8 +825,6 @@ export default class SoakDriver extends Extension {
         this._restartWarm(() => this._watchGiveUp(next, name, bin));
     }
 
-    // Lock and unlock re-enable the extension; a spare that gave up must stay
-    // given up and must not notify again. Calls back with a problem or null.
     _throughLock(stopped, failures, then) {
         const r = this._rayshot;
         const notices = () => Main.messageTray.getSources().flatMap(src => src.notifications ?? [])
@@ -916,8 +876,6 @@ export default class SoakDriver extends Extension {
         }, 15000);
     }
 
-    // A binary installed after login must still get a spare, and the misses
-    // before it must not count toward giving up on a later failure.
     _missingBinary(next) {
         const r = this._rayshot;
         const name = 'binary installed after login';

@@ -1,7 +1,5 @@
-# Headless GNOME Shell with software rendering, for the soak test.
 ARG BASE=fedora:43
 FROM ${BASE}
-# Releases past their end of life only remain in the archive.
 ARG ARCHIVED=
 RUN if [ -n "$ARCHIVED" ]; then sed -i -e 's|^metalink=|#metalink=|' \
         -e 's|^#baseurl=http://download.example/pub/fedora/linux|baseurl=https://archives.fedoraproject.org/pub/archive/fedora/linux|' \

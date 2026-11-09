@@ -247,8 +247,6 @@ export default class RayshotExtension extends Extension {
         Main.notify('rayshot', body);
     }
 
-    // A package upgrade replaces these files while the old code stays loaded
-    // until the next login on Wayland.
     _watchOwnFiles() {
         try {
             const file = Gio.File.new_for_path(GLib.build_filenamev([this.path, 'extension.js']));
@@ -287,8 +285,6 @@ export default class RayshotExtension extends Extension {
         const bin = this._bin();
         if (!bin) {
             this._notifyOnce('no-bin', 'The rayshot program was not found. Install rayshot or set the binary path.');
-            // Kept apart from the failure count, so an install after login
-            // starts with a clean slate.
             this._respawnId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, respawnDelay(this._binMisses++), () => {
                 this._startServer();
                 return GLib.SOURCE_REMOVE;
@@ -386,9 +382,6 @@ export default class RayshotExtension extends Extension {
             return false;
         if (!this._settings)
             return true;
-        // Main.notify is transient and would leave the tray after its banner;
-        // an empty clipboard should still be explained when the user looks.
-        // One notice at a time, so repeated failures do not crowd the tray.
         this._copyNotice?.destroy();
         const notice = persistentNotice(MessageTray, Main.messageTray, 'rayshot',
             `The screenshot could not be copied to the clipboard. A temporary copy is at ${path}.`);
@@ -493,8 +486,6 @@ export default class RayshotExtension extends Extension {
         this._dying?.delete(server);
         if (server.ready && GLib.get_monotonic_time() - server.startedAt > STABLE_SERVER_MS * 1000)
             this._serverFailures = 0;
-        // The reader runs on to EOF so a late `copy-failed` still lands, but a
-        // late `closed` is dropped as stale; a clean exit counts as served.
         if (server.showSent && server.proc.get_if_exited() && server.proc.get_exit_status() === 0)
             server.served = true;
         const current = this._server === server && epoch === this._epoch;
@@ -513,8 +504,6 @@ export default class RayshotExtension extends Extension {
         }
     }
 
-    // Unfreezing while an overlay window is still mapped would expose the
-    // opaque backdrop mutter puts under fullscreen windows.
     _settleOverlay(overlay) {
         if (overlay.settleId || this._overlay !== overlay)
             return;
@@ -565,7 +554,6 @@ export default class RayshotExtension extends Extension {
     }
 
     _collectSoon() {
-        // Frozen textures and pixbufs are native memory the JS heap does not see.
         if (this._gcId)
             return;
         this._gcId = GLib.idle_add(GLib.PRIORITY_LOW, () => {
@@ -689,15 +677,11 @@ export default class RayshotExtension extends Extension {
             reactive: true,
         });
         Main.layoutManager.uiGroup.add_child(actor);
-        // Until the overlay shows, keys would reach the app hidden under the
-        // freeze; the freeze takes them instead, and Esc cancels.
         actor.connect('key-press-event', (_a, event) => {
             if (event.get_key_symbol() === Clutter.KEY_Escape)
                 this._cancelCapture();
             return Clutter.EVENT_STOP;
         });
-        // A drag that starts before the overlay shows lands on the freeze, which
-        // keeps the pointer until release; the drag is forwarded as a selection.
         actor.connect('button-press-event', (_a, event) => {
             if (event.get_button() === Clutter.BUTTON_PRIMARY && this._frozen &&
                 !this._frozen.drag?.held) {
@@ -725,8 +709,6 @@ export default class RayshotExtension extends Extension {
         St.Settings.get().inhibit_animations();
         unredirect(global.compositor, global.display, Meta, false);
         const frozen = {actor, texture, clones: [], focusReleased: false};
-        // A shell modal that ends after the overlay showed would hand the key
-        // focus back to the freeze and leave the overlay without keys.
         frozen.focusId = global.stage.connect('notify::key-focus', () => {
             if (frozen.focusReleased && global.stage.get_key_focus() === actor)
                 global.stage.set_key_focus(null);
@@ -740,7 +722,6 @@ export default class RayshotExtension extends Extension {
         const overlay = this._overlay;
         if (!drag || !overlay?.shown || drag.forwardFailed)
             return;
-        // The frame is in texture pixels, the events in stage units.
         const sx = freeze.texture.get_width() / global.stage.width;
         const sy = freeze.texture.get_height() / global.stage.height;
         const [x0, y0] = drag.from;
@@ -769,8 +750,6 @@ export default class RayshotExtension extends Extension {
         retry?.();
     }
 
-    // Clutter normally reports the release, but the pointer must never stay
-    // captured by the freeze if that event goes missing.
     _watchDrag() {
         const drag = this._frozen?.drag;
         if (!drag?.held || drag.watchId)
@@ -1076,8 +1055,6 @@ export default class RayshotExtension extends Extension {
             this._releaseKeyFocus();
             Main.activateWindow(win);
             this._breakGrab(win);
-            // The texture readback blocks the compositor, so it waits until the
-            // overlay has been painted instead of delaying it.
             if (first) {
                 this._forwardDrag();
                 this._sendPixelsAfterPaint(overlay);
@@ -1089,9 +1066,6 @@ export default class RayshotExtension extends Extension {
         this._frameWatches.push([actor, frameId, destroyId]);
     }
 
-    // An app focused under the freeze would take every key while hidden. The
-    // overlay's own helpers are exempt: wl-copy needs the focus to copy. The
-    // check waits a turn so windows of an ending session are already gone.
     _keepOverlayFocused() {
         if (this._refocusId || !this._overlay?.shown)
             return;
@@ -1180,7 +1154,6 @@ export default class RayshotExtension extends Extension {
         }
         if (!onTop) {
             if (this._frozen?.drag?.held && actor) {
-                // The freeze holds the pointer during a drag; retry on release.
                 this._frozen.drag.afterRelease = () =>
                     this._clickWhenSettled(win, overlay, target, rects, t0, 0);
                 return;

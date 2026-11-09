@@ -8,8 +8,6 @@ mkdir -p "$DST"
 cp -r "$HERE/$UUID/." "$DST/"
 glib-compile-schemas "$DST/schemas"
 ROOT=$(cd "$HERE/.." && pwd)
-# A source checkout builds into target/release; a release archive ships the
-# binary next to this folder.
 BIN="$ROOT/target/release/rayshot"
 [ -x "$BIN" ] || BIN="$ROOT/rayshot"
 if [ -x "$BIN" ]; then
