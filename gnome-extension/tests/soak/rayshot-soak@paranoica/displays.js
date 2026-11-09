@@ -330,6 +330,10 @@ export class Displays {
                     this._textLines(true, next);
                 else if (kind === 'edit-keys')
                     this._editKeys(next);
+                else if (kind === 'wheel-key')
+                    this._wheelKey(next);
+                else if (kind === 'wheel-typing')
+                    this._wheelTyping(next);
                 else if (kind === 'rebound')
                     this._rebound(next);
                 else if (kind === 'shape-enter')
@@ -1138,6 +1142,112 @@ export class Displays {
                     : `redone ${hex(kept)}, undone ${hex(undone)}, green ${hex(green)}, copy ${hex(copy)}`);
                 next();
             }, fail)), () => fail('enter did not copy')));
+        }, fail);
+    }
+
+    _wheelKey(next) {
+        const name = 'a command bound to ctrl and the wheel runs on a wheel turn';
+        const r = this._r();
+        const dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'rayshot']);
+        const conf = GLib.build_filenamev([dir, 'editor.conf']);
+        GLib.mkdir_with_parents(dir, 0o755);
+        let saved = null;
+        try {
+            saved = GLib.file_get_contents(conf)[1];
+        } catch {}
+        GLib.file_set_contents(conf, 'keys = zoom-in:Ctrl+WheelUp\n');
+        const restore = () => {
+            if (saved)
+                GLib.file_set_contents(conf, saved);
+            else
+                GLib.unlink(conf);
+        };
+        const fail = why => {
+            restore();
+            this._clearMarks();
+            this._fail(name, why, next);
+        };
+        const kit = this._keyKit();
+        const k = this._d._keyboard;
+        const p = this._device();
+        this._mark(400, 300, COLOURS[1]);
+        this._capture({x: 300, y: 300}, overlay => {
+            const s = overlay.texture.get_width() / global.stage.width;
+            if (!this._select(overlay, [200, 200, 600, 400], fail))
+                return;
+            sequence([
+                SELECT_SETTLE_MS,
+                () => {},
+                () => k.notify_key(kit.now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED),
+                () => p.notify_discrete_scroll(kit.now(), Clutter.ScrollDirection.UP, Clutter.ScrollSource.WHEEL),
+                () => k.notify_key(kit.now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED),
+                () => kit.tap(Clutter.KEY_Return),
+            ], () => waitFor(() => !r._busy, () => later(400, () => readPng(pb => {
+                restore();
+                this._clearMarks();
+                const got = [pb.get_width(), pb.get_height()];
+                const want = [400 * s, 200 * s].map(Math.round);
+                const zoomed = pixel(pb, 250 * s, 150 * s);
+                const tooFar = pixel(pb, 270 * s, 170 * s);
+                const ok = got[0] === want[0] && got[1] === want[1] &&
+                    near(zoomed, COLOURS[1]) && !near(tooFar, COLOURS[1]);
+                this._d._result(name, ok, ok
+                    ? `png ${got.join('x')}, ctrl and one wheel notch zoomed the selection to 150 %`
+                    : `png ${got.join('x')} (want ${want.join('x')}), inside the mark at 150 % ${hex(zoomed)}, ` +
+                      `outside it unless zoomed further ${hex(tooFar)}`);
+                next();
+            }, fail)), () => fail('enter did not copy')));
+        }, fail);
+    }
+
+    _wheelTyping(next) {
+        const name = 'a wheel binding stays quiet while text is typed';
+        const r = this._r();
+        const dir = GLib.build_filenamev([GLib.get_user_config_dir(), 'rayshot']);
+        const conf = GLib.build_filenamev([dir, 'editor.conf']);
+        GLib.mkdir_with_parents(dir, 0o755);
+        let saved = null;
+        try {
+            saved = GLib.file_get_contents(conf)[1];
+        } catch {}
+        GLib.file_set_contents(conf, 'keys = copy:Ctrl+WheelDown\n');
+        const restore = () => {
+            if (saved)
+                GLib.file_set_contents(conf, saved);
+            else
+                GLib.unlink(conf);
+        };
+        const fail = why => {
+            restore();
+            this._fail(name, why, next);
+        };
+        const kit = this._keyKit();
+        const k = this._d._keyboard;
+        const p = this._device();
+        this._capture({x: 100, y: 100}, overlay => {
+            if (!this._select(overlay, [200, 200, 900, 800], fail))
+                return;
+            sequence([
+                SELECT_SETTLE_MS,
+                () => {},
+                () => kit.tap(Clutter.KEY_t),
+                () => kit.move({x: 300, y: 300}),
+                kit.click,
+                () => kit.tap(Clutter.KEY_a),
+                () => k.notify_key(kit.now(), KEY_LEFTCTRL, Clutter.KeyState.PRESSED),
+                () => p.notify_discrete_scroll(kit.now(), Clutter.ScrollDirection.DOWN, Clutter.ScrollSource.WHEEL),
+                () => k.notify_key(kit.now(), KEY_LEFTCTRL, Clutter.KeyState.RELEASED),
+            ], () => later(800, () => {
+                restore();
+                const ok = r._busy;
+                this._d._result(name, ok, ok
+                    ? 'ctrl and the wheel left the editor open while a text was open'
+                    : 'ctrl and the wheel copied and closed the editor in the middle of typing');
+                if (r._busy)
+                    this._d._endSession(next);
+                else
+                    next();
+            }));
         }, fail);
     }
 

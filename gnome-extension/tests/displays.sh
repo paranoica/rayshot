@@ -13,7 +13,7 @@ run() {
     printf '%s\n' "$out" | grep -v '^skip' || true
 }
 
-run "1920x1080 1920x1080" plain,scale2,fractional,mixed,left,vertical,portrait,fullscreen,russian,spam,text-enter,text-escape,shape-enter,rebound,zoom-export,zoom-draw,zoom-pan,zoom-middle,zoom-seam,lens-export,lens-draw,lens-grip,text-lines,lens-text,edit-keys
+run "1920x1080 1920x1080" plain,scale2,fractional,mixed,left,vertical,portrait,fullscreen,russian,spam,text-enter,text-escape,shape-enter,rebound,zoom-export,zoom-draw,zoom-pan,zoom-middle,zoom-seam,lens-export,lens-draw,lens-grip,text-lines,lens-text,edit-keys,wheel-key,wheel-typing
 run "3840x2160 1920x1080" mixed,plain
 run "5120x1440" plain,scale2
 
