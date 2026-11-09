@@ -8,15 +8,15 @@ directions, and the tables say where.
 
 ## On Linux
 
-| | rayshot | GNOME screenshot UI | Flameshot | Ksnip | Spectacle | Gradia | Satty / Swappy |
-|---|---|---|---|---|---|---|---|
-| GNOME Wayland | yes | yes | experimental | yes, with limits | not documented | yes, through the portal | no, wlroots only |
-| Still picture to select on | at the keypress, ≈2 ms | at the keypress | after a portal call | after a portal call | not documented on GNOME | GNOME's own UI | n/a |
-| Arrows, text, shapes | yes | no | yes | yes | yes | yes | yes |
-| Blur / pixelate | both | no | pixelate | yes | yes | censor tool | Satty both, Swappy blur |
-| Upload, OCR | OCR on your machine, never uploads | no | Imgur | Imgur, OCR plugin | OCR | upload, OCR | no |
-| Key to selection | ≈40 ms, measured | freezes at once, not measured | long delays reported on GNOME | not found | 1.5–2 s reported | not found | n/a |
-| Memory | 24 MB own, 146 MB resident | part of the shell | 36 MB on a Raspberry Pi | not found | 67 MB on a Raspberry Pi | not found | not found |
+| | rayshot | GNOME screenshot UI | Flameshot | Ksnip | Spectacle | Gradia | WayShot | Satty / Swappy |
+|---|---|---|---|---|---|---|---|---|
+| GNOME Wayland | yes | yes | experimental | yes, with limits | not documented | yes, through the portal | yes, through the portal | no, wlroots only |
+| Still picture to select on | at the keypress, ≈2 ms | at the keypress | after a portal call | after a portal call | not documented on GNOME | GNOME's own UI | GNOME's own UI | n/a |
+| Arrows, text, shapes | yes | no | yes | yes | yes | yes | yes | yes |
+| Blur / pixelate | both | no | pixelate | yes | yes | censor tool | both | Satty both, Swappy blur |
+| Upload, OCR | OCR on your machine, never uploads | no | Imgur | Imgur, OCR plugin | OCR | upload, OCR | no | no |
+| Key to selection | ≈40 ms, measured | freezes at once, not measured | long delays reported on GNOME | not found | 1.5–2 s reported | not found | not found | n/a |
+| Memory | 24 MB own, 146 MB resident | part of the shell | 36 MB on a Raspberry Pi | not found | 67 MB on a Raspberry Pi | not found | not found | not found |
 
 <details>
 <summary>Notes and sources</summary>
@@ -27,6 +27,7 @@ directions, and the tables say where.
 - **Spectacle:** KDE's tool; users report 1.5–2 s from PrtSc to the window ([KDE forum](https://discuss.kde.org/t/make-spectacle-launch-faster/38030)).
 - **Shutter:** in maintenance mode with rudimentary Wayland support ([FAQ](https://shutter-project.org/faq-help/)).
 - **Gradia:** a GTK4 app to beautify and redact screenshots, with OCR and upload ([repo](https://github.com/AlexanderVanhee/Gradia)).
+- **WayShot:** a GTK4 editor on Flathub; it takes the shot through the portal, then opens it in a window, and it can also open files and pasted images and save to several formats ([repo](https://github.com/gutopardini/wayshot)).
 - **Satty / Swappy:** annotators for `grim` output on wlroots compositors ([Satty](https://github.com/Satty-org/Satty), [Swappy](https://github.com/jtheoof/swappy)).
 - The Flameshot and Spectacle memory figures come from a Raspberry Pi 4 test ([LinuxLinks](https://www.linuxlinks.com/raspberry-pi-4-chronicling-desktop-experience-screen-capture/)). No controlled benchmark of these tools has been published; "not found" means exactly that.
 
@@ -40,7 +41,7 @@ directions, and the tables say where.
 | Price | free, MIT | free | free, GPL | built in | built in | $35 | pay what you want |
 | Freezes at the keypress | yes | not documented | not documented | dims the screen | not documented | not documented | optional |
 | Draw before copying | yes | yes | yes | afterwards, in a window | in a thumbnail editor | yes | yes |
-| Blur / pixelate | both | no | both | redact | no | redact | not found |
+| Blur / pixelate | both | no | both | redact | no | redact | both | not found |
 | Upload | never | public prnt.sc links | many services | no | no | cloud | S3 |
 | OCR, scrolling capture | OCR | no | yes | OCR | no | yes | yes |
 | Published speed | ≈40 ms, measured | not found | not found | not found | not found | not found | 17 ms to grab, 165 ms to show (vendor) |
